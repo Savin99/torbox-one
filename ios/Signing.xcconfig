@@ -1,0 +1,3 @@
+// Настройки подписи. Свой Apple Team ID держи в Local.xcconfig — он не попадает в гит.
+// cp ios/Local.xcconfig.example ios/Local.xcconfig и впиши DEVELOPMENT_TEAM.
+#include? "Local.xcconfig"

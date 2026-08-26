@@ -1,0 +1,8 @@
+# Reverse-proxy с автоматическим Let's Encrypt для мини-API.
+# Замени адрес на свой домен или <IP>.sslip.io (например, 203.0.113.7.sslip.io).
+# Установка Caddy: https://caddyserver.com/docs/install#debian-ubuntu-raspbian
+# Файл кладётся в /etc/caddy/Caddyfile, затем: sudo systemctl reload caddy
+
+{$SEARCH_API_DOMAIN}
+
+reverse_proxy 127.0.0.1:8787

@@ -1,0 +1,7 @@
+TorBoxOne.xcodeproj/
+build/
+DerivedData/
+.DS_Store
+
+# Локальный Apple Team ID (см. Local.xcconfig.example)
+Local.xcconfig

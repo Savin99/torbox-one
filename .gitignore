@@ -1,0 +1,20 @@
+# Секреты и состояние
+.env
+state.json
+credentials.json
+meta_cache.json
+
+# Кэши и окружение
+*.tmp
+__pycache__/
+*.py[cod]
+.venv/
+.ruff_cache/
+.pytest_cache/
+.claude/
+
+# Локальные сервисы
+prowlarr-config/
+
+# macOS
+.DS_Store

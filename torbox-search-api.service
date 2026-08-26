@@ -1,0 +1,23 @@
+[Unit]
+Description=TorBox One Search API (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+DynamicUser=yes
+StateDirectory=torbox-search-api
+EnvironmentFile=/etc/torbox-telegram-bot.env
+WorkingDirectory=/opt/torbox-telegram-bot
+ExecStart=/opt/torbox-telegram-bot/.venv/bin/uvicorn search_api:app --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5
+
+# Ограничения как у бота: сервис не видит чужие домашние каталоги
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
