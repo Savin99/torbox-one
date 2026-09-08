@@ -4,15 +4,14 @@ import SwiftUI
 /// Метаданные подтягиваются по имени раздачи через мини-API.
 struct TorrentDetailView: View {
     @Environment(AppState.self) private var appState
-    @Environment(\.openURL) private var openURL
     @Environment(\.dismiss) private var dismiss
     let vm: DownloadsViewModel
     let torrentID: Int
 
     @State private var busyFileID: Int?
     @State private var shareURL: URL?
-    @State private var playerQueue: PlayerQueue?
     @State private var fileFilter = ""
+    @State private var selectedFileIDs = Set<Int>()
     @State private var confirmDelete = false
     @State private var showFullOverview = false
     /// Выбранный сезон: у сериала на 73 файла список иначе не читается.
@@ -59,10 +58,7 @@ struct TorrentDetailView: View {
             get: { shareURL.map(ShareItem.init) },
             set: { shareURL = $0?.url }
         )) { item in
-            ShareSheet(url: item.url)
-        }
-        .fullScreenCover(item: $playerQueue) { queue in
-            PlayerScreen(queue: queue, thumbnails: appState.thumbnails)
+            FileTransferSheet(url: item.url)
         }
         .confirmationDialog(
             "Удалить раздачу из TorBox? Скачанное на телефоне останется.",
@@ -78,7 +74,7 @@ struct TorrentDetailView: View {
 
     private func detail(torrent: TBTorrent) -> some View {
         let status = TorrentStatus(torrent: torrent)
-        let videos = PlayerQueueFactory.videoFiles(of: torrent)
+        let videos = DownloadSelection.videoFiles(of: torrent)
         return ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 BackdropHeader(
@@ -89,7 +85,7 @@ struct TorrentDetailView: View {
 
                 VStack(alignment: .leading, spacing: 18) {
                     if status.isFinished, !videos.isEmpty {
-                        watchActions(torrent: torrent, videos: videos)
+                        downloadActions(torrent: torrent, videos: videos)
                     } else {
                         progressCard(torrent: torrent, status: status)
                     }
@@ -110,81 +106,42 @@ struct TorrentDetailView: View {
 
     // MARK: - Действия
 
-    @ViewBuilder
-    private func watchActions(torrent: TBTorrent, videos: [TBFile]) -> some View {
-        let suggested = PlayerQueueFactory.suggestedFile(torrent: torrent, appState: appState)
-        VStack(spacing: 10) {
-            if let file = suggested {
-                let entry = appState.playback.entry(torrent: torrent, fileID: file.id)
+    private func downloadActions(torrent: TBTorrent, videos: [TBFile]) -> some View {
+        let batch = DownloadSelection.seasonFiles(videos, season: season)
+        let number = season ?? availableSeasons(videos).first
+        return VStack(alignment: .leading, spacing: 12) {
+            InfuseLibraryCard()
+            if !batch.isEmpty {
                 Button {
-                    watch(torrent: torrent, file: file)
+                    download(torrent: torrent, files: batch)
                 } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: "play.fill")
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(entry?.isResumable == true ? "Продолжить" : "Смотреть")
+                    HStack {
+                        Image(systemName: "arrow.down.to.line")
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(videos.count == 1 ? "Скачать фильм в Infuse" : "Скачать сезон \(number.map(String.init) ?? "") в Infuse")
                                 .font(.headline)
-                            Text(shortLabel(torrent: torrent, file: file, entry: entry))
-                                .font(.caption)
-                                .foregroundStyle(.white.opacity(0.85))
-                                .lineLimit(1)
+                            Text(selectionSummary(batch)).font(.caption)
                         }
-                        Spacer(minLength: 0)
-                        if videos.count > 1 {
-                            Text("\(videos.count) \(Format.plural(videos.count, "серия", "серии", "серий"))")
-                                .font(.caption.weight(.semibold))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Capsule().fill(.white.opacity(0.22)))
-                        }
+                        Spacer()
                     }
                 }
                 .buttonStyle(AccentButtonStyle())
-
-                HStack(spacing: 10) {
-                    if Infuse.isInstalled {
-                        iconAction(icon: "play.circle", label: "Infuse") {
-                            playInInfuse(torrent: torrent, file: file)
-                        }
-                    }
-                    iconAction(icon: "square.and.arrow.up", label: "Ссылка") {
-                        share(torrent: torrent, file: file)
-                    }
-                    iconAction(icon: "arrow.down.to.line", label: "В телефон") {
-                        startDownload(torrent: torrent, file: file)
-                    }
-                    iconAction(icon: "trash", label: "Удалить", tint: Theme.danger) {
-                        Haptics.warning()
-                        confirmDelete = true
-                    }
-                }
             }
+            Text("Можно скачать сезон целиком или отметить нужные серии ниже. Сначала дождись загрузки в Infuse, затем смотри локально.")
+                .font(.footnote).foregroundStyle(Theme.textSecondary)
         }
     }
 
-    private func iconAction(
-        icon: String,
-        label: String,
-        tint: Color = Theme.textPrimary,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button {
-            action()
-        } label: {
-            VStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(tint)
-                    .frame(width: 44, height: 44)
-                    .background(Circle().fill(Theme.hairline.opacity(0.08)))
-                Text(label)
-                    .font(.caption2)
-                    .foregroundStyle(Theme.textSecondary)
-            }
-            .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(label)
+    private func selectionSummary(_ files: [TBFile]) -> String {
+        let count = "\(files.count) \(Format.plural(files.count, "файл", "файла", "файлов"))"
+        guard files.allSatisfy({ $0.size != nil }) else { return count }
+        return count + " · " + Format.bytes(files.reduce(Int64(0)) { $0 + max(0, $1.size ?? 0) })
+    }
+
+    private func download(torrent: TBTorrent, files: [TBFile]) {
+        guard TorrentStatus(torrent: torrent).isFinished else { return }
+        Haptics.press()
+        appState.infuse.start(DownloadSelection.items(torrent: torrent, files: files), appState: appState)
     }
 
     private func progressCard(torrent: TBTorrent, status: TorrentStatus) -> some View {
@@ -280,17 +237,7 @@ struct TorrentDetailView: View {
         }
     }
 
-    private func shortLabel(torrent: TBTorrent, file: TBFile, entry: PlaybackStore.Entry?) -> String {
-        var parts: [String] = []
-        if let label = file.episode.label { parts.append(label) }
-        parts.append(episodeTitle(torrent: torrent, file: file))
-        if let entry, entry.isResumable {
-            parts.append("с \(Format.clock(entry.positionSeconds))")
-        }
-        return parts.joined(separator: " · ")
-    }
 
-    /// Название серии из каталога, иначе — вычищенное имя файла.
     private func episodeTitle(torrent: TBTorrent, file: TBFile) -> String {
         if let meta, let number = file.episode.episode,
            let episode = appState.meta.episode(
@@ -345,6 +292,18 @@ struct TorrentDetailView: View {
             if files.count > 8 {
                 fileSearchField
             }
+            if status.isFinished, files.contains(where: \.isVideo) {
+                let selected = files.filter { selectedFileIDs.contains($0.id) && $0.isVideo }
+                HStack {
+                    Text(selected.isEmpty ? "Отметь нужные серии" : selectionSummary(selected))
+                        .font(.caption).foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    Button("Скачать выбранное") { download(torrent: torrent, files: selected) }
+                        .font(.subheadline.weight(.semibold))
+                        .disabled(selected.isEmpty)
+                }
+                .frame(minHeight: Theme.hit)
+            }
 
             if files.isEmpty {
                 Text(status.isFinished
@@ -370,8 +329,11 @@ struct TorrentDetailView: View {
                             episode: episodeMeta(torrent: torrent, file: file),
                             ready: status.isFinished,
                             isBusy: busyFileID == file.id,
-                            onWatch: { watch(torrent: torrent, file: file) },
-                            onInfuse: { playInInfuse(torrent: torrent, file: file) },
+                            isSelected: selectedFileIDs.contains(file.id),
+                            onSelect: {
+                                if selectedFileIDs.contains(file.id) { selectedFileIDs.remove(file.id) }
+                                else { selectedFileIDs.insert(file.id) }
+                            },
                             onShare: { share(torrent: torrent, file: file) },
                             onDownload: { startDownload(torrent: torrent, file: file) }
                         )
@@ -413,7 +375,6 @@ struct TorrentDetailView: View {
     private func seasonPicker(seasons: [Int], files: [TBFile], torrent: TBTorrent) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                seasonChip(title: "Все", value: nil, torrent: torrent, files: files)
                 ForEach(seasons, id: \.self) { number in
                     seasonChip(title: "Сезон \(number)", value: number, torrent: torrent, files: files)
                 }
@@ -423,40 +384,22 @@ struct TorrentDetailView: View {
         .onAppear {
             guard !didPickSeason else { return }
             didPickSeason = true
-            // Открываем сезон подсказанной серии — обычно это то, что смотрят
-            if let file = PlayerQueueFactory.suggestedFile(torrent: torrent, appState: appState),
-               let number = file.episode.season, seasons.contains(number) {
-                season = number
-            } else {
-                season = seasons.first
-            }
+            season = seasons.first
         }
     }
 
     private func seasonChip(title: String, value: Int?, torrent: TBTorrent, files: [TBFile]) -> some View {
-        let isSelected = season == value
-        let seasonFiles = value == nil ? files : files.filter { $0.episode.season == value }
-        let progress = appState.playback.progress(
-            torrent: torrent, files: seasonFiles.filter(\.isVideo)
-        )
+        let isSelected = (season ?? availableSeasons(files).first) == value
         return Button {
             Haptics.tap()
-            withAnimation { season = value }
+            withAnimation { season = value; selectedFileIDs.removeAll() }
         } label: {
-            HStack(spacing: 5) {
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
-                if progress.total > 0, progress.watched == progress.total {
-                    Image(systemName: "checkmark")
-                        .font(.caption2.weight(.bold))
-                }
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 36)
-            .background(
-                Capsule().fill(isSelected ? Theme.accent : Theme.hairline.opacity(0.08))
-            )
-            .foregroundStyle(isSelected ? .white : Theme.textPrimary)
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 14)
+                .frame(height: 36)
+                .background(Capsule().fill(isSelected ? Theme.accent : Theme.hairline.opacity(0.08)))
+                .foregroundStyle(isSelected ? .white : Theme.textPrimary)
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
@@ -467,8 +410,8 @@ struct TorrentDetailView: View {
     }
 
     private func seasonFiles(_ files: [TBFile]) -> [TBFile] {
-        guard let season else { return files }
-        return files.filter { $0.episode.season == season }
+        guard let selected = season ?? availableSeasons(files).first else { return files }
+        return files.filter { $0.episode.season == selected || $0.episode.season == nil }
     }
 
     private func subtitleForFiles(files: [TBFile], shown: [TBFile], seasons: [Int]) -> String? {
@@ -522,7 +465,7 @@ struct TorrentDetailView: View {
 
     @ViewBuilder
     private func techCard(torrent: TBTorrent, videos: [TBFile]) -> some View {
-        let file = PlayerQueueFactory.suggestedFile(torrent: torrent, appState: appState) ?? videos.first
+        let file = videos.first
         if let file {
             let tech = MediaTech.parse(file.displayName)
             VStack(alignment: .leading, spacing: 8) {
@@ -575,25 +518,6 @@ struct TorrentDetailView: View {
                     Label("Остановить раздачу", systemImage: "stop.circle")
                 }
             }
-            if let files = torrent.files?.filter(\.isVideo), !files.isEmpty {
-                Divider()
-                Button {
-                    markSeasonWatched(torrent: torrent, files: files)
-                } label: {
-                    Label(
-                        season == nil ? "Отметить всё просмотренным" : "Отметить сезон просмотренным",
-                        systemImage: "eye.fill"
-                    )
-                }
-                Button {
-                    resetSeasonProgress(torrent: torrent, files: files)
-                } label: {
-                    Label(
-                        season == nil ? "Сбросить весь прогресс" : "Сбросить прогресс сезона",
-                        systemImage: "arrow.counterclockwise"
-                    )
-                }
-            }
             Divider()
             Button {
                 refreshMeta(torrent: torrent)
@@ -618,27 +542,6 @@ struct TorrentDetailView: View {
 
     // MARK: - Действия
 
-    private func watch(torrent: TBTorrent, file: TBFile) {
-        Haptics.press()
-        playerQueue = PlayerQueueFactory.queue(torrent: torrent, startAt: file, appState: appState)
-    }
-
-    private func markSeasonWatched(torrent: TBTorrent, files: [TBFile]) {
-        Haptics.success()
-        for file in seasonFiles(files) {
-            appState.playback.markWatched(torrent: torrent, file: file)
-        }
-        appState.toasts.success("Отмечено просмотренным")
-    }
-
-    private func resetSeasonProgress(torrent: TBTorrent, files: [TBFile]) {
-        Haptics.warning()
-        for file in seasonFiles(files) {
-            appState.playback.resetProgress(torrent: torrent, fileID: file.id)
-        }
-        appState.toasts.info("Прогресс сброшен")
-    }
-
     private func refreshMeta(torrent: TBTorrent) {
         appState.meta.forget(name: torrent.name)
         Task {
@@ -653,6 +556,10 @@ struct TorrentDetailView: View {
     }
 
     private func startDownload(torrent: TBTorrent, file: TBFile) {
+        if file.isVideo {
+            download(torrent: torrent, files: [file])
+            return
+        }
         guard let client = appState.torBoxClient else { return }
         let downloads = appState.downloads
         let key = PlaybackStore.key(torrent: torrent, fileID: file.id)
@@ -674,16 +581,6 @@ struct TorrentDetailView: View {
                     action: { appState.selectedTab = .settings }
                 )
             }
-        }
-    }
-
-    private func playInInfuse(torrent: TBTorrent, file: TBFile) {
-        withLink(torrent: torrent, file: file) { cdn in
-            guard let target = Infuse.playURL(for: cdn) else {
-                appState.toasts.error("Не получилось собрать ссылку для Infuse")
-                return
-            }
-            openURL(target)
         }
     }
 
@@ -734,7 +631,7 @@ struct TorrentDetailView: View {
     }
 }
 
-/// Строка серии: кадр или номер, название из каталога, состояние просмотра.
+/// Selection and download state for TorBox files. Playback history belongs to Infuse.
 private struct FileRow: View {
     @Environment(AppState.self) private var appState
     let torrent: TBTorrent
@@ -742,298 +639,77 @@ private struct FileRow: View {
     let episode: EpisodeMeta?
     let ready: Bool
     let isBusy: Bool
-    let onWatch: () -> Void
-    let onInfuse: () -> Void
+    let isSelected: Bool
+    let onSelect: () -> Void
     let onShare: () -> Void
     let onDownload: () -> Void
-
-    var body: some View {
-        let key = PlaybackStore.key(torrent: torrent, fileID: file.id)
-        let watched = appState.playback.entry(torrent: torrent, fileID: file.id)
-        let download = appState.downloads.item(key: key)
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 12) {
-                artwork
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(title)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(Theme.textPrimary)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                    if let episode, !episode.overview.isEmpty {
-                        Text(episode.overview)
-                            .font(.caption)
-                            .foregroundStyle(Theme.textSecondary)
-                            .lineLimit(2)
-                    } else if title != file.displayName {
-                        Text(file.displayName)
-                            .font(.caption2)
-                            .foregroundStyle(Theme.textTertiary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    if let watched, watched.isResumable {
-                        SlimProgressBar(fraction: watched.fraction, height: 3)
-                            .padding(.trailing, 8)
-                    }
-                    FlowLayout(spacing: 6) {
-                        if let size = file.size, size > 0 {
-                            Chip.size(size)
-                        }
-                        if let watched {
-                            if watched.isWatched {
-                                Chip(text: "просмотрено", icon: "checkmark", style: .tinted(Theme.accent))
-                            } else if watched.isResumable {
-                                Chip(
-                                    text: Format.clock(watched.positionSeconds),
-                                    icon: "play.fill",
-                                    style: .tinted(Theme.accent),
-                                    accessibility: "Продолжить с \(Format.clock(watched.positionSeconds))"
-                                )
-                            }
-                        }
-                        downloadChip(download: download, key: key)
-                    }
-                }
-                Spacer(minLength: 0)
-                if ready {
-                    actions
-                }
-            }
-        }
-        .padding(12)
-        .cardSurface(radius: Theme.radiusM)
-    }
 
     private var title: String {
         if let episode, !episode.title.isEmpty { return episode.title }
         return file.prettyName(seriesName: torrent.name)
     }
 
-    /// Короткая причина вместо безликого «не скачался».
-    private static func shortFailure(_ reason: String) -> String {
-        let lowered = reason.lowercased()
-        if lowered.contains("места") { return "мало места" }
-        if lowered.contains("http") { return "ошибка сервера" }
-        if lowered.contains("интернет") || lowered.contains("network") || lowered.contains("соединен") {
-            return "нет сети"
-        }
-        return "не скачался"
-    }
-
-    /// Кадр серии, если каталог его отдал; иначе — номер серии.
-    @ViewBuilder
-    private var artwork: some View {
-        if let still = episode?.stillUrl, !still.isEmpty, let url = URL(string: still) {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image.resizable().aspectRatio(contentMode: .fill)
-                default:
-                    Theme.hairline.opacity(0.08)
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            if file.isVideo, ready {
+                Button(action: onSelect) {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.title3)
+                        .foregroundStyle(isSelected ? Theme.accent : Theme.textTertiary)
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Выбрать \(title)")
+                .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(Theme.textPrimary)
+                if let label = file.episode.label {
+                    Text(label).font(.caption).foregroundStyle(Theme.textSecondary)
+                }
+                if let episode, !episode.overview.isEmpty {
+                    Text(episode.overview).font(.caption).foregroundStyle(Theme.textSecondary).lineLimit(2)
+                }
+                FlowLayout(spacing: 6) {
+                    if let size = file.size { Chip.size(size) }
+                    if appState.downloads.localURL(key: PlaybackStore.key(torrent: torrent, fileID: file.id)) != nil {
+                        Chip(text: "в TorBox One", icon: "iphone", style: .tinted(Theme.info))
+                    }
                 }
             }
-            .frame(width: 104, height: 59)
-            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusS, style: .continuous))
-            .overlay(alignment: .bottomLeading) {
-                if let number = file.episode.episode {
-                    Text("\(number)")
-                        .font(.caption2.weight(.heavy))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(.black.opacity(0.6)))
-                        .foregroundStyle(.white)
-                        .padding(4)
-                }
-            }
-            .accessibilityHidden(true)
-        } else if let number = file.episode.episode {
-            VStack(spacing: 0) {
-                Text("\(number)")
-                    .font(.system(size: 17, weight: .heavy, design: .rounded))
-                    .foregroundStyle(Theme.textPrimary)
-                if let season = file.episode.season {
-                    Text("S\(season)")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(Theme.textTertiary)
-                }
-            }
-            .frame(width: 42, height: 42)
-            .background(
-                RoundedRectangle(cornerRadius: Theme.radiusS, style: .continuous)
-                    .fill(Theme.hairline.opacity(0.07))
-            )
-            .accessibilityHidden(true)
-        } else {
-            FileArtwork(title: file.displayName, isVideo: file.isVideo, side: 42)
-        }
-    }
-
-    @ViewBuilder
-    private func downloadChip(download: DownloadManager.Item?, key: String) -> some View {
-        if let download {
-            switch download.state {
-            case .done:
-                Chip.onDevice()
-            case .downloading:
-                Chip(
-                    text: "\(Int((appState.downloads.progress[key] ?? 0) * 100))%",
-                    icon: "arrow.down",
-                    style: .tinted(Theme.info),
-                    accessibility: "Качается в телефон"
-                )
-            case .paused:
-                Chip(text: "пауза", icon: "pause.fill", style: .tinted(Theme.idle))
-            case .failed(let reason):
-                Chip(
-                    text: Self.shortFailure(reason),
-                    icon: "exclamationmark.triangle.fill",
-                    style: .tinted(Theme.danger),
-                    accessibility: "Не скачался: \(reason)"
-                )
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var actions: some View {
-        if isBusy {
-            ProgressView()
-                .frame(width: 38, height: 38)
-        } else {
-            HStack(spacing: 6) {
-                if file.isVideo {
-                    Button {
-                        onWatch()
-                    } label: {
-                        Image(systemName: "play.fill")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 38, height: 38)
-                            .background(Circle().fill(Theme.accent))
-                            .hitTarget()
+            Spacer(minLength: 0)
+            if isBusy {
+                ProgressView().frame(width: 44, height: 44)
+            } else if ready {
+                VStack(spacing: 4) {
+                    Button(action: onDownload) {
+                        Image(systemName: "arrow.down.to.line")
+                            .foregroundStyle(Theme.accent).frame(width: 44, height: 44)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Смотреть \(title)")
-                }
-                Menu {
-                    if file.isVideo {
-                        let watched = appState.playback.entry(torrent: torrent, fileID: file.id)
-                        if watched?.isWatched == true {
+                    .accessibilityLabel(file.isVideo ? "Скачать \(title) в Infuse" : "Скачать \(title)")
+                    Menu {
+                        if let local = appState.downloads.localURL(key: PlaybackStore.key(torrent: torrent, fileID: file.id)) {
                             Button {
-                                appState.playback.resetProgress(torrent: torrent, fileID: file.id)
-                                Haptics.tap()
+                                appState.infuse.sheet = .export(local)
                             } label: {
-                                Label("Снять отметку «просмотрено»", systemImage: "eye.slash")
-                            }
-                        } else {
-                            Button {
-                                appState.playback.markWatched(torrent: torrent, file: file)
-                                Haptics.success()
-                            } label: {
-                                Label("Отметить просмотренным", systemImage: "eye.fill")
+                                Label("Передать сохранённый файл", systemImage: "square.and.arrow.up")
                             }
                         }
-                        if watched?.isStarted == true {
-                            Button {
-                                appState.playback.resetProgress(torrent: torrent, fileID: file.id)
-                                Haptics.tap()
-                            } label: {
-                                Label("Смотреть с начала", systemImage: "arrow.counterclockwise")
-                            }
-                        }
-                        Divider()
-                    }
-                    if file.isVideo, Infuse.isInstalled {
-                        Button {
-                            onInfuse()
-                        } label: {
-                            Label("Смотреть в Infuse", systemImage: "play.circle")
-                        }
-                    }
-                    Button {
-                        onShare()
+                        Button(action: onShare) { Label("Поделиться ссылкой", systemImage: "link") }
                     } label: {
-                        Label("Поделиться ссылкой", systemImage: "square.and.arrow.up")
+                        Image(systemName: "ellipsis").frame(width: 44, height: 44)
                     }
-                    downloadMenuItems
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundStyle(Theme.textSecondary)
-                        .frame(width: 38, height: 38)
-                        .background(Circle().fill(Theme.hairline.opacity(0.07)))
-                        .hitTarget()
+                    .accessibilityLabel("Действия с файлом")
                 }
-                .accessibilityLabel("Действия с файлом")
             }
         }
-    }
-
-    @ViewBuilder
-    private var downloadMenuItems: some View {
-        let key = PlaybackStore.key(torrent: torrent, fileID: file.id)
-        let downloads = appState.downloads
-        switch downloads.item(key: key)?.state {
-        case .done:
-            Button(role: .destructive) {
-                downloads.deleteLocal(key: key)
-                Haptics.warning()
-            } label: {
-                Label("Удалить с телефона", systemImage: "iphone.slash")
-            }
-        case .downloading:
-            Button {
-                downloads.pause(key: key)
-            } label: {
-                Label("Пауза загрузки", systemImage: "pause.circle")
-            }
-        case .paused, .failed:
-            Button {
-                downloads.resume(key: key, client: appState.torBoxClient)
-            } label: {
-                Label("Продолжить загрузку", systemImage: "arrow.clockwise")
-            }
-        case nil:
-            Button {
-                onDownload()
-            } label: {
-                Label("Скачать в телефон", systemImage: "arrow.down.to.line")
-            }
-        }
-    }
-}
-
-/// Сборка deep-link для Infuse: вложенный URL кодируем вручную по unreserved-набору,
-/// иначе &-параметры CDN-ссылки разорвут query самого infuse://.
-enum Infuse {
-    static var isInstalled: Bool {
-        guard let probe = URL(string: "infuse://") else { return false }
-        return UIApplication.shared.canOpenURL(probe)
-    }
-
-    static func playURL(for cdn: URL) -> URL? {
-        let unreserved = CharacterSet(
-            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-        )
-        guard let encoded = cdn.absoluteString.addingPercentEncoding(withAllowedCharacters: unreserved) else {
-            return nil
-        }
-        return URL(string: "infuse://x-callback-url/play?url=\(encoded)")
+        .padding(12)
+        .cardSurface(radius: Theme.radiusM)
     }
 }
 
 private struct ShareItem: Identifiable {
     let url: URL
     var id: String { url.absoluteString }
-}
-
-private struct ShareSheet: UIViewControllerRepresentable {
-    let url: URL
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: [url], applicationActivities: nil)
-    }
-
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }

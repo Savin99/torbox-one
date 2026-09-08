@@ -13,7 +13,6 @@ struct HomeTab: View {
     @State private var vm = SearchViewModel()
     @State private var searchText = ""
     @State private var path: [HomeRoute] = []
-    @State private var playerQueue: PlayerQueue?
 
     private var library: DownloadsViewModel { appState.library }
 
@@ -32,9 +31,6 @@ struct HomeTab: View {
                     TorrentDetailView(vm: library, torrentID: id)
                 }
             }
-        }
-        .fullScreenCover(item: $playerQueue) { queue in
-            PlayerScreen(queue: queue, thumbnails: appState.thumbnails)
         }
     }
 
@@ -97,14 +93,12 @@ struct HomeTab: View {
             setupCard(
                 icon: "key.horizontal",
                 title: "Подключи TorBox",
-                message: "Без ключа не будет ни библиотеки, ни плеера. Ввод занимает минуту.",
+                message: "Подключи свой аккаунт, чтобы открыть библиотеку и смотреть в Infuse.",
                 tint: Theme.instant
             )
         }
 
-        ContinueWatchingStrip(vm: library) { queue in
-            playerQueue = queue
-        }
+        InfuseLibraryCard().padding(.horizontal, Theme.gutter)
 
         recentlyAdded
 
@@ -213,14 +207,12 @@ struct HomeTab: View {
             await appState.meta.load(name: torrent.name, client: appState.searchClient)
         }
         .contextMenu {
-            if let file = PlayerQueueFactory.suggestedFile(torrent: torrent, appState: appState) {
+            if !DownloadSelection.videoFiles(of: torrent).isEmpty {
                 Button {
                     Haptics.press()
-                    playerQueue = PlayerQueueFactory.queue(
-                        torrent: torrent, startAt: file, appState: appState
-                    )
+                    path.append(.torrent(torrent.id))
                 } label: {
-                    Label("Смотреть", systemImage: "play.fill")
+                    Label("Выбрать для скачивания", systemImage: "arrow.down.to.line")
                 }
             }
             Button {
