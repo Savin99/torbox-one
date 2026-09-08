@@ -108,7 +108,7 @@ struct OnboardingView: View {
                     Text("TorBox One")
                         .font(.system(size: 40, weight: .heavy, design: .rounded))
                         .foregroundStyle(Theme.textPrimary)
-                    Text("Найти на трекерах, скачать в облако, посмотреть — не выходя из приложения.")
+                    Text("Найти фильм, скачать нужные серии в Infuse и смотреть без интернета.")
                         .font(.title3)
                         .foregroundStyle(Theme.textSecondary)
                 }
@@ -128,8 +128,8 @@ struct OnboardingView: View {
                     featureRow(
                         icon: "play.rectangle.fill",
                         tint: Theme.accent,
-                        title: "Плеер и офлайн",
-                        text: "Серия качается в телефон, пока ты её смотришь, и помнит место остановки."
+                        title: "Просмотр в Infuse",
+                        text: "Скачивай фильм, сезон или отдельные серии. Infuse воспроизводит локальные файлы и помнит, где ты остановился."
                     )
                 }
                 Button("Настроить за минуту") {
@@ -295,7 +295,7 @@ struct OnboardingView: View {
                 .buttonStyle(AccentButtonStyle())
                 .disabled(urlInput.trimmingCharacters(in: .whitespaces).isEmpty || searchStatus.isChecking)
 
-                Text("Без сервера поиска приложение всё равно работает: остаются библиотека, плеер и офлайн-файлы.")
+                Text("Без сервера поиска остаются библиотека TorBox, добавление magnet-ссылок и скачивание в Infuse.")
                     .font(.footnote)
                     .foregroundStyle(Theme.textTertiary)
             }
@@ -334,8 +334,10 @@ struct OnboardingView: View {
                     .font(.system(size: 34, weight: .heavy, design: .rounded))
                     .foregroundStyle(Theme.textPrimary)
                 VStack(spacing: 10) {
-                    checklistRow(done: appState.hasTorBoxKey, title: "TorBox подключён", hint: "Библиотека, плеер и файлы")
+                    checklistRow(done: appState.hasTorBoxKey, title: "TorBox подключён", hint: "Облачная библиотека и ссылки на видео")
                     checklistRow(done: appState.hasSearchAPI, title: "Сервер поиска подключён", hint: "Каталог и поиск по трекерам")
+                    checklistRow(done: appState.infuse.isInstalled, title: "Infuse установлен", hint: "Версия \(InfuseProtocol.minimumVersion) или новее для скачивания выбранных файлов")
+                    Link("Установить или обновить Infuse", destination: InfuseLinks.appStore)
                 }
                 Text("Настройки можно поменять в любой момент во вкладке «Настройки».")
                     .font(.footnote)

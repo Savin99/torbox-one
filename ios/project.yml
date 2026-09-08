@@ -1,8 +1,4 @@
 name: TorBoxOne
-packages:
-  VLCKit:
-    url: https://github.com/videolan/vlckit
-    exactVersion: "4.0.0-a23"
 options:
   bundleIdPrefix: com.ilyaqa
   deploymentTarget:
@@ -23,9 +19,6 @@ targets:
     type: application
     platform: iOS
     sources: [TorBoxOne]
-    dependencies:
-      - package: VLCKit
-        product: VLCKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ilyaqa.torboxone
@@ -51,8 +44,26 @@ targets:
         LSSupportsOpeningDocumentsInPlace: true
         LSApplicationQueriesSchemes: [infuse]
         CFBundleURLTypes:
+          - CFBundleURLName: com.ilyaqa.torboxone.infuse
+            CFBundleURLSchemes: [torboxone]
           - CFBundleURLName: com.ilyaqa.torboxone.magnet
             CFBundleURLSchemes: [magnet]
         NSLocalNetworkUsageDescription: "Подключение к локальному серверу поиска во время разработки."
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+  TorBoxOneTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [TorBoxOneTests]
+    dependencies:
+      - target: TorBoxOne
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  TorBoxOne:
+    build:
+      targets:
+        TorBoxOne: all
+    test:
+      targets: [TorBoxOneTests]
