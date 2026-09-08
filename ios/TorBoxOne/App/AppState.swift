@@ -65,8 +65,8 @@ final class AppState {
 
     var hasTorBoxKey: Bool { !torBoxKey.isEmpty }
     var hasSearchAPI: Bool { URL(string: searchAPIURL)?.host() != nil }
-    /// Всё настроено — приложение работает целиком.
-    var isFullyConfigured: Bool { hasTorBoxKey && hasSearchAPI }
+    /// Search, cloud downloads, and the local player are available.
+    var isFullyConfigured: Bool { hasTorBoxKey && hasSearchAPI && infuse.isInstalled }
 
     var torBoxClient: TorBoxClient? {
         hasTorBoxKey ? TorBoxClient(apiKey: torBoxKey) : nil

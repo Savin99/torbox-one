@@ -158,7 +158,7 @@ struct HomeTab: View {
             VStack(alignment: .leading, spacing: 10) {
                 SectionHeader(
                     title: "Недавно добавленное",
-                    subtitle: "готово к просмотру",
+                    subtitle: "готово в TorBox",
                     actionTitle: "Вся библиотека",
                     action: { appState.selectedTab = .library }
                 )

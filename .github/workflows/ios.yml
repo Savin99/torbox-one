@@ -1,7 +1,7 @@
 name: iOS
 on:
   push:
-    branches: [main, 'feat/infuse-playback-integration']
+    branches: [main]
     paths: ['ios/**', '.github/workflows/ios.yml']
   pull_request:
     paths: ['ios/**', '.github/workflows/ios.yml']

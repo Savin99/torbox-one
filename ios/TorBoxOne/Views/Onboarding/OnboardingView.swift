@@ -295,7 +295,7 @@ struct OnboardingView: View {
                 .buttonStyle(AccentButtonStyle())
                 .disabled(urlInput.trimmingCharacters(in: .whitespaces).isEmpty || searchStatus.isChecking)
 
-                Text("Без сервера поиска приложение всё равно работает: остаются библиотека, плеер и офлайн-файлы.")
+                Text("Без сервера поиска остаются библиотека TorBox, добавление magnet-ссылок и скачивание в Infuse.")
                     .font(.footnote)
                     .foregroundStyle(Theme.textTertiary)
             }

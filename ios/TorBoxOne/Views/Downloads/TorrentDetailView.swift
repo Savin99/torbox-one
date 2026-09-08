@@ -111,6 +111,9 @@ struct TorrentDetailView: View {
         let number = season ?? availableSeasons(videos).first
         return VStack(alignment: .leading, spacing: 12) {
             InfuseLibraryCard()
+            if availableSeasons(videos).count > 1 {
+                seasonPicker(seasons: availableSeasons(videos), files: videos, torrent: torrent)
+            }
             if !batch.isEmpty {
                 Button {
                     download(torrent: torrent, files: batch)
@@ -118,7 +121,7 @@ struct TorrentDetailView: View {
                     HStack {
                         Image(systemName: "arrow.down.to.line")
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(videos.count == 1 ? "Скачать фильм в Infuse" : "Скачать сезон \(number.map(String.init) ?? "") в Infuse")
+                            Text(videos.count == 1 ? "Скачать видео в Infuse" : "Скачать сезон \(number.map(String.init) ?? "") в Infuse")
                                 .font(.headline)
                             Text(selectionSummary(batch)).font(.caption)
                         }
@@ -166,7 +169,7 @@ struct TorrentDetailView: View {
                         .foregroundStyle(Theme.textSecondary)
                 }
             }
-            Text("Смотреть можно, когда TorBox закончит закачку.")
+            Text("Скачать выбранные файлы в Infuse можно после завершения загрузки в TorBox.")
                 .font(.caption)
                 .foregroundStyle(Theme.textTertiary)
         }
@@ -371,7 +374,7 @@ struct TorrentDetailView: View {
         .cardSurface(radius: Theme.radiusM)
     }
 
-    /// Чипы сезонов: «Все» плюс номера. Первым открывается сезон, где остановился.
+    /// Каждый сезон выбирается отдельно, чтобы не скачать весь сериал по ошибке.
     private func seasonPicker(seasons: [Int], files: [TBFile], torrent: TBTorrent) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
