@@ -16,6 +16,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -64,6 +65,9 @@ class TitleMeta:
     matched: bool
     source: str = ""
     source_id: int = 0
+    tmdb_id: int | None = None
+    tmdb_media_type: str | None = None
+    tmdb_lookup_version: int = 1
     title: str = ""
     original_title: str = ""
     year: str = ""
@@ -408,6 +412,34 @@ class TMDBStills:
         return result
 
 
+def resolve_tmdb_library_id(imdb_id: str, expected_type: str) -> tuple[int | None, str | None]:
+    """Resolve an exact external ID using TMDB's official redirect, never a fuzzy title search.
+
+    No redirect is followed: only a validated TMDB movie/TV Location is accepted.
+    A missing match or temporary upstream failure leaves playback unavailable.
+    """
+    if not re.fullmatch(r"tt[0-9]{7,12}", imdb_id):
+        return None, None
+    try:
+        response = requests.head(
+            "https://www.themoviedb.org/redirect",
+            params={"external_source": "imdb_id", "external_id": imdb_id},
+            allow_redirects=False, timeout=8,
+        )
+        if response.status_code not in (301, 302, 303, 307, 308):
+            return None, None
+        location = urlparse(response.headers.get("Location", ""))
+        match = re.fullmatch(r"/(movie|tv)/([1-9][0-9]*)/?", location.path)
+        if (location.scheme != "https" or location.netloc != "www.themoviedb.org"
+                or location.query or location.fragment or not match
+                or match[1] != expected_type):
+            return None, None
+        return int(match[2]), match[1]
+    except requests.RequestException:
+        LOG.warning("TMDB external-ID lookup unavailable")
+        return None, None
+
+
 class MetaService:
     """Фасад: имя раздачи → карточка и серии, всё с кэшем."""
 
@@ -428,7 +460,7 @@ class MetaService:
     def match(self, name: str) -> TitleMeta:
         if self.kinopoisk is None:
             return TitleMeta.empty()
-        cache_key = f"match:{name.strip().casefold()}"
+        cache_key = f"match-tmdb-v1:{name.strip().casefold()}"
         cached = self.cache.get(cache_key)
         if cached is not None:
             return TitleMeta(**cached)
@@ -489,11 +521,15 @@ class MetaService:
         if details.get("serial") or "SERIAL" in media_type or "TV" in media_type:
             seasons_count = self._seasons_count(film_id)
 
+        expected_type = "tv" if details.get("serial") or media_type in {"TV_SERIES", "MINI_SERIES", "TV_SHOW"} else "movie"
+        tmdb_id, tmdb_media_type = resolve_tmdb_library_id(str(details.get("imdbId") or ""), expected_type)
         rating = details.get("ratingKinopoisk") or item.get("rating") or ""
         return TitleMeta(
             matched=True,
             source="kinopoisk",
             source_id=film_id,
+            tmdb_id=tmdb_id,
+            tmdb_media_type=tmdb_media_type,
             title=str(details.get("nameRu") or item.get("nameRu") or item.get("nameEn") or "").strip(),
             original_title=str(
                 details.get("nameOriginal") or item.get("nameEn") or item.get("nameOriginal") or ""
