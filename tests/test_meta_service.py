@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import tempfile
 import time
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -511,6 +513,33 @@ SEASONS_PAYLOAD = {
 }
 
 
+class FakeRedirect:
+    """Ответ редиректа TMDB: он же единственное, что читает resolve_tmdb_library_id."""
+
+    def __init__(self, location: str, status_code: int = 307) -> None:
+        self.status_code = status_code
+        self.headers = {"Location": location}
+
+
+@contextlib.contextmanager
+def tmdb_redirect(location: str | None, status_code: int = 307) -> Iterator[list[dict[str, Any]]]:
+    """Подменяет сетевой вызов TMDB: тесты сеть не трогают."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_head(url: str, **kwargs: Any) -> FakeRedirect:
+        calls.append(dict(kwargs.get("params") or {}))
+        if location is None:
+            raise meta_service.requests.RequestException("TMDB недоступен")
+        return FakeRedirect(location, status_code)
+
+    saved = meta_service.requests.head
+    meta_service.requests.head = fake_head  # type: ignore[assignment]
+    try:
+        yield calls
+    finally:
+        meta_service.requests.head = saved  # type: ignore[assignment]
+
+
 def catalog_service(routes: dict[str, Any], status: int = 200) -> tuple[meta_service.MetaService, FakeHttp]:
     kinopoisk = meta_service.KinopoiskMeta("test-key")
     http = FakeHttp(routes, status)
@@ -614,25 +643,29 @@ class TitleCardTests(unittest.TestCase):
 
     def test_card_carries_seasons_and_external_ids(self) -> None:
         service, _ = catalog_service(self.routes())
-        card = service.title_card(4444)
+        with tmdb_redirect("https://www.themoviedb.org/tv/1399"):
+            card = service.title_card(4444)
         self.assertTrue(card.meta.matched)
         self.assertEqual(card.meta.title, "Игра престолов")
         self.assertEqual(card.meta.original_title, "Game of Thrones")
         self.assertEqual(card.imdb_id, "tt0944947")
         self.assertEqual([(item.season, item.episodes) for item in card.seasons], [(1, 2), (2, 1)])
-        # tmdb_id Кинопоиск не отдаёт, а TMDB в этой сборке не настроен
-        self.assertEqual(card.tmdb_id, 0)
+        # tmdb_id приходит внутри meta и добывается по IMDb, а не поиском
+        self.assertEqual(card.meta.tmdb_id, 1399)
+        self.assertEqual(card.meta.tmdb_media_type, "tv")
 
     def test_card_is_cached_between_calls(self) -> None:
         service, http = catalog_service(self.routes())
-        service.title_card(4444)
-        calls = len(http.calls)
-        service.title_card(4444)
+        with tmdb_redirect("https://www.themoviedb.org/tv/1399"):
+            service.title_card(4444)
+            calls = len(http.calls)
+            service.title_card(4444)
         self.assertEqual(len(http.calls), calls)
 
     def test_card_costs_three_catalog_requests(self) -> None:
         service, http = catalog_service(self.routes())
-        service.title_card(4444)
+        with tmdb_redirect("https://www.themoviedb.org/tv/1399"):
+            service.title_card(4444)
         # Карточка, состав и сезоны — и ни одного лишнего запроса из 500 в сутки
         self.assertEqual(len(http.calls), 3)
 
@@ -730,3 +763,88 @@ class RealTrackerNamesTests(unittest.TestCase):
             "[4K, HDR10, 10-bit] | LostFilm, Amedia"
         )
         self.assertEqual(spec.studios, ["LostFilm", "Amedia"])
+
+
+class ResolveTmdbLibraryIdTests(unittest.TestCase):
+    """Точный tmdb_id по IMDb через редирект TMDB. Ключ API здесь не нужен —
+    в отличие от кадров серий, которые по-прежнему требуют TMDB_API_KEY."""
+
+    def test_series_redirect_is_accepted(self) -> None:
+        with tmdb_redirect("https://www.themoviedb.org/tv/1399") as calls:
+            self.assertEqual(meta_service.resolve_tmdb_library_id("tt0944947", "tv"), (1399, "tv"))
+        self.assertEqual(calls[0], {"external_source": "imdb_id", "external_id": "tt0944947"})
+
+    def test_movie_redirect_is_accepted(self) -> None:
+        with tmdb_redirect("https://www.themoviedb.org/movie/157336"):
+            self.assertEqual(meta_service.resolve_tmdb_library_id("tt0816692", "movie"), (157336, "movie"))
+
+    def test_wrong_type_is_rejected(self) -> None:
+        # Ждали сериал, редирект привёл на фильм — это не наш тайтл
+        with tmdb_redirect("https://www.themoviedb.org/movie/157336"):
+            self.assertEqual(meta_service.resolve_tmdb_library_id("tt0816692", "tv"), (None, None))
+
+    def test_foreign_host_is_rejected(self) -> None:
+        with tmdb_redirect("https://evil.example.org/tv/1399"):
+            self.assertEqual(meta_service.resolve_tmdb_library_id("tt0944947", "tv"), (None, None))
+
+    def test_malformed_imdb_id_never_reaches_the_network(self) -> None:
+        with tmdb_redirect("https://www.themoviedb.org/tv/1399") as calls:
+            self.assertEqual(meta_service.resolve_tmdb_library_id("не-imdb", "tv"), (None, None))
+        self.assertEqual(calls, [], "кривой идентификатор не должен уходить в сеть")
+
+    def test_missing_redirect_is_not_a_match(self) -> None:
+        with tmdb_redirect("https://www.themoviedb.org/tv/1399", status_code=200):
+            self.assertEqual(meta_service.resolve_tmdb_library_id("tt0944947", "tv"), (None, None))
+
+    def test_network_failure_is_survivable(self) -> None:
+        with tmdb_redirect(None):
+            self.assertEqual(meta_service.resolve_tmdb_library_id("tt0944947", "tv"), (None, None))
+
+
+class FakeStills:
+    """Подмена TMDB: считает, звали ли нечёткий поиск по названию."""
+
+    def __init__(self) -> None:
+        self.searches: list[str] = []
+        self.stills_for: list[tuple[int, int]] = []
+
+    def find_series(self, query: str, year: int | None) -> int | None:
+        self.searches.append(query)
+        return 999
+
+    def stills(self, tv_id: int, season: int) -> dict[int, str]:
+        self.stills_for.append((tv_id, season))
+        return {1: "https://image.tmdb.org/t/p/w780/still.jpg"}
+
+
+class StillsUseExactIdTests(unittest.TestCase):
+    def service_with_stills(self) -> tuple[meta_service.MetaService, FakeStills, FakeHttp]:
+        service, http = catalog_service(
+            {"films/4444/seasons": SEASONS_PAYLOAD, "api/v2.2/films/4444": SERIES_FILM_PAYLOAD, "v1/staff": []}
+        )
+        stills = FakeStills()
+        service.tmdb = stills  # type: ignore[assignment]
+        return service, stills, http
+
+    def test_exact_id_is_preferred_over_title_search(self) -> None:
+        service, stills, _ = self.service_with_stills()
+        with tmdb_redirect("https://www.themoviedb.org/tv/1399"):
+            episodes = service.episodes(4444, season=1)
+        self.assertEqual(stills.searches, [], "поиск по названию звать не должны")
+        self.assertEqual(stills.stills_for, [(1399, 1)])
+        self.assertEqual(episodes[0].still_url, "https://image.tmdb.org/t/p/w780/still.jpg")
+
+    def test_title_search_is_the_fallback(self) -> None:
+        service, stills, _ = self.service_with_stills()
+        # Редирект не нашёл тайтл — тогда и только тогда ищем по названию
+        with tmdb_redirect("https://www.themoviedb.org/tv/1399", status_code=404):
+            service.episodes(4444, season=1)
+        self.assertEqual(len(stills.searches), 1)
+        self.assertEqual(stills.stills_for, [(999, 1)])
+
+    def test_resolved_id_is_cached(self) -> None:
+        service, stills, _ = self.service_with_stills()
+        with tmdb_redirect("https://www.themoviedb.org/tv/1399") as calls:
+            service.episodes(4444, season=1)
+            service.episodes(4444, season=2)
+        self.assertEqual(len(calls), 1, "редирект TMDB спрашиваем один раз на тайтл")

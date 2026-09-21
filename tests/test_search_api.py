@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import logging
+import sys
 import tempfile
 import threading
 import time
@@ -648,7 +650,10 @@ class CatalogEndpointTests(unittest.TestCase):
         self.assertTrue(result["meta"]["matched"])
         self.assertEqual(result["meta"]["title"], "Игра престолов")
         self.assertEqual(result["seasons"], [{"season": 1, "episodes": 10}])
-        self.assertEqual(result["tmdb_id"], 0)
+        # tmdb_id и tmdb_media_type приходят внутри meta, рядом их нет
+        self.assertNotIn("tmdb_id", result)
+        self.assertIn("tmdb_id", result["meta"])
+        self.assertIn("tmdb_media_type", result["meta"])
 
     def test_episodes_alias_matches_the_old_path(self) -> None:
         meta = FakeMeta(series_card())
@@ -823,3 +828,46 @@ class RealTopicPageTests(unittest.TestCase):
             )
         self.assertEqual(value, "af9c4501de08d591611b3717c82a0b0fe3e1e0e9")
         self.assertEqual(client.downloads, 0, "хэш берётся из magnet, .torrent не качаем")
+
+
+class LogRedactionTests(unittest.TestCase):
+    """TMDB принимает ключ параметром адреса, поэтому его адрес попадает в
+    текст ошибки requests и в предупреждения urllib3 о повторах — то есть в
+    журнал сервиса. Проверено живьём: без вырезания ключ виден целиком."""
+
+    def format_record(self, message: str, exc: Exception | None = None) -> str:
+        formatter = search_api.RedactingFormatter(search_api.LOG_FORMAT)
+        record = logging.LogRecord(
+            name="проба", level=logging.WARNING, pathname=__file__, lineno=1,
+            msg=message, args=(), exc_info=None,
+        )
+        if exc is not None:
+            try:
+                raise exc
+            except Exception:
+                record.exc_info = sys.exc_info()
+        return formatter.format(record)
+
+    def test_tmdb_key_in_a_url_is_cut(self) -> None:
+        line = self.format_record(
+            "TMDB не отдал кадры: https://api.themoviedb.org/3/tv/1399/season/1?api_key=0123456789abcdef0123456789abcdef"
+        )
+        self.assertNotIn("0123456789abcdef", line)
+        self.assertIn("api_key=<вырезано>", line)
+
+    def test_key_inside_a_traceback_is_cut(self) -> None:
+        error = RuntimeError(
+            "500 Server Error for url: https://api.themoviedb.org/3/tv/1/season/1?api_key=SEKRETSEKRETSEKRET"
+        )
+        line = self.format_record("TMDB не отдал кадры", exc=error)
+        self.assertNotIn("SEKRET", line)
+        self.assertIn("api_key=<вырезано>", line)
+
+    def test_bearer_and_passkey_are_cut_too(self) -> None:
+        line = self.format_record("ссылка https://tracker.test/dl?passkey=abcdef0123&token=zzz9")
+        self.assertNotIn("abcdef0123", line)
+        self.assertNotIn("zzz9", line)
+
+    def test_ordinary_lines_are_untouched(self) -> None:
+        line = self.format_record("Поиск ['Дюна 2021']: 8 релизов")
+        self.assertIn("Поиск ['Дюна 2021']: 8 релизов", line)

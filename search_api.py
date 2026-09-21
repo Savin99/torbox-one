@@ -28,12 +28,34 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any
 from urllib.parse import urljoin
 
-# Логгер настраивается до импорта бота: torbox_tg_bot вызывает
-# logging.basicConfig на импорте и иначе перехватил бы конфигурацию uvicorn.
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+# TMDB принимает ключ параметром адреса, а не заголовком. Поэтому его адрес
+# с ключом попадает и в текст ошибки requests, и в предупреждения urllib3 о
+# повторах — то есть в журнал сервиса открытым текстом. Вырезаем в
+# форматтере, а не фильтре: фильтр не видит трассировку исключения.
+SECRET_IN_TEXT_RE = re.compile(r"(api_key|apikey|token|passkey|key)=[^&\s\"'<>]+", re.IGNORECASE)
+
+
+class RedactingFormatter(logging.Formatter):
+    """Форматтер, убирающий ключи из всего, что уходит в журнал."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return SECRET_IN_TEXT_RE.sub(r"\1=<вырезано>", super().format(record))
+
+
+def configure_logging() -> None:
+    """Настраивает журнал до импорта бота.
+
+    torbox_tg_bot зовёт logging.basicConfig на импорте и иначе перехватил бы
+    конфигурацию uvicorn, поэтому порядок здесь важен.
+    """
+    handler = logging.StreamHandler()
+    handler.setFormatter(RedactingFormatter(LOG_FORMAT))
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), handlers=[handler])
+
+
+configure_logging()
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
@@ -649,10 +671,14 @@ class SeasonItem(BaseModel):
 
 
 class TitleCardResult(BaseModel):
-    """Ответ `/catalog/title/{kp_id}`: карточка плюс внешние id и сезоны."""
+    """Ответ `/catalog/title/{kp_id}`: карточка плюс внешние id и сезоны.
+
+    `tmdb_id` и `tmdb_media_type` лежат внутри `meta`, а не рядом: их
+    отдаёт сам `TitleMeta`, и дублировать их сюда значило бы завести два
+    источника правды для одного значения.
+    """
 
     meta: dict[str, Any]
-    tmdb_id: int = 0
     imdb_id: str = ""
     seasons: list[SeasonItem] = Field(default_factory=list)
 
@@ -863,9 +889,10 @@ def catalog_title(kp_id: int) -> TitleCardResult:
         kp_id: Идентификатор Кинопоиска.
 
     Returns:
-        TitleMeta, идентификаторы TMDB и IMDb и состав сезонов. tmdb_id
-        Кинопоиск не отдаёт ни одним эндпоинтом — он ищется в самом TMDB
-        по оригинальному названию и году, и только для сериалов.
+        TitleMeta, идентификатор IMDb и состав сезонов. `tmdb_id` и
+        `tmdb_media_type` приходят внутри `meta`: Кинопоиск их не отдаёт,
+        и сервер выясняет их у самого TMDB по IMDb-идентификатору —
+        точным редиректом, без ключа API.
     """
     if not META.available:
         raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
@@ -875,7 +902,6 @@ def catalog_title(kp_id: int) -> TitleCardResult:
         raise catalog_error(exc) from exc
     return TitleCardResult(
         meta=dataclasses.asdict(card.meta),
-        tmdb_id=card.tmdb_id,
         imdb_id=card.imdb_id,
         seasons=[SeasonItem(season=item.season, episodes=item.episodes) for item in card.seasons],
     )

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RootTabView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         @Bindable var state = appState
@@ -22,6 +23,14 @@ struct RootTabView: View {
         .overlay(alignment: .top) {
             ToastOverlay(toasts: appState.toasts)
         }
+        .overlay {
+            if appState.infuse.isPreparing {
+                InfusePreparationOverlay(coordinator: appState.infuse)
+            }
+        }
+        .sheet(item: Binding(get: { appState.infuse.sheet }, set: { appState.infuse.sheet = $0 })) { sheet in
+            InfuseIntegrationSheet(sheet: sheet)
+        }
         .fullScreenCover(isPresented: Binding(
             get: { !appState.didOnboard },
             set: { if !$0 { state.didOnboard = true } }
@@ -30,6 +39,9 @@ struct RootTabView: View {
         }
         .onChange(of: appState.selectedTab) { _, _ in
             Haptics.tap()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { appState.infuse.refreshAvailability() }
         }
         .onChange(of: appState.pendingMagnet) { _, magnet in
             // Ссылка magnet: из другого приложения — ведём в «Библиотеку»,
