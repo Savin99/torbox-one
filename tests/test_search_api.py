@@ -783,3 +783,43 @@ class FuturesTimeoutTests(unittest.TestCase):
         finally:
             search_api.as_completed = saved  # type: ignore[assignment]
         self.assertEqual(result.hashes, {"nnm:1": None})
+
+
+class RealTopicPageTests(unittest.TestCase):
+    """Страница темы NNM-Club, снятая живьём 21.09.2026 и вычищенная.
+
+    Смотрел анонимно, без входа: ни `sid=`, ни passkey, ни ссылок на профиль
+    на странице нет — проверено поиском перед сохранением."""
+
+    def setUp(self) -> None:
+        path = Path(__file__).parent / "fixtures" / "nnm-topic.html"
+        self.page = path.read_text(encoding="utf-8")
+
+    def test_restore_reads_attachment_id_title_and_magnet(self) -> None:
+        release = search_api.restore_nnm_topic(FakeNnmClient(page=self.page), "1201971")
+        assert release is not None
+        # Ссылка на .torrent живёт под номером вложения, а не темы
+        self.assertEqual(release.torrent_id, "979391")
+        self.assertEqual(release.topic_id, "1201971")
+        self.assertIn("download.php?id=979391", release.download_url)
+        self.assertTrue(release.title.startswith("Интерстеллар / Interstellar (2014)"))
+        self.assertNotIn("NNM-Club", release.title)
+
+    def test_magnet_on_the_page_gives_the_hash_for_free(self) -> None:
+        release = search_api.restore_nnm_topic(FakeNnmClient(page=self.page), "1201971")
+        assert release is not None
+        self.assertTrue(release.magnet_url.startswith("magnet:?xt=urn:btih:"))
+        # Живьём этот же хэш совпал с sha1 от info-словаря скачанного .torrent
+        self.assertEqual(
+            search_api.normalized_info_hash(release.info_hash),
+            "af9c4501de08d591611b3717c82a0b0fe3e1e0e9",
+        )
+
+    def test_restored_release_needs_no_torrent_download_for_its_hash(self) -> None:
+        client = FakeNnmClient(page=self.page, torrent=SMALL_TORRENT)
+        with providers_replaced([client]), cache_replaced(search_api.ReleaseCache()):
+            value = search_api.release_info_hash(
+                "nnm:1201971", search_api.restore_nnm_topic(client, "1201971")
+            )
+        self.assertEqual(value, "af9c4501de08d591611b3717c82a0b0fe3e1e0e9")
+        self.assertEqual(client.downloads, 0, "хэш берётся из magnet, .torrent не качаем")

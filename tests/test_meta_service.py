@@ -651,3 +651,82 @@ class GenreDirectoryTests(unittest.TestCase):
     def test_unknown_genre_has_no_id(self) -> None:
         service, _ = catalog_service({"films/filters": FILTERS_PAYLOAD})
         self.assertIsNone(service.genre_id("киберпанк"))
+
+
+class RealTrackerNamesTests(unittest.TestCase):
+    """Имена сняты живьём с NNM-Club и Prowlarr 21.09.2026. Это публичные
+    строки трекера, и они здесь ровно затем, чтобы разбор проверялся не на
+    придуманных примерах."""
+
+    def test_season_range_glued_to_episode_range(self) -> None:
+        # «S1-8E1-73 of 73» — правая граница сезонов упирается в маркер серий.
+        # Живьём такой релиз разбирался как «сезон 1» с 73 сериями в нём.
+        scope = meta_service.parse_release_scope(
+            "Игра престолов / Game of Thrones, S1-8E1-73 of 73 (2011-2019) BDRip 720p, WEB-DL"
+        )
+        self.assertEqual((scope.season_from, scope.season_to), (1, 8))
+        self.assertEqual((scope.episode_from, scope.episode_to), (1, 73))
+        self.assertEqual(scope.episodes_declared, 73)
+
+    def test_single_season_with_episode_range(self) -> None:
+        scope = meta_service.parse_release_scope(
+            "Игра престолов / Game of Thrones, S8E1-6 of 6 (2019) WEB-DL 1080p-Amedia"
+        )
+        self.assertEqual((scope.season_from, scope.season_to), (8, 8))
+        self.assertEqual((scope.episode_from, scope.episode_to), (1, 6))
+        self.assertEqual(scope.episodes_declared, 6)
+
+    def test_bracketed_season_range(self) -> None:
+        scope = meta_service.parse_release_scope(
+            "Игра престолов / Game of Thrones [S01-08] (2011-2019) BDRip-HEVC 1080p от RIPS CLUB"
+        )
+        self.assertEqual((scope.season_from, scope.season_to), (1, 8))
+
+    def test_russian_season_and_episode_words(self) -> None:
+        scope = meta_service.parse_release_scope(
+            "Игра престолов / Game of Thrones (2011-2019) BDRemux [H.264/1080p] "
+            "(сезон 1-8, серии 1-73 из 73)"
+        )
+        self.assertEqual((scope.season_from, scope.season_to), (1, 8))
+        self.assertEqual((scope.episode_from, scope.episode_to), (1, 73))
+        self.assertEqual(scope.episodes_declared, 73)
+
+    def test_spin_off_movie_has_no_season(self) -> None:
+        scope = meta_service.parse_release_scope(
+            "Игра престолов: Последний дозор / Game of Thrones: The Last Watch (2019) WEB-DL 1080p"
+        )
+        self.assertIsNone(scope.season_from)
+        self.assertIsNone(scope.episode_from)
+
+    def test_real_movie_quality_lines(self) -> None:
+        cases = [
+            ("Интерстеллар / Interstellar (2014) UHD BDRemux [H.265/2160p] [4K, HDR, 10-bit] [IMAX Edition]",
+             2160, "bdremux", "h265", "hdr"),
+            ("Интерстеллар / Interstellar (2014) BDRip [H.265/2160p] [4K, HDR10, 10-bit] [IMAX Edition]",
+             2160, "bdrip", "h265", "hdr10"),
+            ("Интерстеллар / Interstellar (2014) BDRip 720p | 60 fps-IMAX", 720, "bdrip", None, None),
+            ("Интерстеллар / Interstellar (2014) BDRip-AVC | 60 fps", None, "bdrip", "h264", None),
+        ]
+        for title, resolution, source, codec, hdr in cases:
+            with self.subTest(title=title[:40]):
+                spec = meta_service.parse_video_spec(title)
+                self.assertEqual(spec.resolution, resolution)
+                self.assertEqual(spec.source_type, source)
+                self.assertEqual(spec.video_codec, codec)
+                self.assertEqual(spec.hdr, hdr)
+
+    def test_dolby_vision_and_track_codes_together(self) -> None:
+        title = (
+            "Интерстеллар / Interstellar (2014) UHD BDRemux 2160p | 4K | HDR | IMAX Edition | "
+            "Dolby Vision Profile 8 | D, P, A-Лицензия"
+        )
+        self.assertEqual(meta_service.parse_video_spec(title).hdr, "dolby_vision")
+        kinds = meta_service.parse_voiceover_spec(title).kinds
+        self.assertEqual(set(kinds), {"licensed", "dub", "professional", "author"})
+
+    def test_studios_from_a_real_release_name(self) -> None:
+        spec = meta_service.parse_voiceover_spec(
+            "Игра престолов / Game of Thrones (2011-2019) UHD BDRemux [H.265/2160p] "
+            "[4K, HDR10, 10-bit] | LostFilm, Amedia"
+        )
+        self.assertEqual(spec.studios, ["LostFilm", "Amedia"])
