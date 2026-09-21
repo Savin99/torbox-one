@@ -1,5 +1,5 @@
 [Unit]
-Description=TorBox One Search API (FastAPI)
+Description=TorBox One Search API
 After=network-online.target
 Wants=network-online.target
 
@@ -7,16 +7,9 @@ Wants=network-online.target
 Type=exec
 DynamicUser=yes
 StateDirectory=torbox-search-api
-# Кэши каталога, полок, хэшей и релизов складываются в StateDirectory
-# (/var/lib/torbox-search-api). Рабочий каталог под ProtectSystem=strict
-# только для чтения, и без этой переменной ни один кэш не сохранялся бы:
-# суточная квота Кинопоиска — 500 запросов, и её нельзя тратить заново
-# после каждого перезапуска. Объявлено до EnvironmentFile, чтобы значение
-# из окружения при желании перекрывало это.
-Environment=SEARCH_API_STATE_DIR=%S/torbox-search-api
-EnvironmentFile=/etc/torbox-telegram-bot.env
-WorkingDirectory=/opt/torbox-telegram-bot
-ExecStart=/opt/torbox-telegram-bot/.venv/bin/uvicorn search_api:app --host 127.0.0.1 --port 8787
+EnvironmentFile=/etc/torbox-search-api.env
+WorkingDirectory=/opt/torbox-one
+ExecStart=/opt/torbox-one/.venv-search/bin/uvicorn search_api:app --host 127.0.0.1 --port 18787
 Restart=on-failure
 RestartSec=5
 
