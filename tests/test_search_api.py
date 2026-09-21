@@ -735,3 +735,51 @@ class SourceStatusTests(unittest.TestCase):
         expected = {"ok": "1", "error": "ошибка", "timeout": "таймаут"}
         for source in payload.sources:
             self.assertEqual(payload.status[source.name], expected[source.state])
+
+
+class FuturesTimeoutTests(unittest.TestCase):
+    """До Python 3.11 concurrent.futures.TimeoutError — отдельный класс, а не
+    встроенный TimeoutError. На боевом сервере Python 3.10.12, и `except
+    TimeoutError` там дедлайн не ловил: вместо partial клиент получал 500.
+    На Mac (3.14) оба имени указывают на один объект, поэтому обычные тесты
+    дедлайна ошибку не видели."""
+
+    def test_handler_catches_the_futures_class_not_the_builtin(self) -> None:
+        import concurrent.futures
+
+        self.assertIs(search_api.FuturesTimeout, concurrent.futures.TimeoutError)
+
+    def test_deadline_survives_the_futures_timeout(self) -> None:
+        import concurrent.futures
+
+        def raise_timeout(*args: object, **kwargs: object) -> object:
+            raise concurrent.futures.TimeoutError("срок вышел")
+
+        provider = StaticProvider("nnm", "NNM-Club", [video_release("Дюна 2021 WEB-DL 1080p")])
+        saved = search_api.as_completed
+        search_api.as_completed = raise_timeout  # type: ignore[assignment]
+        try:
+            with providers_replaced([provider]), cache_replaced(search_api.ReleaseCache()):
+                payload = search_api.tracker_search(q="Дюна 2021", deadline=5)
+        finally:
+            search_api.as_completed = saved  # type: ignore[assignment]
+        self.assertTrue(payload.partial)
+        self.assertEqual([source.state for source in payload.sources], ["timeout"])
+
+    def test_hashes_survive_the_futures_timeout(self) -> None:
+        import concurrent.futures
+
+        def raise_timeout(*args: object, **kwargs: object) -> object:
+            raise concurrent.futures.TimeoutError("срок вышел")
+
+        saved = search_api.as_completed
+        search_api.as_completed = raise_timeout  # type: ignore[assignment]
+        try:
+            with providers_replaced([FakeNnmClient(torrent=SMALL_TORRENT)]):
+                with cache_replaced(search_api.ReleaseCache()):
+                    result = search_api.release_hashes(
+                        search_api.HashRequest(ids=["nnm:1"], deadline=5)
+                    )
+        finally:
+            search_api.as_completed = saved  # type: ignore[assignment]
+        self.assertEqual(result.hashes, {"nnm:1": None})

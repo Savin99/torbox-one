@@ -21,6 +21,10 @@ import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+# До Python 3.11 concurrent.futures.TimeoutError — отдельный класс, а не
+# встроенный TimeoutError. На сервере 3.10, и `except TimeoutError` там
+# дедлайн не ловил вовсе: вместо partial клиент получал 500.
+from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any
 from urllib.parse import urljoin
 
@@ -413,7 +417,7 @@ def collect_info_hashes(ids: list[str], deadline: float) -> dict[str, str | None
                 result[release_id] = future.result()
             except Exception as exc:
                 LOG.warning("Хэш релиза %s не посчитан: %s", release_id, exc)
-    except TimeoutError:
+    except FuturesTimeout:
         LOG.warning("Хэши: не успели к сроку %s с, отдаю что посчитали", deadline)
     finally:
         # Ждать отставших нельзя: срок общий, и ответ уходит сейчас
@@ -515,7 +519,7 @@ def aggregate_releases(
                 continue
             counts[provider.name] += len(items)
             found.extend((query, item) for item in items)
-    except TimeoutError:
+    except FuturesTimeout:
         partial = True
         LOG.warning("Поиск: срок %s с вышел, отдаю что успели", deadline)
     finally:
