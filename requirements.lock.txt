@@ -1,0 +1,10 @@
+# Runtime versions verified on the production server. Python 3.10+.
+bencodepy==0.9.5
+certifi==2026.7.22
+charset-normalizer==3.4.9
+cloudscraper==1.2.71
+idna==3.18
+pyparsing==3.3.2
+requests==2.34.2
+requests-toolbelt==1.0.0
+urllib3==2.7.0

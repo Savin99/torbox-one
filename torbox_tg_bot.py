@@ -16,13 +16,15 @@ import re
 import signal
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
-from threading import Event, Lock, RLock, Thread, Timer, get_ident, local
+from threading import Event, Lock, RLock, Thread, get_ident, local
 from typing import Any, Protocol
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
+from weakref import WeakValueDictionary
 
 import bencodepy
 import cloudscraper
@@ -30,18 +32,27 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from torbox_runtime import (
+    PRIVATE_LOG, OutboundThrottle, RateLimiter, ThreadLocalHTTP, UserDispatcher,
+    configure_private_logging, write_private_json,
+)
+
 APP_DIR = Path(__file__).resolve().parent
 STATE_PATH = Path(os.getenv("STATE_PATH", str(APP_DIR / "state.json")))
 CREDENTIALS_PATH = Path(os.getenv("CREDENTIALS_PATH", str(APP_DIR / "credentials.json")))
 NNM_BASE = "https://nnmclub.to/forum/"
 TORBOX_API = "https://api.torbox.app/v1/api"
+SETUP_GUIDE_URL = "https://telegra.ph/TorBox--Infuse-nastrojka-s-nulya-09-13"
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 MAX_RESULTS = 8
 MAX_SEARCH_CANDIDATES = 24
 MAX_PROVIDER_RESULTS = 80
 TORBOX_PAGE_SIZE = 6
+SEARCH_PAGE_SIZE = 3
+FILE_PAGE_SIZE = 6
 MAX_QUERY_LENGTH = 120
 MAX_TORRENT_BYTES = 4 * 1024 * 1024
+MAX_SEARCH_CACHE = 64
 USER_AGENT = "Mozilla/5.0 (compatible; TorBoxPrivateTelegramBot/1.0)"
 
 BTN_SEARCH = "🔎 Поиск"
@@ -73,6 +84,7 @@ BOTTOM_ACTIONS = {
 BOTTOM_KEYBOARD_VERSION = 7
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+configure_private_logging()
 LOG = logging.getLogger("torbox_tg_bot")
 STOP = Event()
 
@@ -80,19 +92,52 @@ STOP = Event()
 def configure_read_retries(session: requests.Session) -> None:
     """Retry transient read failures without replaying mutations."""
     retry = Retry(
-        total=2,
-        connect=2,
-        read=2,
-        status=2,
+        total=1,
+        connect=1,
+        read=0,
+        status=1,
         backoff_factor=0.4,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
-        respect_retry_after_header=True,
+        respect_retry_after_header=False,
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+
+
+def http_session() -> requests.Session:
+    session = requests.Session()
+    configure_read_retries(session)
+    return session
+
+
+def scraper_session() -> requests.Session:
+    session = cloudscraper.create_scraper()
+    configure_read_retries(session)
+    return session
+
+
+def public_error(exc: Exception) -> str:
+    if isinstance(exc, requests.RequestException):
+        return "Сервис временно не отвечает. Попробуй ещё раз через минуту."
+    if str(exc).startswith("Сначала подключи"):
+        return "Сначала подключи свой TorBox через /connect."
+    return "Не удалось выполнить запрос. Проверь /status и попробуй ещё раз."
+
+
+def torrent_response_bytes(response: requests.Response) -> bytes:
+    try:
+        response.raise_for_status()
+        content = bytearray()
+        for chunk in response.iter_content(16 * 1024):
+            if len(content) + len(chunk) > MAX_TORRENT_BYTES:
+                raise RuntimeError("Torrent file is unexpectedly large")
+            content.extend(chunk)
+        return bytes(content)
+    finally:
+        response.close()
 
 QUALITY_POSITIVE = {
     "дублированный": 50, "официальный": 35, "lostfilm": 30,
@@ -152,22 +197,21 @@ class CatalogTitle:
 
     @property
     def search_query(self) -> str:
-        return " ".join(part for part in (self.name, self.year) if part).strip()
+        return self.name if self.media_type.upper() in {"TV_SERIES", "MINI_SERIES", "SERIES", "TV_SHOW"} else " ".join(part for part in (self.name, self.year) if part).strip()
 
 
-class KinopoiskCatalog:
+class KinopoiskCatalog(ThreadLocalHTTP):
     """Optional Russian-language movie catalog used by Telegram inline mode."""
 
     API_URL = "https://kinopoiskapiunofficial.tech/api/v2.1/films/search-by-keyword"
     POPULAR_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/collections"
 
     def __init__(self, api_key: str) -> None:
-        self.http = requests.Session()
-        configure_read_retries(self.http)
-        self.http.headers.update({"X-API-KEY": api_key.strip(), "Accept": "application/json", "User-Agent": USER_AGENT})
+        PRIVATE_LOG.add_secret(api_key)
+        self.init_http(http_session, {"X-API-KEY": api_key.strip(), "Accept": "application/json", "User-Agent": USER_AGENT})
 
     def search(self, query: str) -> list[CatalogTitle]:
-        response = self.http.get(self.API_URL, params={"keyword": query, "page": 1}, timeout=15)
+        response = self.http.get(self.API_URL, params={"keyword": query, "page": 1}, timeout=(5, 15), allow_redirects=False)
         response.raise_for_status()
         payload = response.json()
         films = payload.get("films") if isinstance(payload, dict) else None
@@ -180,6 +224,7 @@ class KinopoiskCatalog:
             self.POPULAR_URL,
             params={"type": "TOP_POPULAR_ALL", "page": 1},
             timeout=15,
+            allow_redirects=False,
         )
         response.raise_for_status()
         payload = response.json()
@@ -316,9 +361,11 @@ def progress_percent(raw: Any) -> float:
 
 def status_label(item: dict[str, Any]) -> tuple[str, str]:
     state = str(item.get("download_state") or "unknown").strip().casefold()
+    if item.get("download_finished") and item.get("download_present") is False:
+        return "⏳", "подготовка файлов"
     if item.get("download_finished") or item.get("cached") or state in {"cached", "completed", "uploading"}:
         return "✅", "готово"
-    if "error" in state or "missing" in state or "no seeds" in state:
+    if "error" in state or "missing" in state or "no seeds" in state or "stalled" in state:
         return "⚠️", "нужна проверка"
     if "pause" in state:
         return "⏸", "приостановлено"
@@ -327,6 +374,16 @@ def status_label(item: dict[str, Any]) -> tuple[str, str]:
     if item.get("active") or "down" in state:
         return "⬇️", "скачивается"
     return "⏳", state or "ожидание"
+
+
+def torrent_ready(item: dict[str, Any]) -> bool:
+    if "download_present" in item:
+        return item["download_present"] is True
+    return status_label(item)[0] == "✅"
+
+
+def natural_file_key(name: str) -> tuple[Any, ...]:
+    return tuple(int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", name))
 
 
 def safe_torrent_id(raw: Any) -> int:
@@ -473,24 +530,202 @@ def release_variant_key(release: Release) -> str:
     return f"{quality}|{voiceover}"
 
 
+def release_season_numbers(title: str) -> tuple[int, ...]:
+    """Read explicit EN/RU season labels without mistaking episode counts for seasons."""
+    seasons: set[int] = set()
+    def add_numbers(value: str) -> None:
+        for match in re.finditer(r"(?<!\d)(\d{1,2})(?:\s*[-–—]\s*[sS]?(\d{1,2}))?(?!\d)", value):
+            first = int(match[1])
+            last = int(match[2] or first)
+            if 1 <= first <= last <= 99:
+                seasons.update(range(first, last + 1))
+    for match in re.finditer(r"(?i)\bS(\d{1,2}(?:\s*[-–—]\s*S?\d{1,2})?)(?!\d)", title):
+        add_numbers(match[1])
+    numbers = r"\d{1,2}(?:\s*[-–—,]\s*\d{1,2}|\s+и\s+\d{1,2})*"
+    for pattern in [rf"(?i)сезон(?:ы|ов)?\s*[:№#]?\s*({numbers})(?!\d)",
+                    rf"(?i)(?<!\d)({numbers})\s*(?:-?й\s+)?сезон"]:
+        for match in re.finditer(pattern, title):
+            add_numbers(match[1])
+    return tuple(sorted(seasons))
+
+
+def release_is_partial_season(title: str) -> bool:
+    """Episode-only batches need explicit full coverage before being treated as a season."""
+    match = re.search(
+        r"(?i)(?:\bS\d{1,2}\s*E|\bE|серии?\s*[:№]?\s*)(\d{1,3})"
+        r"(?:\s*[-–—]\s*E?(\d{1,3}))?\s*(?:(?:of|из|/)\s*(\d{1,3}))?", title,
+    )
+    if match:
+        first, last = int(match[1]), int(match[2] or match[1])
+        total = int(match[3]) if match[3] else None
+        return not (total is not None and first == 1 and last == total)
+    return bool(re.search(r"(?i)неполны[йе]|пополняем|ongoing", title))
+
+
+SEARCH_DEFAULTS = {"quality": "1080", "audio": "dub", "complete": True, "fallback": True}
+SEARCH_QUALITIES = {"1080": "1080p", "720": "720p", "2160": "4K", "any": "Любое качество"}
+SEARCH_AUDIO = {"dub": "Дубляж", "multi": "Многоголосая", "dvo": "Двухголосая",
+                "lostfilm": "LostFilm", "hdrezka": "HDRezka", "any": "Любая озвучка"}
+
+
+def search_preferences(raw: Any = None) -> dict[str, Any]:
+    raw = raw if isinstance(raw, dict) else {}
+    return {"quality": raw.get("quality") if raw.get("quality") in SEARCH_QUALITIES else "1080",
+            "audio": raw.get("audio") if raw.get("audio") in SEARCH_AUDIO else "dub",
+            "complete": raw.get("complete", True) is not False,
+            "fallback": raw.get("fallback", True) is not False}
+
+
+def release_resolution(release: Release) -> str:
+    match = re.search(r"(?i)\b(2160|1080|720)[pi]\b|\b(4k)\b", release.title + " " + release.details_text)
+    return (match[1] or "2160") if match else "unknown"
+
+
+def release_audio_tags(release: Release) -> set[str]:
+    # A tracker's translation field is stronger evidence than the filename.
+    translation = _labeled_value(release.details_text, "Перевод")
+    text = translation or release.title
+    tags: set[str] = set()
+    no_dub = re.search(r"(?i)без\s+дубляжа|не\s+дублирован", text)
+    if not no_dub and re.search(r"(?i)\bдублирован\w*|\bдублирование\b|\bдубляж\w*|\bdub(?:bed)?\b|(?:\[|\||,)\s*D(?=\s*[,|\]])", text):
+        tags.add("dub")
+    for tag, pattern in [("multi", r"\bMVO\b|многоголос"), ("dvo", r"\bDVO\b|двухголос")]:
+        if re.search(pattern, text, re.I):
+            tags.add(tag)
+    for tag in ("lostfilm", "hdrezka"):
+        if re.search(r"\b" + tag + r"\b", release.title + " " + text, re.I):
+            tags.add(tag)
+    # DUAL denotes multiple audio tracks; it is not proof of Russian dubbing.
+    return tags
+
+
+def release_matches_preferences(release: Release, prefs: dict[str, Any]) -> bool:
+    return (not re.search(r"(?i)\b(?:camrip|hdcam|cam|telesync|tsrip|ts)\b", release.title) and
+            (prefs["quality"] == "any" or release_resolution(release) == prefs["quality"]) and
+            (prefs["audio"] == "any" or prefs["audio"] in release_audio_tags(release)))
+
+
+def personalized_releases(releases: list[Release], prefs: dict[str, Any]) -> list[Release]:
+    """Rank by explicit preferences; keep every candidate for season/alternate selection."""
+    unique: dict[str, Release] = {}
+    for item in releases:
+        key = release_dedupe_key(item)
+        if key not in unique or item.score > unique[key].score:
+            unique[key] = item
+    def rank(item: Release) -> tuple[Any, ...]:
+        quality = release_resolution(item)
+        requested = prefs["quality"]
+        quality_fit = 3 if requested == "any" or quality == requested else (2 if quality == "1080" else 1 if quality in {"720", "2160"} else 0)
+        audio = release_audio_tags(item)
+        audio_fit = 3 if prefs["audio"] == "any" or prefs["audio"] in audio else 1 if audio else 0
+        seasons = release_season_numbers(item.title)
+        partial = release_is_partial_season(item.title) if seasons else False
+        safe = not bool(re.search(r"(?i)\b(?:camrip|hdcam|cam|telesync|tsrip|ts)\b", item.title))
+        available = item.cached is True or item.seeders > 0
+        complete = not partial if prefs["complete"] else True
+        coverage = len(seasons) if prefs["complete"] and not partial else 0
+        # Preferences dominate seed counts and generic 4K/remux bonuses.
+        return (safe, available, quality_fit, complete, audio_fit, coverage, item.cached is True,
+                min(item.seeders, 100), max(-200, min(item.score, 400)), -max(item.size_bytes, 0))
+    ranked = sorted(unique.values(), key=rank, reverse=True)
+    if not prefs["complete"] or not ranked:
+        return ranked
+    # Spotlight one useful choice for each uncovered season before redundant editions.
+    front = [ranked[0]]
+    covered = set(release_season_numbers(ranked[0].title)) if not release_is_partial_season(ranked[0].title) else set()
+    seasons = sorted({n for item in ranked for n in release_season_numbers(item.title)})
+    for season in seasons:
+        if season in covered:
+            continue
+        candidates = [r for r in ranked if season in release_season_numbers(r.title)]
+        # Preserve availability and quality priorities when spotlighting a season.
+        best = candidates[0]
+        if best not in front:
+            front.append(best)
+        covered.update(release_season_numbers(best.title))
+    return front + [r for r in ranked if r not in front]
+
+
+def season_summary(seasons: Any) -> str:
+    numbers = sorted(set(seasons))
+    groups = []
+    for number in numbers:
+        if groups and number == groups[-1][-1] + 1:
+            groups[-1].append(number)
+        else:
+            groups.append([number])
+    return ", ".join(str(g[0]) if len(g) == 1 else f"{g[0]}–{g[-1]}" for g in groups)
+
+
 def select_diverse_releases(releases: list[Release], limit: int = MAX_RESULTS) -> list[Release]:
-    """Keep a short Telegram list useful instead of filling it with clones."""
+    """Keep a short list useful, preserving season coverage before edition variety."""
     selected: list[Release] = []
     selected_ids: set[int] = set()
     variant_counts: dict[str, int] = {}
     source_counts: dict[str, int] = {}
 
+    def append(index: int) -> None:
+        release = releases[index]
+        selected.append(release)
+        selected_ids.add(index)
+        variant = release_variant_key(release)
+        source = release.source_name.casefold()
+        variant_counts[variant] = variant_counts.get(variant, 0) + 1
+        source_counts[source] = source_counts.get(source, 0) + 1
+
+    coverage_by_index = {
+        index: release_season_numbers(release.title)
+        for index, release in enumerate(releases)
+    }
+    seasons = sorted({season for coverage in coverage_by_index.values() for season in coverage})
+    season_aware = len(seasons) >= 2
+
+    if season_aware:
+        priority_indices: set[int] = set()
+
+        # Keep the strongest complete multi-season pack as the simplest choice.
+        pack_candidates = [
+            index for index, coverage in coverage_by_index.items()
+            if len(coverage) > 1 and not release_is_partial_season(releases[index].title)
+        ]
+        if not pack_candidates:
+            pack_candidates = [index for index, coverage in coverage_by_index.items() if len(coverage) > 1]
+        if pack_candidates:
+            priority_indices.add(pack_candidates[0])
+
+        # Also retain one exact result for every season. Quality/voice similarity
+        # must not let S01 and S02 push S03 out of a short list.
+        for season in seasons:
+            exact = [
+                index for index, coverage in coverage_by_index.items()
+                if coverage == (season,)
+            ]
+            if exact:
+                complete = [index for index in exact if not release_is_partial_season(releases[index].title)]
+                priority_indices.add((complete or exact)[0])
+
+        for index in sorted(priority_indices):
+            if len(selected) >= limit:
+                return selected
+            append(index)
+
     for index, release in enumerate(releases):
+        if index in selected_ids:
+            continue
+        if season_aware and release.seeders <= 0:
+            continue
         variant = release_variant_key(release)
         source = release.source_name.casefold()
         if variant_counts.get(variant, 0) >= 2 or source_counts.get(source, 0) >= 5:
             continue
-        selected.append(release)
-        selected_ids.add(index)
-        variant_counts[variant] = variant_counts.get(variant, 0) + 1
-        source_counts[source] = source_counts.get(source, 0) + 1
+        append(index)
         if len(selected) >= limit:
             return selected
+
+    # A season-aware list can be shorter than the hard limit. Filling it with
+    # dead S01 clones makes coverage less clear and adds no useful choice.
+    if season_aware:
+        return selected
 
     # Do not return an artificially short list when only one edition exists.
     for index, release in enumerate(releases):
@@ -536,6 +771,8 @@ def video_quality_summary(release: Release, details: str = "") -> str:
         ("HDTV", r"\bhdtv\b"),
         ("HDRip", r"\bhdrip\b"),
         ("DVDRip", r"\bdvdrip\b"),
+        ("CAM — съёмка с экрана", r"\b(?:camrip|hdcam|cam)\b"),
+        ("TS — экранная копия", r"\b(?:telesync|tsrip|ts)\b"),
         ("4K / 2160p", r"\b(?:4k|2160p)\b"),
         ("1080p", r"\b1080p\b"),
         ("720p", r"\b720p\b"),
@@ -566,6 +803,7 @@ def voiceover_summary(release: Release, details: str = "") -> str:
         ("Одноголосая", r"одноголос\w*"),
         ("Авторская", r"авторск\w*"),
         ("Кравец", r"\b(?:kravec|кравец)\b"),
+        ("Пифагор", r"\b(?:pifagor|пифагор)\b"),
         ("AlexFilm", r"\balexfilm\b"),
         ("LostFilm", r"\blostfilm\b"),
         ("Amedia", r"\b(?:amedia|амедиа)\b"),
@@ -596,6 +834,10 @@ def voiceover_summary(release: Release, details: str = "") -> str:
         found.insert(0, "Дубляж")
     if re.search(r"\|[^\n]*\bP(?:\s*[,|]|$)", release.title, re.I) and not any("голос" in item for item in found):
         found.insert(1 if found else 0, "Профессиональная")
+    audio_tags = release_audio_tags(replace(release, details_text=details or release.details_text))
+    for key, label in (("dub", "Дубляж"), ("multi", "Многоголосая"), ("dvo", "Двухголосая")):
+        if key in audio_tags and label not in found:
+            found.insert(0, label)
     return " · ".join(dict.fromkeys(found)) if found else "не указана источником"
 
 
@@ -660,10 +902,9 @@ class State:
 
     def __init__(self, path: Path = STATE_PATH) -> None:
         self.path = path
-        # Inline queries are handled on a Timer thread while long polling keeps
-        # updating the same state. One re-entrant lock protects both mutations
-        # and the JSON snapshot written to disk.
+        # Interactive and background workers share one atomic state snapshot.
         self._lock = RLock()
+        self._last_prune = 0.0
         self.data: dict[str, Any] = {
             "offset": 0,
             "searches": {},
@@ -695,6 +936,8 @@ class State:
         self.data.setdefault("stalled_downloads", {})
         self.data.setdefault("reported_stalls", [])
         self.data.setdefault("torbox_accounts", {})
+        for ui in self.data["ui"].values():
+            ui.setdefault("last_active", int(time.time()))
 
     def _torbox_account(self, user_id: int | None) -> dict[str, Any]:
         """Return per-user maintenance state, retaining the legacy owner state."""
@@ -709,10 +952,31 @@ class State:
 
     def save(self) -> None:
         with self._lock:
-            temporary = self.path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
-            temporary.chmod(0o600)
-            temporary.replace(self.path)
+            now = time.time()
+            if now - self._last_prune > 60:
+                for section in ("searches", "pending", "inline_items"):
+                    self.data[section] = {key: value for key, value in self.data[section].items()
+                                          if value.get("expires", 0) >= now}
+                for user_id, ui in self.data["ui"].items():
+                    if now - ui.get("last_active", now) > 30 * 86_400:
+                        for key in ("history", "favorites"):
+                            ui.pop(key, None)
+                        self.data["modes"].pop(user_id, None)
+                self._last_prune = now
+            write_private_json(self.path, self.data)
+
+    def forget_user(self, user_id: int) -> None:
+        with self._lock:
+            for section in ("searches", "pending", "modes", "ui", "torbox_accounts"):
+                self.data[section].pop(str(user_id), None)
+            self.data["inline_items"] = {key: value for key, value in self.data["inline_items"].items()
+                                          if value.get("payload", {}).get("owner") != user_id}
+            self.save()
+
+    def reset_account(self, user_id: int) -> None:
+        with self._lock:
+            self.data["torbox_accounts"].pop(str(user_id), None)
+            self.set_ui(user_id, recent_adds={})
 
     def offset(self) -> int:
         with self._lock:
@@ -734,15 +998,50 @@ class State:
         *,
         query: str = "",
         source_status: str = "",
+        candidates: list[Release] | None = None,
     ) -> None:
         with self._lock:
             self.data["searches"][str(chat_id)] = {
+                "revision": os.urandom(5).hex(),
                 "expires": int(time.time()) + 3600,
                 "query": query,
                 "source_status": source_status,
                 "items": [release.to_dict() for release in releases],
+                "candidates": [release.to_dict() for release in (candidates if candidates is not None else releases)],
             }
+            if len(self.data["searches"]) > MAX_SEARCH_CACHE:
+                overflow = len(self.data["searches"]) - MAX_SEARCH_CACHE
+                oldest = sorted((key for key in self.data["searches"] if key != str(chat_id)),
+                                key=lambda key: self.data["searches"][key].get("expires", 0))
+                for key in oldest[:overflow]:
+                    self.data["searches"].pop(key, None)
+            self.data.setdefault("ui", {}).setdefault(str(chat_id), {}).update(search_page=0, search_filter="all", search_season="all")
             self.save()
+
+    def search_revision(self, chat_id: int) -> str:
+        with self._lock:
+            return str(self.data["searches"].get(str(chat_id), {}).get("revision") or "")
+
+    def search_candidates(self, chat_id: int) -> list[Release]:
+        with self._lock:
+            stored = self.data["searches"].get(str(chat_id), {})
+            if stored.get("expires", 0) < time.time():
+                return []
+            return [Release.from_dict(item) for item in stored.get("candidates", stored.get("items", []))]
+
+    def ui_value(self, chat_id: int, key: str, default: Any = None) -> Any:
+        with self._lock:
+            return self.data.get("ui", {}).get(str(chat_id), {}).get(key, default)
+
+    def set_ui(self, chat_id: int, **values: Any) -> None:
+        with self._lock:
+            self.data.setdefault("ui", {}).setdefault(str(chat_id), {}).update(values)
+            self.save()
+
+    def remember_query(self, chat_id: int, query: str) -> None:
+        with self._lock:
+            history = self.ui_value(chat_id, "history", [])
+            self.set_ui(chat_id, history=[query, *[q for q in history if q.casefold() != query.casefold()]][:8])
 
     def get_search(self, chat_id: int) -> tuple[str, str, list[Release]] | None:
         with self._lock:
@@ -772,6 +1071,9 @@ class State:
             items = stored.get("items", [])
             if 0 <= index < len(items):
                 items[index] = release.to_dict()
+                for candidate_index, raw in enumerate(stored.get("candidates", [])):
+                    if release_dedupe_key(Release.from_dict(raw)) == release_dedupe_key(release):
+                        stored["candidates"][candidate_index] = release.to_dict()
                 self.save()
 
     def put_inline_item(self, token: str, payload: dict[str, Any]) -> None:
@@ -804,6 +1106,10 @@ class State:
     def put_pending(self, chat_id: int, release: Release) -> None:
         with self._lock:
             self.data["pending"][str(chat_id)] = {"expires": int(time.time()) + 900, "item": release.to_dict()}
+            if len(self.data["pending"]) > 128:
+                oldest = min((key for key in self.data["pending"] if key != str(chat_id)),
+                             key=lambda key: self.data["pending"][key]["expires"])
+                self.data["pending"].pop(oldest, None)
             self.save()
 
     def pop_pending(self, chat_id: int) -> Release | None:
@@ -908,28 +1214,21 @@ class CredentialStore:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             users = raw.get("users") if isinstance(raw, dict) else None
-            if isinstance(users, dict):
-                self.data = {
-                    str(user_id): str(api_key)
-                    for user_id, api_key in users.items()
-                    if str(user_id).isdigit() and isinstance(api_key, str) and api_key
-                }
+            if not isinstance(users, dict) or any(
+                not str(user_id).isdigit() or not isinstance(api_key, str) or not api_key
+                for user_id, api_key in users.items()
+            ):
+                raise ValueError("Invalid credential store format")
+            self.data = dict(users)
             path.chmod(0o600)
         except FileNotFoundError:
             pass
-        except (OSError, json.JSONDecodeError) as exc:
-            LOG.warning("Credential store ignored: %s", exc)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Credential store could not be loaded; restore it before starting the bot") from exc
 
     def save(self) -> None:
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps({"users": self.data}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            temporary.chmod(0o600)
-            temporary.replace(self.path)
+            write_private_json(self.path, {"users": self.data})
 
     def api_key(self, user_id: int) -> str | None:
         with self._lock:
@@ -938,14 +1237,17 @@ class CredentialStore:
 
     def set_api_key(self, user_id: int, api_key: str) -> None:
         with self._lock:
-            self.data[str(user_id)] = api_key.strip()
-            self.save()
+            updated = {**self.data, str(user_id): api_key.strip()}
+            write_private_json(self.path, {"users": updated})
+            self.data = updated
 
     def remove_api_key(self, user_id: int) -> bool:
         with self._lock:
-            removed = self.data.pop(str(user_id), None) is not None
+            updated = self.data.copy()
+            removed = updated.pop(str(user_id), None) is not None
             if removed:
-                self.save()
+                write_private_json(self.path, {"users": updated})
+                self.data = updated
             return removed
 
     def user_ids(self) -> set[int]:
@@ -953,14 +1255,12 @@ class CredentialStore:
             return {int(value) for value in self.data if value.isdigit()}
 
 
-class NnmClient:
+class NnmClient(ThreadLocalHTTP):
     key = "nnm"
     name = "NNM-Club"
 
     def __init__(self) -> None:
-        self.http = cloudscraper.create_scraper()
-        configure_read_retries(self.http)
-        self.http.headers.update({"User-Agent": USER_AGENT})
+        self.init_http(scraper_session, {"User-Agent": USER_AGENT})
 
     def search(self, query: str) -> list[Release]:
         url = f"{NNM_BASE}tracker.php?nm={quote_plus(query)}"
@@ -1014,21 +1314,19 @@ class NnmClient:
         return "\n".join(fragments[:6]) or "Подробное описание у источника не распознано."
 
     def download_torrent(self, release: Release) -> bytes:
-        response = self.http.get(release.download_url, headers={"Referer": release.source_url}, timeout=30)
-        response.raise_for_status()
-        if len(response.content) > MAX_TORRENT_BYTES:
-            raise RuntimeError("Torrent file is unexpectedly large")
+        response = self.http.get(release.download_url, headers={"Referer": release.source_url}, timeout=(5, 30), stream=True)
+        content = torrent_response_bytes(response)
         # Fast validity check before it reaches the TorBox account.
         try:
-            decoded = bencodepy.decode(response.content)
+            decoded = bencodepy.decode(content)
             if b"info" not in decoded:
                 raise ValueError("no info dictionary")
         except Exception as exc:  # bencode parser errors have varying concrete types
             raise RuntimeError(f"Source did not return a valid .torrent file: {exc}") from exc
-        return response.content
+        return content
 
 
-class ProwlarrClient:
+class ProwlarrClient(ThreadLocalHTTP):
     """One connector for all torrent indexers configured in Prowlarr."""
 
     key = "prowlarr"
@@ -1040,12 +1338,11 @@ class ProwlarrClient:
             raise RuntimeError("PROWLARR_URL must be a full http(s) URL")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key.strip()
+        PRIVATE_LOG.add_secret(self.api_key)
         if not self.api_key:
             raise RuntimeError("PROWLARR_API_KEY is empty")
         self.indexer_ids = indexer_ids
-        self.http = requests.Session()
-        configure_read_retries(self.http)
-        self.http.headers.update({"X-Api-Key": self.api_key, "User-Agent": USER_AGENT, "Accept": "application/json"})
+        self.init_http(http_session, {"X-Api-Key": self.api_key, "User-Agent": USER_AGENT, "Accept": "application/json"})
 
     @staticmethod
     def _http_url(*candidates: Any) -> str:
@@ -1060,7 +1357,7 @@ class ProwlarrClient:
             ("query", query), ("type", "search"), ("limit", MAX_PROVIDER_RESULTS), ("offset", 0),
         ]
         params.extend(("indexerIds", indexer_id) for indexer_id in self.indexer_ids)
-        response = self.http.get(f"{self.base_url}/api/v1/search", params=params, timeout=25)
+        response = self.http.get(f"{self.base_url}/api/v1/search", params=params, timeout=(5, 25), allow_redirects=False)
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, list):
@@ -1144,21 +1441,29 @@ class ProwlarrClient:
         url, same_origin = self._download_endpoint(release.download_url)
         if urlparse(url).scheme not in {"http", "https"}:
             raise RuntimeError("Prowlarr returned an unsupported download URL")
-        if same_origin:
-            response = self.http.get(url, timeout=40)
+        for _ in range(5):
+            # requests preserves custom X-Api-Key headers on redirects. Follow
+            # redirects explicitly, deciding whether to send credentials at every hop.
+            get = self.http.get if same_origin else requests.get
+            response = get(url, headers={"User-Agent": USER_AGENT}, timeout=(5, 30),
+                           stream=True, allow_redirects=False)
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                break
+            location = response.headers.get("Location", "")
+            response.close()
+            url, same_origin = self._download_endpoint(urljoin(url, location))
+            if not location or urlparse(url).scheme not in {"http", "https"}:
+                raise RuntimeError("Prowlarr returned an invalid redirect")
         else:
-            # Never leak the Prowlarr API key to a tracker-owned URL.
-            response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=40)
-        response.raise_for_status()
-        if len(response.content) > MAX_TORRENT_BYTES:
-            raise RuntimeError("Torrent file is unexpectedly large")
+            raise RuntimeError("Too many torrent download redirects")
+        content = torrent_response_bytes(response)
         try:
-            decoded = bencodepy.decode(response.content)
+            decoded = bencodepy.decode(content)
             if b"info" not in decoded:
                 raise ValueError("no info dictionary")
         except Exception as exc:
             raise RuntimeError(f"Prowlarr did not return a valid .torrent file: {exc}") from exc
-        return response.content
+        return content
 
 
 class SearchAggregator:
@@ -1169,9 +1474,21 @@ class SearchAggregator:
             raise RuntimeError("At least one search provider must be enabled")
         self.providers = providers
         self.by_key = {provider.key: provider for provider in providers}
+        self._status = local()
         self.last_status: dict[str, str] = {}
 
+    @property
+    def last_status(self) -> dict[str, str]:
+        return getattr(self._status, "value", {})
+
+    @last_status.setter
+    def last_status(self, value: dict[str, str]) -> None:
+        self._status.value = value
+
     def search(self, query: str) -> list[Release]:
+        return select_diverse_releases(self.search_candidates(query), MAX_SEARCH_CANDIDATES)
+
+    def search_candidates(self, query: str) -> list[Release]:
         found: list[Release] = []
         self.last_status = {}
         with ThreadPoolExecutor(max_workers=min(4, len(self.providers)), thread_name_prefix="search") as pool:
@@ -1205,7 +1522,7 @@ class SearchAggregator:
         # soundtracks displace them in the short Telegram result list.
         if len(video_items) >= 4:
             ranked_items = video_items
-        return select_diverse_releases(ranked_items, MAX_SEARCH_CANDIDATES)
+        return ranked_items
 
     def status_summary(self) -> str:
         return " · ".join(f"{name}: {status}" for name, status in self.last_status.items())
@@ -1247,7 +1564,8 @@ class TorBoxClient:
         return session
 
     def request(self, method: str, path: str, *, timeout: int = 30, **kwargs: Any) -> dict[str, Any]:
-        response = self._session().request(method, f"{TORBOX_API}/{path.lstrip('/')}", timeout=timeout, **kwargs)
+        response = self._session().request(method, f"{TORBOX_API}/{path.lstrip('/')}", timeout=(5, timeout),
+                                          allow_redirects=False, **kwargs)
         try:
             payload = response.json()
         except ValueError as exc:
@@ -1352,6 +1670,19 @@ class TorBoxClient:
             json={"torrent_id": safe_torrent_id(torrent_id), "operation": operation, "all": False},
         )
 
+    def download_link(self, torrent_id: int, file_id: int) -> str:
+        # Resolve on the server: never put the API-key-bearing request URL in Telegram.
+        try:
+            data = self.request("GET", "torrents/requestdl", params={
+                "token": self.api_key, "torrent_id": safe_torrent_id(torrent_id),
+                "file_id": safe_torrent_id(file_id), "redirect": "false",
+            }).get("data")
+        except Exception:
+            raise RuntimeError("Не удалось получить ссылку. Попробуй ещё раз чуть позже.") from None
+        if not isinstance(data, str) or urlparse(data).scheme != "https" or self.api_key in data:
+            raise RuntimeError("TorBox пока не вернул ссылку на файл. Обнови загрузку и попробуй снова.")
+        return data
+
     def notifications(self) -> list[dict[str, Any]]:
         data = self.request("GET", "notifications/mynotifications").get("data")
         if data is None:
@@ -1384,8 +1715,10 @@ class TelegramBot:
         credentials: CredentialStore | None = None,
         multi_user_enabled: bool = False,
         torbox_factory: Callable[[str], Any] = TorBoxClient,
+        workers: int = 8,
     ) -> None:
         self.token, self.owner_id, self.torbox, self.nnm, self.state = token, owner_id, torbox, nnm, state
+        PRIVATE_LOG.add_secret(token)
         self.catalog = catalog
         self.notifications_enabled = notifications_enabled
         self.notification_poll_seconds = notification_poll_seconds
@@ -1398,17 +1731,130 @@ class TelegramBot:
         self.username = ""
         self.bot_id = 0
         self.inline_enabled = False
-        self.inline_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-        self.inline_timers: dict[int, Timer] = {}
+        self.inline_cache: OrderedDict[str, tuple[float, list[dict[str, Any]]]] = OrderedDict()
         self.inline_dispatch_lock = Lock()
-        self.inline_search_lock = Lock()
         self.latest_inline_query_ids: dict[int, str] = {}
+        self._render_context = local()
         self.callback_message_id: int | None = None
         self.callback_inline_message_id = ""
         self.capture_screen = False
         self.session = requests.Session()
         self._owner_thread_id = get_ident()
         self._thread_sessions = local()
+        self._user_locks: WeakValueDictionary[int, Any] = WeakValueDictionary()
+        self._user_locks_guard = Lock()
+        self.updates = UserDispatcher(workers=workers, name="telegram-user")
+        self.inline_jobs = UserDispatcher(workers=4, capacity=32, per_user=2, name="inline")
+        self.control_jobs = UserDispatcher(workers=2, capacity=32, name="telegram-control")
+        self.maintenance_jobs = UserDispatcher(workers=4, capacity=32, per_user=1, name="torbox-health")
+        self.message_limit = RateLimiter(12, 30)
+        self.inline_limit = RateLimiter(15, 30)
+        self.search_limit = RateLimiter(4, 60)
+        self.global_search_limit = RateLimiter(40, 60, max_keys=1)
+        self.catalog_limit = RateLimiter(90, 60, max_keys=1)
+        self.notice_limit = RateLimiter(1, 15)
+        self._closing = Event()
+        self.outbound = OutboundThrottle()
+
+    @property
+    def callback_message_id(self) -> int | None:
+        return getattr(self._render_context, "message_id", None)
+
+    @callback_message_id.setter
+    def callback_message_id(self, value: int | None) -> None:
+        self._render_context.message_id = value
+
+    @property
+    def callback_inline_message_id(self) -> str:
+        return getattr(self._render_context, "inline_id", "")
+
+    @callback_inline_message_id.setter
+    def callback_inline_message_id(self, value: str) -> None:
+        self._render_context.inline_id = value
+
+    @property
+    def capture_screen(self) -> bool:
+        return getattr(self._render_context, "capture", False)
+
+    @capture_screen.setter
+    def capture_screen(self, value: bool) -> None:
+        self._render_context.capture = value
+
+    def user_lock(self, user_id: int) -> Any:
+        with self._user_locks_guard:
+            lock = self._user_locks.get(user_id)
+            if lock is None:
+                lock = RLock()
+                self._user_locks[user_id] = lock
+            return lock
+
+    def update_user(self, update: dict[str, Any]) -> int | None:
+        event = (update.get("message") or update.get("callback_query") or
+                 update.get("inline_query") or update.get("chosen_inline_result") or {})
+        user_id = event.get("from", {}).get("id")
+        if not isinstance(user_id, int) or user_id <= 0 or not self.user_allowed(user_id):
+            return None
+        if update.get("message") or update.get("callback_query"):
+            message = update.get("message") or event.get("message") or {}
+            if not event.get("inline_message_id") and message.get("chat", {}).get("id") != user_id:
+                return None
+        return user_id
+
+    def dispatch_update(self, update: dict[str, Any]) -> bool:
+        """Keep polling free of user network I/O and preserve each user's ordering."""
+        user_id = self.update_user(update)
+        if user_id is None:
+            return False
+        if query := update.get("inline_query"):
+            self.inline_query(query)
+            return True
+        if not self.message_limit.allow(user_id):
+            self.reject_update(user_id, update)
+            return False
+        accepted = self.updates.submit(user_id, lambda: self._run_update(user_id, update))
+        if not accepted:
+            self.reject_update(user_id, update)
+        return accepted
+
+    def reject_update(self, user_id: int, update: dict[str, Any]) -> None:
+        # Notices have their own small queue and cooldown, so spam cannot block polling.
+        if not self.notice_limit.allow(user_id):
+            return
+        def notify() -> None:
+            message = update.get("message", {})
+            if self.state.mode(user_id) == "torbox_api_key" and message.get("message_id"):
+                self.delete_user_message(user_id, message["message_id"])
+            text = "Слишком много запросов. Подожди немного и повтори последнее действие."
+            if callback := update.get("callback_query"):
+                self.answer_callback(str(callback.get("id") or ""), text, alert=True)
+            else:
+                self._send_new(user_id, text)
+        self.control_jobs.submit(user_id, notify)
+
+    def _run_update(self, user_id: int, update: dict[str, Any]) -> None:
+        with self.user_lock(user_id):
+            try:
+                self._render_context.search_permitted = False
+                self.state.set_ui(user_id, last_active=int(time.time()))
+                self.handle(update)
+            except Exception as exc:
+                LOG.exception("User request failed for Telegram user %s", user_id)
+                try:
+                    self._send_new(user_id, public_error(exc), [[self.home_button()]])
+                except Exception:
+                    LOG.warning("Could not deliver error response to Telegram user %s", user_id)
+            finally:
+                self.callback_message_id = None
+                self.callback_inline_message_id = ""
+                self.capture_screen = False
+
+    def close(self) -> None:
+        self._closing.set()
+        # Drain accepted work before exit; queued destructive callbacks must not be replayed.
+        self.updates.close()
+        self.inline_jobs.close()
+        self.maintenance_jobs.close()
+        self.control_jobs.close()
 
     def _telegram_session(self) -> requests.Session:
         """Use one Telegram connection pool per worker thread."""
@@ -1428,17 +1874,27 @@ class TelegramBot:
                 {"text": BTN_NOTIFICATIONS, "callback_data": "notifications"},
             ],
         ]
+        keyboard.append([
+            {"text": "🕘 История", "callback_data": "history"},
+            {"text": "⭐ Избранное", "callback_data": "favorites"},
+        ])
+        keyboard.append([self.search_settings_button()])
         account_row: list[dict[str, str]] = []
         if self.multi_user_enabled or self.credentials:
             account_row.append({"text": BTN_ACCOUNT, "callback_data": "account"})
         account_row.append({"text": BTN_HELP, "callback_data": "help"})
         keyboard.append(account_row)
+        keyboard.append([self.guide_button()])
         return keyboard
 
     def search_button(self, text: str = BTN_SEARCH) -> dict[str, str]:
         if self.inline_enabled and self.catalog:
             return {"text": text, "switch_inline_query_current_chat": ""}
         return {"text": text, "callback_data": "search"}
+
+    @staticmethod
+    def guide_button() -> dict[str, str]:
+        return {"text": "📖 Инструкция", "url": SETUP_GUIDE_URL}
 
     @staticmethod
     def home_button() -> dict[str, str]:
@@ -1460,6 +1916,7 @@ class TelegramBot:
         if self.credentials:
             api_key = self.credentials.api_key(user_id)
             if api_key:
+                PRIVATE_LOG.add_secret(api_key)
                 client = self._torbox_clients.get(user_id)
                 if client is None:
                     client = self.torbox_factory(api_key)
@@ -1477,6 +1934,13 @@ class TelegramBot:
             users.add(self.owner_id)
         return sorted(users)
 
+    def forget_log_key(self, api_key: str | None) -> None:
+        if not api_key or api_key == getattr(self.torbox, "api_key", None):
+            return
+        if self.credentials and any(self.credentials.api_key(user) == api_key for user in self.credentials.user_ids()):
+            return
+        PRIVATE_LOG.remove_secret(api_key)
+
     def _maintenance_state_user(self, user_id: int) -> int | None:
         # Legacy single-user tests and deployments keep their old state keys.
         return user_id if self.credentials else None
@@ -1484,7 +1948,6 @@ class TelegramBot:
     def install_bottom_keyboard(self, chat_id: int, *, force: bool = False) -> int | None:
         if not force and self.state.bottom_keyboard_version(chat_id) >= BOTTOM_KEYBOARD_VERSION:
             return self.state.screen_message_id(chat_id)
-        previous_screen_id = self.state.screen_message_id(chat_id)
         result = self.call(
             "sendMessage",
             chat_id=chat_id,
@@ -1504,20 +1967,27 @@ class TelegramBot:
                 message_id = None
         if message_id:
             self.state.set_screen_message_id(chat_id, message_id)
-            if force and previous_screen_id and previous_screen_id != message_id:
-                self.delete_user_message(chat_id, previous_screen_id)
         self.state.set_bottom_keyboard_version(chat_id, BOTTOM_KEYBOARD_VERSION)
         return message_id
 
     def call(self, method: str, **payload: Any) -> Any:
+        if method != "getUpdates":
+            chat_id = payload.get("chat_id") if method in {"sendMessage", "editMessageText"} else None
+            self.outbound.wait(chat_id)
         response = self._telegram_session().post(
-            TELEGRAM_API.format(token=self.token, method=method), json=payload, timeout=65,
+            TELEGRAM_API.format(token=self.token, method=method), json=payload,
+            timeout=(5, 55 if method == "getUpdates" else 15),
         )
         try:
             result = response.json()
         except ValueError as exc:
             response.raise_for_status()
             raise RuntimeError(f"Telegram {method} вернул ответ без JSON") from exc
+        if result.get("error_code") == 403 and isinstance(payload.get("chat_id"), int):
+            self.state.set_ui(payload["chat_id"], delivery_blocked=True)
+        if result.get("error_code") == 429:
+            retry_after = float(result.get("parameters", {}).get("retry_after") or 5)
+            self.outbound.defer(retry_after)
         if not response.ok or not result.get("ok"):
             description = result.get("description") or f"HTTP {response.status_code}"
             raise RuntimeError(f"Telegram {method}: {description}")
@@ -1530,8 +2000,7 @@ class TelegramBot:
             "parse_mode": "HTML",
             "link_preview_options": {"is_disabled": True},
         }
-        if keyboard:
-            payload["reply_markup"] = {"inline_keyboard": keyboard}
+        payload["reply_markup"] = {"inline_keyboard": keyboard or []}
         return payload
 
     def _send_new(
@@ -1540,7 +2009,29 @@ class TelegramBot:
         text: str,
         keyboard: list[list[dict[str, str]]] | None = None,
     ) -> Any:
-        return self.call("sendMessage", chat_id=chat_id, **self._message_payload(text, keyboard))
+        return self.call("sendMessage", chat_id=chat_id, **self._message_payload(text, self.account_keyboard(chat_id, keyboard)))
+
+    def account_revision(self, user_id: int) -> str:
+        key = self.credentials.api_key(user_id) if self.credentials else None
+        if not key and user_id == self.owner_id and self.torbox is not None:
+            key = getattr(self.torbox, "api_key", "owner")
+        return hashlib.sha256(f"{user_id}:{key or 'disconnected'}".encode()).hexdigest()[:12]
+
+    def account_keyboard(self, user_id: int, keyboard: Any) -> Any:
+        if not self.credentials or not keyboard:
+            return keyboard
+        protected = {"tctl", "delconfirm", "nclearconfirm", "file", "files", "tinfo", "delask"}
+        result = []
+        for row in keyboard:
+            buttons = []
+            for button in row:
+                button = dict(button)
+                data = button.get("callback_data", "")
+                if data.split(":", 1)[0] in protected:
+                    button["callback_data"] = data + ":a" + self.account_revision(user_id)
+                buttons.append(button)
+            result.append(buttons)
+        return result
 
     def edit_message(
         self,
@@ -1553,7 +2044,7 @@ class TelegramBot:
             "editMessageText",
             chat_id=chat_id,
             message_id=message_id,
-            **self._message_payload(text, keyboard),
+            **self._message_payload(text, self.account_keyboard(chat_id, keyboard)),
         )
 
     def edit_inline_message(
@@ -1607,6 +2098,7 @@ class TelegramBot:
                 pass
         if message_id:
             self.state.set_screen_message_id(chat_id, message_id)
+            self.callback_message_id = message_id
 
     def send(self, chat_id: int, text: str, keyboard: list[list[dict[str, str]]] | None = None) -> Any:
         """Render callback navigation in place; send only for a genuinely new flow."""
@@ -1627,29 +2119,19 @@ class TelegramBot:
         except Exception:
             LOG.debug("Could not answer an old callback query", exc_info=True)
 
-    def delete_user_message(self, chat_id: int, message_id: int) -> None:
+    def delete_user_message(self, chat_id: int, message_id: int) -> bool:
         try:
             self.call("deleteMessage", chat_id=chat_id, message_id=message_id)
+            return True
         except Exception:
-            # The command still works when Telegram no longer permits deletion.
             LOG.debug("Could not remove the user's service message", exc_info=True)
+            return False
 
     def answer_inline_query(self, inline_query_id: str, results: list[dict[str, Any]], *, cache_time: int = 30) -> None:
         # Inline searches run outside the long-poll thread. A separate HTTP
         # request avoids sharing the polling Session between threads.
-        response = requests.post(
-            TELEGRAM_API.format(token=self.token, method="answerInlineQuery"),
-            json={
-                "inline_query_id": inline_query_id,
-                "results": results,
-                "cache_time": cache_time,
-                "is_personal": True,
-            },
-            timeout=20,
-        )
-        payload = response.json()
-        if not response.ok or not payload.get("ok"):
-            raise RuntimeError(f"Telegram answerInlineQuery: {payload.get('description') or response.status_code}")
+        self.call("answerInlineQuery", inline_query_id=inline_query_id, results=results,
+                  cache_time=cache_time, is_personal=True)
 
     def _deep_link(self, token: str) -> str:
         username = self.username or "tor_boxai_bot"
@@ -1690,7 +2172,7 @@ class TelegramBot:
             ]
             if second_meta:
                 message_lines.append(f"🌍 {html.escape(' · '.join(second_meta))}")
-            message_lines.append("\n⏳ Ищу лучшие релизы…")
+            message_lines.append("\nРезультаты придут отдельным сообщением от бота в личный чат.")
             result: dict[str, Any] = {
                 "type": "article",
                 "id": token,
@@ -1702,7 +2184,7 @@ class TelegramBot:
                     "link_preview_options": {"is_disabled": True},
                 },
                 "reply_markup": {"inline_keyboard": [[{
-                    "text": "🔎 Открыть результаты, если поиск не запустился",
+                    "text": "🔎 Получить ответ от бота",
                     "callback_data": f"catalog:{token}",
                 }]]},
             }
@@ -1762,44 +2244,35 @@ class TelegramBot:
 
     def inline_query(self, query: dict[str, Any]) -> None:
         query_id = str(query.get("id") or "")
-        if not query_id:
-            return
         user_id = query.get("from", {}).get("id")
-        if not isinstance(user_id, int) or not self.user_allowed(user_id):
-            self.answer_inline_query(query_id, [], cache_time=60)
-            return
-        if not self.catalog:
-            self.answer_inline_query(query_id, [], cache_time=5)
+        if not query_id or not isinstance(user_id, int):
             return
         text = re.sub(r"\s+", " ", str(query.get("query") or "")).strip()
+        if (not self.user_allowed(user_id) or not self.catalog or
+                len(text) > MAX_QUERY_LENGTH or not self.inline_limit.allow(user_id)):
+            self.control_jobs.submit(user_id, lambda: self.answer_inline_query(query_id, [], cache_time=5), coalesce=True)
+            return
         with self.inline_dispatch_lock:
             self.latest_inline_query_ids[user_id] = query_id
-            previous_timer = self.inline_timers.pop(user_id, None)
-            if previous_timer:
-                previous_timer.cancel()
-        # Telegram opens inline mode with an empty query. Show the popular
-        # storefront there, then switch to regular relevance search as soon as
-        # the user starts typing. The debounce below coalesces fast keystrokes.
-        search_text = text
-        cache_key = f"catalog:{search_text.casefold() or 'popular'}"
-        cached = self.inline_cache.get(cache_key)
-        if cached and cached[0] > time.monotonic():
-            self.answer_inline_query(query_id, cached[1], cache_time=300 if not search_text else 30)
-            return
-        timer = Timer(
-            0.05 if not search_text else 0.4,
-            self._process_inline_query,
-            args=(query_id, search_text, cache_key, user_id),
-        )
-        timer.daemon = True
-        with self.inline_dispatch_lock:
-            if self.latest_inline_query_ids.get(user_id) != query_id:
-                return
-            self.inline_timers[user_id] = timer
-            timer.start()
+            accepted = self.inline_jobs.submit(
+                user_id, lambda: self._debounced_inline_query(query_id, text, user_id), coalesce=True,
+            )
+            if not accepted:
+                self.latest_inline_query_ids.pop(user_id, None)
+        if not accepted:
+            self.control_jobs.submit(user_id, lambda: self.answer_inline_query(query_id, [], cache_time=2), coalesce=True)
+
+    def _debounced_inline_query(self, query_id: str, text: str, user_id: int) -> None:
+        try:
+            if not self._closing.wait(0.35 if text else 0.05):
+                self._process_inline_query(query_id, text, user_id=user_id)
+        finally:
+            with self.inline_dispatch_lock:
+                if self.latest_inline_query_ids.get(user_id) == query_id:
+                    self.latest_inline_query_ids.pop(user_id, None)
 
     def chosen_inline_result(self, chosen: dict[str, Any]) -> None:
-        """Turn the selected catalog card into release results immediately."""
+        """Keep the user's inline card intact and answer from the bot privately."""
         user_id = chosen.get("from", {}).get("id")
         if not isinstance(user_id, int) or not self.user_allowed(user_id):
             return
@@ -1807,21 +2280,22 @@ class TelegramBot:
         stored = self.state.get_inline_item(token)
         if not stored:
             return
-        inline_message_id = str(chosen.get("inline_message_id") or "")
-        if stored.get("kind") == "catalog":
-            query = str(stored.get("query") or "").strip()
-            if query:
-                self.show_search(user_id, query, inline_message_id=inline_message_id)
-        elif stored.get("kind") == "release" and isinstance(stored.get("release"), dict):
-            release = Release.from_dict(stored["release"])
-            self.state.put_search(user_id, [release], query=release.title)
-            self.render_search_results(
-                user_id,
-                release.title,
-                [release],
-                "",
-                inline_message_id=inline_message_id,
-            )
+        self.callback_message_id = None
+        self.callback_inline_message_id = ""
+        self.capture_screen = True
+        try:
+            if stored.get("kind") == "catalog":
+                query = str(stored.get("query") or "").strip()
+                if query:
+                    self.show_search(user_id, query)
+            elif stored.get("kind") == "release" and isinstance(stored.get("release"), dict):
+                release = Release.from_dict(stored["release"])
+                self.state.put_search(user_id, [release], query=release.title)
+                self.render_search_results(user_id, release.title, [release])
+        finally:
+            self.callback_message_id = None
+            self.callback_inline_message_id = ""
+            self.capture_screen = False
 
     def _process_inline_query(
         self,
@@ -1833,35 +2307,39 @@ class TelegramBot:
         user_id = self.owner_id if user_id is None else user_id
         cache_key = cache_key or f"catalog:{text.casefold() or 'popular'}"
         try:
-            with self.inline_search_lock:
-                with self.inline_dispatch_lock:
-                    latest_query_id = self.latest_inline_query_ids.get(user_id)
-                    if latest_query_id and latest_query_id != query_id:
-                        return
-                cached = self.inline_cache.get(cache_key)
-                if cached and cached[0] > time.monotonic():
-                    results = cached[1]
-                elif self.catalog:
-                    titles = self.catalog.search(text) if text else self.catalog.popular()
-                    results = self._catalog_inline_results(titles)
-                else:
-                    results = self._release_inline_results(self._fast_inline_release_search(text))
-            self.inline_cache[cache_key] = (time.monotonic() + (1800 if not text else 300), results)
             with self.inline_dispatch_lock:
-                latest_query_id = self.latest_inline_query_ids.get(user_id)
-                if latest_query_id and latest_query_id != query_id:
+                latest = self.latest_inline_query_ids.get(user_id)
+                if latest and latest != query_id:
+                    return
+                cached = self.inline_cache.get(cache_key)
+            if (cached and cached[0] > time.monotonic() and
+                    all(self.state.get_inline_item(item["id"]) for item in cached[1])):
+                results = cached[1]
+            elif not self.catalog_limit.allow("catalog"):
+                results = []
+            elif self.catalog:
+                titles = self.catalog.search(text) if text else self.catalog.popular()
+                results = self._catalog_inline_results(titles)
+            else:
+                results = self._release_inline_results(self._fast_inline_release_search(text))
+            with self.inline_dispatch_lock:
+                now = time.monotonic()
+                self.inline_cache = OrderedDict((key, value) for key, value in self.inline_cache.items() if value[0] > now)
+                if results:
+                    self.inline_cache[cache_key] = (now + (1800 if not text else 300), results)
+                    self.inline_cache.move_to_end(cache_key)
+                while len(self.inline_cache) > 256:
+                    self.inline_cache.popitem(last=False)
+                latest = self.latest_inline_query_ids.get(user_id)
+                if latest and latest != query_id:
                     return
             self.answer_inline_query(query_id, results, cache_time=300 if not text else 30)
         except Exception:
             LOG.warning("Inline search failed", exc_info=True)
-            with self.inline_dispatch_lock:
-                latest_query_id = self.latest_inline_query_ids.get(user_id)
-                is_latest = not latest_query_id or latest_query_id == query_id
-            if is_latest:
-                try:
-                    self.answer_inline_query(query_id, [], cache_time=1)
-                except Exception:
-                    LOG.debug("Could not send empty inline response", exc_info=True)
+            try:
+                self.answer_inline_query(query_id, [], cache_time=1)
+            except Exception:
+                LOG.debug("Could not send empty inline response", exc_info=True)
 
     def is_owner(self, update: dict[str, Any]) -> bool:
         callback = update.get("callback_query", {})
@@ -1889,6 +2367,7 @@ class TelegramBot:
             keyboard = [[{"text": "🔄 Заменить ключ", "callback_data": "connect"}]]
             if self.credentials and self.credentials.api_key(chat_id):
                 keyboard.append([{"text": "🗑 Отключить TorBox", "callback_data": "disconnectask"}])
+            keyboard.append([{"text": "🔐 Мои данные", "callback_data": "privacy"}])
             keyboard.append([self.home_button()])
             self.send(
                 chat_id,
@@ -1902,7 +2381,8 @@ class TelegramBot:
             "🔑 <b>Подключи свой TorBox</b>\n\n"
             "У каждого пользователя свой список загрузок, лимиты и уведомления. "
             "Нажми кнопку ниже и отправь API key из TorBox → Settings → API Keys.",
-            [[{"text": "➕ Подключить TorBox", "callback_data": "connect"}], [self.home_button()]],
+            [[{"text": "➕ Подключить TorBox", "callback_data": "connect"}],
+             [{"text": "🔐 Мои данные", "callback_data": "privacy"}], [self.home_button()]],
         )
 
     def prompt_connect(self, chat_id: int) -> None:
@@ -1920,14 +2400,18 @@ class TelegramBot:
         self.send(
             chat_id,
             "🔐 <b>Отправь TorBox API key</b>\n\n"
+            "Открой сайт TorBox → Settings → API Keys и скопируй свой ключ. "
+            "Отправь его следующим сообщением в этот чат.\n\n"
             "Я сразу удалю сообщение, проверю ключ и сохраню его в защищённом файле сервера. "
+            "Администратор сервера имеет доступ к ключу. "
             "Не отправляй ключ в групповой чат.\n\nДля отмены: /cancel",
-            [[{"text": "Отмена", "callback_data": "account"}]],
+            [[self.guide_button()],
+             [{"text": "Отмена", "callback_data": "account"}, {"text": "🔐 Мои данные", "callback_data": "privacy"}]],
         )
 
     def connect_torbox(self, chat_id: int, api_key: str) -> None:
         api_key = api_key.strip()
-        if len(api_key) < 16 or any(character.isspace() for character in api_key):
+        if not 16 <= len(api_key) <= 256 or any(character.isspace() for character in api_key):
             self.send(
                 chat_id,
                 "❌ Ключ выглядит некорректно. Отправь API key без пробелов или нажми /cancel.",
@@ -1950,68 +2434,245 @@ class TelegramBot:
                 [[{"text": "Отмена", "callback_data": "account"}]],
             )
             return
+        previous_key = self.credentials.api_key(chat_id)
         self.credentials.set_api_key(chat_id, api_key)
+        self.forget_log_key(previous_key)
+        PRIVATE_LOG.add_secret(api_key)
         self._torbox_clients[chat_id] = client
+        self.state.reset_account(chat_id)
+        self.last_notification_poll.pop(chat_id, None)
+        self.last_health_poll.pop(chat_id, None)
         self.state.set_mode(chat_id, None)
         self.send(
             chat_id,
             "✅ <b>Личный TorBox подключён</b>\n\nТеперь поиск, добавление, список загрузок и уведомления работают с твоим аккаунтом.",
-            self.menu_keyboard(),
+            ([[{"text": "＋ Добавить выбранный релиз", "callback_data": "confirm"}]]
+             if self.state.data["pending"].get(str(chat_id)) else []) + self.menu_keyboard(),
         )
 
     def show_home(self, chat_id: int) -> None:
         self.state.set_mode(chat_id, None)
-        notification_line = "включены" if self.notifications_enabled else "выключены в конфигурации"
-        account_line = "🟢 подключён" if self.has_torbox(chat_id) else "🟡 не подключён — нажми «TorBox-аккаунт»"
+        connected = self.has_torbox(chat_id)
+        if connected:
+            self.send(
+                chat_id,
+                "👋 Привет! Это <b>TorBox</b>.\nНайти. Добавить. Открыть.\n\n"
+                "Отправь название фильма или сериала — подберу релизы. "
+                "Готовые файлы открываются в «Мой TorBox».\n\n"
+                "Хочешь смотреть через Infuse? Нажми «📖 Инструкция» — "
+                "там ссылки и настройка по шагам.\n\n"
+                "🟢 Аккаунт подключён",
+                self.menu_keyboard(),
+            )
+            return
         self.send(
             chat_id,
-            "<b>TorBox — личный пульт</b>\n\n"
-            "Все основные действия находятся под этим сообщением.\n\n"
-            "🔎 Поиск сразу открывает фильмы с постерами в строке ввода.\n"
-            "➕ Сразу добавляет выбранный релиз.\n"
-            "🗑 Удаление всегда просит подтверждение.\n\n"
-            f"🔑 Аккаунт: <b>{account_line}</b>\n"
-            f"🔔 Автоуведомления: <b>{notification_line}</b>.",
-            self.menu_keyboard(),
+            "👋 Привет! Это <b>TorBox</b>.\n\n"
+            "Помогу найти фильм или сериал и добавить его в твой TorBox. "
+            "TorBox загрузит файлы в облако, а Infuse поможет смотреть их "
+            "на iPhone, iPad, Mac и Apple TV.\n\n"
+            "<b>С чего начать</b>\n"
+            "1. Создай аккаунт TorBox — можно начать с Essential за $3/месяц.\n"
+            "2. Подключи свой TorBox к боту по API-ключу.\n"
+            "3. Настрой Infuse по инструкции ниже.\n\n"
+            "📖 В инструкции — что скачать, ссылки и все настройки по шагам. "
+            "Infuse Pro при необходимости оплачивается отдельно.\n\n"
+            "Поиск доступен ещё до подключения TorBox.",
+            [[self.guide_button()],
+             [{"text": "🔑 Подключить TorBox", "callback_data": "connect"}],
+             [self.search_button()],
+             [{"text": BTN_HELP, "callback_data": "help"}]],
         )
 
+    def show_privacy(self, chat_id: int) -> None:
+        self.state.set_mode(chat_id, None)
+        self.send(chat_id,
+            "🔐 <b>Твои данные</b>\n\n"
+            "Бот хранит твой Telegram ID, ключ TorBox, настройки, последние 8 поисков, "
+            "избранное и состояние уведомлений. Ключ даёт доступ к твоему TorBox: "
+            "он хранится на сервере без шифрования, в файле с ограниченными правами. "
+            "Администратор сервера технически может его прочитать.\n\n"
+            "Сообщение с ключом удаляется перед проверкой. Запросы поиска передаются "
+            "каталогу фильмов и подключённым трекерам; ключ TorBox отправляется только TorBox.\n\n"
+            "История поиска и избранное неактивных пользователей очищаются через 30 дней. "
+            "Ключ остаётся до отключения аккаунта. /delete_data удаляет личные данные из бота; "
+            "файлы в TorBox остаются. Ключ также можно отозвать в настройках TorBox.",
+            [[{"text": "Удалить мои данные", "callback_data": "forgetask"}], [self.home_button()]],
+        )
+
+    def forget_prompt(self, chat_id: int) -> None:
+        self.send(chat_id, "Удалить ключ, историю, избранное и настройки из бота? Загрузки в TorBox останутся.",
+                  [[{"text": "Да, удалить мои данные", "callback_data": "forgetconfirm"},
+                    {"text": "Отмена", "callback_data": "account"}]])
+
+    def forget_user(self, chat_id: int) -> None:
+        previous_key = self.credentials.api_key(chat_id) if self.credentials else None
+        if self.credentials:
+            self.credentials.remove_api_key(chat_id)
+        self.forget_log_key(previous_key)
+        self._torbox_clients.pop(chat_id, None)
+        self.last_notification_poll.pop(chat_id, None)
+        self.last_health_poll.pop(chat_id, None)
+        self.state.forget_user(chat_id)
+        self.capture_screen = False
+        text = "✅ Ключ и личные данные удалены из бота. Загрузки в TorBox сохранены."
+        if chat_id == self.owner_id and self.torbox is not None:
+            text += " Резервный ключ владельца из конфигурации сервера остаётся активным."
+        self._send_new(chat_id, text)
+
     def show_help(self, chat_id: int) -> None:
-        self.send(
-            chat_id,
-            "<b>Как пользоваться</b>\n\n"
-            "🔎 Нажми кнопку под сообщением, введи название и выбери фильм с постером. "
-            "После выбора релизы откроются сразу.\n"
-            "Сообщение с запросом бот убирает, поэтому экран не засоряется.\n"
-            "➕ В списке сразу добавляет релиз, ℹ️ показывает подробности.\n"
-            "↩️ Кнопка «Назад» возвращает к предыдущему экрану без нового сообщения.\n"
-            "📥 <b>Мой TorBox</b> — список, прогресс, скорость, детали и удаление.\n"
-            "🔔 <b>Уведомления</b> — последние сообщения TorBox. Новые сообщения бот присылает сам.\n\n"
-            "🔑 <b>TorBox-аккаунт</b> — подключить или заменить личный API key.\n"
-            "🔎 <b>Поиск</b> — открывает выдачу с постерами прямо в строке ввода.\n\n"
-            "Команды: /start, /connect, /account, /search, /torrents, /notifications, /status, /help",
-            [[self.home_button()]],
+        self.state.set_mode(chat_id, None)
+        self.send(chat_id,
+            "<b>От поиска до просмотра</b>\n\n"
+            "Впервые здесь? «📖 Инструкция» объяснит, как подключить TorBox "
+            "и настроить Infuse для просмотра.\n\n"
+            "<b>1. Найди</b>\nОтправь название, при необходимости добавь год. "
+            "Поиск с постерами доступен отдельной кнопкой, если каталог подключён.\n\n"
+            "<b>2. Выбери релиз</b>\nСравни качество, озвучку и размер. "
+            "«В кэше» означает, что TorBox уже хранит файлы. "
+            "CAM и TS — экранные копии, даже если указано 1080p.\n\n"
+            "<b>3. Добавь и открой</b>\n«Добавить» отправляет релиз в твой TorBox. "
+            "Когда он готов, открой загрузку → «Файлы» → нужную серию. "
+            "Ссылка открывается в браузере; поддержку видео определяет устройство.\n\n"
+            "⭐ Избранное сохраняет название для повторного поиска.\n"
+            "🕘 История — последние 8 запросов.\n"
+            "🗑 Удаление загрузки требует подтверждения.\n\n"
+            "/search — поиск · /torrents — загрузки · /cancel — выйти из ввода",
+            [[self.guide_button()], [self.search_button(), self.home_button()]],
         )
 
     def prompt_search(
-        self,
-        chat_id: int,
-        *,
-        message_id: int | None = None,
-        inline_message_id: str = "",
+        self, chat_id: int, *, message_id: int | None = None, inline_message_id: str = "",
     ) -> None:
         self.state.set_mode(chat_id, "catalog_search" if self.catalog else "search")
-        text = (
-            "🔎 <b>Что найти?</b>\n\n"
-            "Нажми кнопку и пиши название фильма или сериала прямо в строке ввода."
+        keyboard = []
+        if self.inline_enabled and self.catalog:
+            keyboard.append([self.search_button("🔎 Поиск с постерами")])
+        keyboard.append([
+            {"text": "🕘 История", "callback_data": "history"},
+            {"text": "⭐ Избранное", "callback_data": "favorites"},
+        ])
+        keyboard.append([self.search_settings_button(), self.home_button()])
+        self.render(chat_id,
+            "🔎 <b>Что найти?</b>\n\nОтправь название фильма или сериала обычным сообщением.\n"
+            "Например: <i>Дюна 2021</i> или <i>Разделение 2 сезон</i>.",
+            keyboard, message_id=message_id, inline_message_id=inline_message_id,
         )
-        keyboard = [[self.search_button("🔎 Открыть поиск с постерами")], [self.home_button()]]
-        self.render(
-            chat_id,
-            text,
-            keyboard,
-            message_id=message_id,
-            inline_message_id=inline_message_id,
-        )
+
+    def query_button(self, chat_id: int, query: str, text: str) -> dict[str, str]:
+        token = "q_" + hashlib.sha256(f"{chat_id}:{query}".encode()).hexdigest()[:16]
+        self.state.put_inline_item(token, {"kind": "query", "query": query, "owner": chat_id})
+        return {"text": text, "callback_data": f"retry:{token}"}
+
+    def search_prefs(self, chat_id: int) -> dict[str, Any]:
+        return search_preferences(self.state.ui_value(chat_id, "search_preferences", {}))
+
+    def search_settings_button(self) -> dict[str, str]:
+        return {"text": "⚙️ Настройки поиска", "callback_data": "searchsettings"}
+
+    def show_search_settings(self, chat_id: int) -> None:
+        self.state.set_mode(chat_id, None)
+        prefs = self.search_prefs(chat_id)
+        keyboard = []
+        for values, field in [(SEARCH_QUALITIES, "quality"), (SEARCH_AUDIO, "audio")]:
+            buttons = [{"text": ("✓ " if prefs[field] == key else "") + label,
+                        "callback_data": f"sp:{field}:{key}"} for key, label in values.items()]
+            keyboard.extend(buttons[i:i+2] for i in range(0, len(buttons), 2))
+        keyboard.extend([
+            [{"text": ("✓ " if prefs["complete"] else "") + "Комплекты и полные сезоны первыми",
+              "callback_data": f"sp:complete:{int(not prefs['complete'])}"}],
+            [{"text": ("✓ " if prefs["fallback"] else "") + "Показывать другие качество / озвучку",
+              "callback_data": f"sp:fallback:{int(not prefs['fallback'])}"}],
+            [{"text": "Сбросить: 1080p и дубляж", "callback_data": "sp:reset:1"}],
+        ])
+        if self.state.get_search(chat_id):
+            keyboard.append([{"text": "← К результатам", "callback_data": "results"}])
+        keyboard.append([self.search_button(), self.home_button()])
+        self.send(chat_id,
+                  "⚙️ <b>Настройки поиска</b>\n\n"
+                  f"Качество: <b>{SEARCH_QUALITIES[prefs['quality']]}</b>\n"
+                  f"Озвучка: <b>{SEARCH_AUDIO[prefs['audio']]}</b>\n\n"
+                  "Приоритет — доступные раздачи в выбранном качестве. "
+                  + ("Полные сезоны выше отдельных серий, а среди них — выбранная озвучка и комплекты сезонов."
+                     if prefs["complete"] else "Затем — выбранная озвучка, кэш и сиды. Приоритет полных сезонов выключен.")
+                  + "\n\n"
+                  + ("Если точного совпадения нет, покажу подписанные альтернативы."
+                     if prefs["fallback"] else "Другие качество и озвучка скрыты. Некоторые сезоны могут не попасть под настройки.")
+                  + "\n\nИзменения сохраняются сразу и перестраивают текущую выдачу. Дубляж определяется по данным источника; DUAL сам по себе его не подтверждает.",
+                  keyboard)
+
+    def change_search_preference(self, chat_id: int, field: str, value: str) -> None:
+        prefs = self.search_prefs(chat_id)
+        if (field == "quality" and value in SEARCH_QUALITIES) or (field == "audio" and value in SEARCH_AUDIO):
+            prefs[field] = value
+        elif field in {"complete", "fallback"} and value in {"0", "1"}:
+            prefs[field] = value == "1"
+        elif field == "reset":
+            prefs = dict(SEARCH_DEFAULTS)
+        else:
+            raise ValueError("Invalid search preference")
+        self.state.set_ui(chat_id, search_preferences=prefs)
+        stored = self.state.get_search(chat_id)
+        if stored:
+            query, sources, _ = stored
+            candidates = self.state.search_candidates(chat_id)
+            season_scope = self.state.ui_value(chat_id, "search_season", "all")
+            self.state.put_search(chat_id, personalized_releases(candidates, prefs), query=query,
+                                  source_status=sources, candidates=candidates)
+            self.state.set_ui(chat_id, search_season=season_scope)
+        self.show_search_settings(chat_id)
+
+    def show_seasons(self, chat_id: int, revision: str, page: int = 0) -> None:
+        stored = self.state.get_search(chat_id)
+        if not stored or revision != self.state.search_revision(chat_id):
+            self.send(chat_id, "Этот поиск устарел. Открой актуальные результаты.",
+                      [[{"text": "К результатам", "callback_data": "results"}]])
+            return
+        query, _, releases = stored
+        seasons = sorted({n for r in releases for n in release_season_numbers(r.title)})
+        pages = max(1, (len(seasons) + 11) // 12)
+        page = max(0, min(page, pages - 1))
+        lines = [f"📺 <b>{html.escape(query)}</b>", "\nВыбери сезон — повторный поиск не нужен."]
+        keyboard = [[{"text": "Все найденные сезоны", "callback_data": f"season:{revision}:all"}]]
+        if any(len(release_season_numbers(r.title)) > 1 for r in releases):
+            keyboard.append([{"text": "📦 Комплекты сезонов", "callback_data": f"season:{revision}:packs"}])
+        for season in seasons[page*12:(page+1)*12]:
+            matching = [r for r in releases if season in release_season_numbers(r.title)]
+            prefs = self.search_prefs(chat_id)
+            suitable = [r for r in matching if release_matches_preferences(r, prefs)]
+            note = "" if suitable else " · другое качество / озвучка"
+            if all(release_is_partial_season(r.title) for r in matching):
+                note += " · отдельные серии"
+            lines.append(f"Сезон {season}: вариантов {len(matching)}{note}")
+            keyboard.append([{"text": f"Сезон {season}" + (" · есть совпадение" if suitable else " · альтернативы"),
+                              "callback_data": f"season:{revision}:{season}"}])
+        gaps = sorted(set(range(1, max(seasons, default=0)+1)) - set(seasons))
+        if gaps:
+            lines.append(f"\nВ выдаче не найдены сезоны: {season_summary(gaps)}.")
+        lines.append("\nПоказано покрытие найденных релизов. Это не подтверждение, что вышли и найдены все сезоны сериала.")
+        nav = []
+        if page:
+            nav.append({"text": "← Назад", "callback_data": f"seasons:{revision}:{page-1}"})
+        if page+1 < pages:
+            nav.append({"text": "Далее →", "callback_data": f"seasons:{revision}:{page+1}"})
+        if nav:
+            keyboard.append(nav)
+        keyboard.append([{"text": "← К результатам", "callback_data": "results"}, self.search_settings_button()])
+        self.send(chat_id, "\n".join(lines), keyboard)
+
+    def show_saved_queries(self, chat_id: int, *, favorites: bool = False) -> None:
+        self.state.set_mode(chat_id, None)
+        queries = self.state.ui_value(chat_id, "favorites" if favorites else "history", [])
+        title = "⭐ Избранное" if favorites else "🕘 История поиска"
+        text = f"<b>{title}</b>\n\n"
+        text += ("Выбери название, чтобы найти актуальные релизы." if queries else
+                 "Здесь появятся сохранённые названия. Нажми «В избранное» под результатами поиска."
+                 if favorites else "Здесь появятся последние 8 поисков. Начни с названия фильма или сериала.")
+        keyboard = [[self.query_button(chat_id, q, compact_title(q, 48))] for q in queries]
+        if queries and not favorites:
+            keyboard.append([{"text": "Очистить историю", "callback_data": "historyclear"}])
+        keyboard.append([self.search_button(), self.home_button()])
+        self.send(chat_id, text, keyboard)
 
     def show_catalog_choices(
         self,
@@ -2032,7 +2693,12 @@ class TelegramBot:
                 message_id=message_id,
             )
             return
+        if not self.allow_search(chat_id):
+            return
         if not self.catalog:
+            self.show_search(chat_id, query, message_id=message_id)
+            return
+        if not self.catalog_limit.allow("catalog"):
             self.show_search(chat_id, query, message_id=message_id)
             return
         loading = self.render(chat_id, f"🎬 Ищу фильм <b>{html.escape(query)}</b>…", message_id=message_id)
@@ -2043,12 +2709,13 @@ class TelegramBot:
                 message_id = None
         try:
             titles = self.catalog.search(query)[:8]
-        except Exception as exc:
+        except Exception:
             LOG.exception("Catalog search failed")
             self.render(
                 chat_id,
-                f"❌ Каталог сейчас недоступен: {html.escape(str(exc))}",
-                [[self.search_button("🔄 Новый поиск"), self.home_button()]],
+                "Каталог фильмов временно недоступен. Можно поискать название сразу на трекерах.",
+                [[self.query_button(chat_id, query, "🔎 Искать на трекерах")],
+                 [self.search_button("Другой запрос"), self.home_button()]],
                 message_id=message_id,
             )
             return
@@ -2056,7 +2723,8 @@ class TelegramBot:
             self.render(
                 chat_id,
                 "Ничего похожего не нашёл. Попробуй другое написание.",
-                [[self.search_button("🔎 Другой запрос"), self.home_button()]],
+                [[self.query_button(chat_id, query, "🔎 Искать на трекерах")],
+                 [self.search_button("Другой запрос"), self.home_button()]],
                 message_id=message_id,
             )
             return
@@ -2091,45 +2759,98 @@ class TelegramBot:
         self.render(chat_id, "\n".join(lines), keyboard, message_id=message_id)
 
     def render_search_results(
-        self,
-        chat_id: int,
-        query: str,
-        releases: list[Release],
-        source_status: str = "",
-        *,
-        message_id: int | None = None,
-        inline_message_id: str = "",
+        self, chat_id: int, query: str, releases: list[Release], source_status: str = "", *,
+        message_id: int | None = None, inline_message_id: str = "",
+        page: int | None = None, filter_by: str | None = None,
     ) -> Any:
-        lines = [
-            f"🔎 <b>{html.escape(query)}</b>\n"
-            f"Нашёл <b>{len(releases)} релизов</b> · ⭐ первый — лучший баланс.\n"
-        ]
-        if source_status:
-            lines.append(f"📡 {html.escape(source_status)}\n")
-        keyboard: list[list[dict[str, str]]] = []
-        for index, release in enumerate(releases):
-            quality = video_quality_summary(release, release.details_text)
-            voiceover = voiceover_summary(release, release.details_text)
-            number = f"⭐ {index + 1}" if index == 0 else str(index + 1)
+        page = self.state.ui_value(chat_id, "search_page", 0) if page is None else page
+        filter_by = self.state.ui_value(chat_id, "search_filter", "all") if filter_by is None else filter_by
+        revision = self.state.search_revision(chat_id)
+        prefs = self.search_prefs(chat_id)
+        indexed = list(enumerate(releases))
+        season_scope = self.state.ui_value(chat_id, "search_season", "all")
+        if season_scope == "packs":
+            indexed = [(i, r) for i, r in indexed if len(release_season_numbers(r.title)) > 1]
+        elif str(season_scope).isdigit():
+            indexed = [(i, r) for i, r in indexed if int(season_scope) in release_season_numbers(r.title)]
+        if not prefs["fallback"]:
+            indexed = [(i, r) for i, r in indexed if release_matches_preferences(r, prefs)]
+        if filter_by == "cached":
+            indexed = [(i, r) for i, r in indexed if r.cached is True]
+        elif filter_by == "hd":
+            indexed = [(i, r) for i, r in indexed if re.search(r"\b(?:1080p|2160p|4k)\b", r.title, re.I)
+                       and not re.search(r"\b(?:camrip|hdcam|cam|ts|tsrip|telesync)\b", r.title, re.I)]
+        elif filter_by == "small":
+            indexed = sorted(indexed, key=lambda pair: pair[1].size_bytes if pair[1].size_bytes > 0 else float("inf"))
+        pages = max(1, (len(indexed) + SEARCH_PAGE_SIZE - 1) // SEARCH_PAGE_SIZE)
+        page = max(0, min(page, pages - 1))
+        self.state.set_ui(chat_id, search_page=page, search_filter=filter_by)
+        lines = [f"🔎 <b>{html.escape(query)}</b>", f"Нашёл релизов: <b>{len(releases)}</b> · в подборке {len(indexed)}",
+                 f"Приоритет: {SEARCH_QUALITIES[prefs['quality']]} · {SEARCH_AUDIO[prefs['audio']]}"]
+        seasons = sorted({n for r in releases for n in release_season_numbers(r.title)})
+        if seasons:
+            lines.append(f"Найдены сезоны: {season_summary(seasons)}")
+        if season_scope != "all":
+            lines.append("📦 Комплекты сезонов" if season_scope == "packs" else f"📺 Сезон {season_scope}")
+        if "ошибка" in source_status:
+            lines.append("Часть источников недоступна. Здесь результаты тех, что ответили.")
+        keyboard = []
+        for index, release in indexed[page * SEARCH_PAGE_SIZE:(page + 1) * SEARCH_PAGE_SIZE]:
+            quality = compact_title(video_quality_summary(release, release.details_text), 90)
+            voice = compact_title(voiceover_summary(release, release.details_text), 80)
+            availability = "⚡ В кэше TorBox" if release.cached is True else seed_health_summary(release.seeders)
+            coverage = release_season_numbers(release.title)
+            coverage_line = (f"📦 Сезоны {season_summary(coverage)}" if len(coverage) > 1 else f"📺 Сезон {coverage[0]}") if coverage else ""
+            if coverage and release_is_partial_season(release.title):
+                coverage_line += " · отдельные серии"
+            alternate = "Альтернатива по качеству / озвучке" if not release_matches_preferences(release, prefs) else ""
             lines.append(
-                f"<b>{number}. {html.escape(compact_title(release.title, 118))}</b>\n"
-                f"🎞 {html.escape(quality)}\n"
-                f"🎙 {html.escape(voiceover)}\n"
-                f"📦 {html.escape(release.size_text)} · {availability_summary(release)} · "
-                f"{html.escape(release.source_name)}\n"
+                f"\n<b>{index + 1}. {html.escape(compact_title(release.title, 85))}</b>\n"
+                + (coverage_line + "\n" if coverage_line else "")
+                + f"{html.escape(quality)} · {html.escape(release.size_text)}\n"
+                f"Озвучка: {html.escape(voice)}\n"
+                f"{availability} · {html.escape(compact_title(release.source_name, 30))}"
+                + (f"\n<i>{alternate}</i>" if alternate else "")
             )
             keyboard.append([
-                {"text": f"ℹ️ {index + 1} · Подробнее", "callback_data": f"info:{index}"},
-                {"text": f"➕ {index + 1}", "callback_data": f"add:{index}"},
+                {"text": f"{index + 1} · Подробнее", "callback_data": f"info:{index}:{revision}"},
+                {"text": f"＋ {index + 1} · Добавить", "callback_data": f"add:{index}:{revision}"},
             ])
-        keyboard.append([self.search_button("🔎 Другой фильм"), self.home_button()])
-        return self.render(
-            chat_id,
-            "\n".join(lines),
-            keyboard,
-            message_id=message_id,
-            inline_message_id=inline_message_id,
-        )
+        if not indexed:
+            lines.append("\nПод эти настройки и фильтры релизов нет. Выбери «Все» или разреши альтернативы в настройках поиска.")
+        nav = []
+        if page:
+            nav.append({"text": "← Назад", "callback_data": f"sr:{revision}:{page - 1}:{filter_by}"})
+        if pages > 1:
+            nav.append({"text": f"{page + 1} / {pages}", "callback_data": "noop"})
+        if page + 1 < pages:
+            nav.append({"text": "Далее →", "callback_data": f"sr:{revision}:{page + 1}:{filter_by}"})
+        if nav:
+            keyboard.append(nav)
+        if seasons:
+            keyboard.append([{"text": "📺 Выбрать сезон / комплект", "callback_data": f"seasons:{revision}:0"}])
+        for row in [[("all", "Все"), ("cached", "В кэше")], [("hd", "1080p+ без CAM/TS"), ("small", "Меньше размер")]]:
+            keyboard.append([{"text": ("✓ " if filter_by == key else "") + label,
+                              "callback_data": f"sr:{revision}:0:{key}"} for key, label in row])
+        saved = query in self.state.ui_value(chat_id, "favorites", [])
+        keyboard.append([{"text": "★ Убрать из избранного" if saved else "☆ В избранное",
+                          "callback_data": f"favorite:{revision}"}])
+        keyboard.append([self.search_settings_button()])
+        keyboard.append([self.search_button("🔎 Новый поиск"), self.home_button()])
+        return self.render(chat_id, "\n".join(lines), keyboard,
+                           message_id=message_id, inline_message_id=inline_message_id)
+
+    def allow_search(self, chat_id: int) -> bool:
+        if getattr(self._render_context, "search_permitted", False):
+            return True
+        if not self.search_limit.allow(chat_id):
+            self.send(chat_id, "Слишком частый поиск. Подожди 15 секунд и повтори запрос.", [[self.home_button()]])
+            return False
+        if not self.global_search_limit.allow("search"):
+            self.send(chat_id, "Сейчас много поисковых запросов. Попробуй через минуту.", [[self.home_button()]])
+            return False
+        self._render_context.search_permitted = True
+        return True
 
     def show_search(
         self,
@@ -2152,10 +2873,17 @@ class TelegramBot:
                 inline_message_id=inline_message_id,
             )
             return
+        if not self.allow_search(chat_id):
+            return
         self.state.set_mode(chat_id, None)
+        self.state.remember_query(chat_id, query)
+        self.state.put_search(chat_id, [], query=query)
+        self.state.set_ui(chat_id, search_page=0, search_filter="all")
+        retry_keyboard = [[self.query_button(chat_id, query, "🔄 Повторить поиск")],
+                          [self.search_button("Изменить запрос"), self.home_button()]]
         loading = self.render(
             chat_id,
-            f"🔎 Ищу <b>{html.escape(query)}</b>…",
+            f"🔎 <b>{html.escape(query)}</b>\n\nИщу релизы на трекерах…\nОбычно это занимает до минуты.",
             message_id=message_id,
             inline_message_id=inline_message_id,
         )
@@ -2165,13 +2893,14 @@ class TelegramBot:
             except (TypeError, ValueError):
                 message_id = None
         try:
-            releases = self.nnm.search(query)
-        except requests.RequestException as exc:
+            search = getattr(self.nnm, "search_candidates", self.nnm.search)
+            releases = search(query)
+        except Exception:
             LOG.exception("NNM search failed")
             self.render(
                 chat_id,
-                f"❌ Источник сейчас недоступен: {html.escape(str(exc))}",
-                [[{"text": "🔄 Повторить", "callback_data": "results"}]],
+                "Источники поиска сейчас не отвечают. Запрос сохранён — попробуй ещё раз.",
+                retry_keyboard,
                 message_id=message_id,
                 inline_message_id=inline_message_id,
             )
@@ -2180,27 +2909,28 @@ class TelegramBot:
         status_summary = getattr(self.nnm, "status_summary", None)
         if callable(status_summary):
             source_status = str(status_summary())
-        if releases:
-            if self.has_torbox(chat_id):
-                try:
-                    cached = self.torbox_for(chat_id).cached_hashes([release.info_hash for release in releases])
-                    releases = cache_ranked_releases(releases, cached)
-                except Exception:
-                    LOG.warning("Could not enrich search with TorBox cache", exc_info=True)
-                    releases = select_diverse_releases(releases, MAX_RESULTS)
-            else:
-                releases = select_diverse_releases(releases, MAX_RESULTS)
+        if releases and self.has_torbox(chat_id):
+            try:
+                cached = self.torbox_for(chat_id).cached_hashes([release.info_hash for release in releases])
+                cached = {normalize_info_hash(value) for value in cached}
+                releases = [replace(r, cached=normalize_info_hash(r.info_hash) in cached if r.info_hash else r.cached) for r in releases]
+            except Exception:
+                LOG.warning("Could not enrich search with TorBox cache")
         if not releases:
+            statuses = getattr(self.nnm, "last_status", {})
+            all_failed = bool(statuses) and all(value == "ошибка" for value in statuses.values())
             self.render(
                 chat_id,
-                "Ничего подходящего не нашёл. Попробуй другое написание или добавь год."
-                + (f"\n\nИсточники: {html.escape(source_status)}" if source_status else ""),
-                [[self.search_button("🔎 Искать ещё"), self.home_button()]],
+                ("Источники поиска сейчас не отвечают. Запрос сохранён — попробуй ещё раз." if all_failed else
+                 f"По запросу «{html.escape(query)}» релизов пока нет.\n\nПопробуй оригинальное название, добавь год или убери номер серии."),
+                retry_keyboard,
                 message_id=message_id,
                 inline_message_id=inline_message_id,
             )
             return
-        self.state.put_search(chat_id, releases, query=query, source_status=source_status)
+        candidates = releases
+        releases = personalized_releases(candidates, self.search_prefs(chat_id))
+        self.state.put_search(chat_id, releases, query=query, source_status=source_status, candidates=candidates)
         self.render_search_results(
             chat_id,
             query,
@@ -2216,88 +2946,164 @@ class TelegramBot:
         size = human_size(int(item.get("size") or 0))
         speed = int(item.get("download_speed") or 0)
         speed_text = f" · {human_size(speed)}/с" if speed > 0 else ""
+        summary = f"Готово · {size}" if torrent_ready(item) else f"{html.escape(status)} · {progress:.0f}% · {size}{speed_text}"
         return (
             f"{icon} <b>{html.escape(compact_title(str(item.get('name') or 'Без названия'), 90))}</b>\n"
-            f"{html.escape(status)} · {progress:.0f}% · {size}{speed_text}"
+            f"{summary}"
         )
 
-    def show_torrents(self, chat_id: int, page: int = 0, *, refresh: bool = False) -> None:
+    def library_back(self, chat_id: int) -> dict[str, str]:
+        return {"text": "← К загрузкам", "callback_data": f"list:{self.state.ui_value(chat_id, 'library_page', 0)}"}
+
+    def show_torrents(self, chat_id: int, page: int = 0, *, refresh: bool = False, filter_by: str | None = None) -> None:
+        self.state.set_mode(chat_id, None)
+        if not self.has_torbox(chat_id):
+            self.show_account(chat_id)
+            return
         try:
-            items = self.torbox_for(chat_id).list_torrents(limit=100, bypass_cache=refresh)
-        except Exception as exc:
-            LOG.exception("Could not list TorBox torrents")
-            self.send(chat_id, f"❌ Не удалось получить список: {html.escape(str(exc))}", self.menu_keyboard())
+            items = self.torbox_for(chat_id).list_torrents(limit=1000, bypass_cache=refresh)
+        except Exception:
+            LOG.warning("Could not list TorBox torrents")
+            self.send(chat_id, "Не удалось загрузить список TorBox. Попробуй обновить его чуть позже.",
+                      [[{"text": "🔄 Повторить", "callback_data": f"refresh:{page}"}], [self.home_button()]])
             return
-        items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
-        if not items:
-            self.send(
-                chat_id,
-                "📥 <b>TorBox пока пуст</b>\n\nНайди релиз и добавь его — он появится здесь.",
-                [[self.search_button(), {"text": "🔄 Обновить", "callback_data": "refresh:0"}],
-                 [self.home_button()]],
-            )
-            return
-        pages = max(1, (len(items) + TORBOX_PAGE_SIZE - 1) // TORBOX_PAGE_SIZE)
+        items = sorted(items, key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        filter_by = filter_by or self.state.ui_value(chat_id, "library_filter", "all")
+        ready_count = sum(torrent_ready(item) for item in items)
+        visible_items = [item for item in items if filter_by == "all" or
+                         (torrent_ready(item) if filter_by == "ready" else not torrent_ready(item))]
+        pages = max(1, (len(visible_items) + TORBOX_PAGE_SIZE - 1) // TORBOX_PAGE_SIZE)
         page = max(0, min(page, pages - 1))
-        visible = items[page * TORBOX_PAGE_SIZE:(page + 1) * TORBOX_PAGE_SIZE]
-        lines = [f"📥 <b>Мой TorBox</b> · {len(items)} загрузок · страница {page + 1}/{pages}\n"]
-        keyboard: list[list[dict[str, str]]] = []
-        for item in visible:
+        self.state.set_ui(chat_id, library_page=page, library_filter=filter_by)
+        lines = ["📥 <b>Мой TorBox</b>", f"Готово: {ready_count} · В процессе: {len(items) - ready_count}"]
+        keyboard = [[{"text": ("✓ " if filter_by == key else "") + label,
+                      "callback_data": f"library:{key}:0"}
+                     for key, label in [("all", "Все"), ("ready", "Готово"), ("active", "В процессе")]]]
+        if not items:
+            lines = ["📥 <b>TorBox пока пуст</b>", "\nНайди фильм или сериал и нажми «Добавить». Загрузка появится здесь."]
+        elif not visible_items:
+            lines.append("\nВ этом разделе пока нет загрузок. Все файлы доступны во вкладке «Все».")
+        for number, item in enumerate(visible_items[page * TORBOX_PAGE_SIZE:(page + 1) * TORBOX_PAGE_SIZE], 1):
             try:
                 torrent_id = safe_torrent_id(item.get("id"))
             except ValueError:
                 continue
-            lines.append(self.torrent_line(item) + "\n")
-            keyboard.append([
-                {"text": f"ℹ️ {torrent_id}", "callback_data": f"tinfo:{torrent_id}"},
-                {"text": "🗑 Удалить", "callback_data": f"delask:{torrent_id}"},
-            ])
-        navigation: list[dict[str, str]] = []
-        if page > 0:
-            navigation.append({"text": "←", "callback_data": f"list:{page - 1}"})
-        navigation.append({"text": "🔄", "callback_data": f"refresh:{page}"})
+            lines.append("\n" + self.torrent_line(item))
+            keyboard.append([{"text": f"{number} · {compact_title(str(item.get('name') or 'Без названия'), 43)}",
+                              "callback_data": f"tinfo:{torrent_id}"}])
+        navigation = []
+        if page:
+            navigation.append({"text": "← Назад", "callback_data": f"list:{page - 1}"})
+        if pages > 1:
+            navigation.append({"text": f"{page + 1} / {pages}", "callback_data": "noop"})
         if page + 1 < pages:
-            navigation.append({"text": "→", "callback_data": f"list:{page + 1}"})
-        keyboard.append(navigation)
+            navigation.append({"text": "Далее →", "callback_data": f"list:{page + 1}"})
+        if navigation:
+            keyboard.append(navigation)
+        keyboard.append([{"text": "🔄 Обновить", "callback_data": f"refresh:{page}"}])
         keyboard.append([self.search_button(), self.home_button()])
         self.send(chat_id, "\n".join(lines), keyboard)
 
-    def show_torrent(self, chat_id: int, torrent_id: int) -> None:
+    def show_torrent(self, chat_id: int, torrent_id: int, *, notice: str = "") -> None:
+        back = [self.library_back(chat_id), self.home_button()]
         try:
             item = self.torbox_for(chat_id).get_torrent(torrent_id, bypass_cache=True)
-        except Exception as exc:
-            self.send(chat_id, f"❌ Не удалось загрузить карточку: {html.escape(str(exc))}")
+        except Exception:
+            self.send(chat_id, "Не удалось загрузить карточку. Попробуй ещё раз.",
+                      [[{"text": "🔄 Повторить", "callback_data": f"tinfo:{torrent_id}"}], back])
             return
         if not item:
-            self.send(chat_id, "Загрузка уже удалена или недоступна.", [[{"text": "← К списку", "callback_data": "list:0"}]])
+            self.send(chat_id, "Загрузка уже удалена или недоступна.", [back])
             return
         icon, status = status_label(item)
-        progress = progress_percent(item.get("progress"))
-        speed = int(item.get("download_speed") or 0)
-        eta = int(item.get("eta") or 0)
-        raw_state = str(item.get("download_state") or "").casefold()
-        eta_text = "—" if "no seeds" in raw_state or "stalled" in raw_state else human_duration(eta)
+        ready = torrent_ready(item)
         files = item.get("files") if isinstance(item.get("files"), list) else []
-        text = (
-            f"{icon} <b>{html.escape(str(item.get('name') or 'Без названия'))}</b>\n\n"
-            f"Статус: <b>{html.escape(status)}</b>\n"
-            f"Прогресс: <b>{progress:.1f}%</b>\n"
-            f"Размер: <b>{human_size(int(item.get('size') or 0))}</b>\n"
-            f"Скорость: <b>{human_size(speed)}/с</b>\n"
-            f"Осталось: <b>{eta_text}</b>\n"
-            f"Сиды / пиры: <b>{int(item.get('seeds') or 0)} / {int(item.get('peers') or 0)}</b>\n"
-            f"Файлов: <b>{len(files)}</b>\n"
-            f"TorBox ID: <code>{torrent_id}</code>"
-        )
-        keyboard: list[list[dict[str, str]]] = [[
-            {"text": "🔄 Обновить", "callback_data": f"tinfo:{torrent_id}"},
-            {"text": "📡 Переподключить", "callback_data": f"tctl:{torrent_id}:reannounce"},
-        ]]
-        if "pause" in str(item.get("download_state") or "").casefold():
-            keyboard.append([{"text": "▶️ Продолжить", "callback_data": f"tctl:{torrent_id}:resume"}])
-        keyboard.append([{"text": "🗑 Удалить", "callback_data": f"delask:{torrent_id}"}])
-        keyboard.append([{"text": "← К списку", "callback_data": "list:0"}, self.home_button()])
-        self.send(chat_id, text, keyboard)
+        lines = [f"{icon} <b>{html.escape(compact_title(str(item.get('name') or 'Без названия'), 220))}</b>"]
+        if notice:
+            lines.append(notice)
+        lines.append(f"\n{human_size(int(item.get('size') or 0))} · Файлов: {len(files)}")
+        keyboard = []
+        raw_state = str(item.get("download_state") or "").casefold()
+        if ready:
+            lines.append("Готово в TorBox. Выбери файл, чтобы получить ссылку.")
+            keyboard.append([{"text": f"📂 Открыть файлы · {len(files)}", "callback_data": f"files:{torrent_id}:0"}])
+        else:
+            progress = progress_percent(item.get("progress"))
+            lines.append(f"{html.escape(status.capitalize())} · {progress:.0f}%")
+            if status == "подготовка файлов":
+                lines.append("Загрузка завершена. TorBox подготавливает файлы — обнови карточку чуть позже.")
+            elif "no seeds" in raw_state or "stalled" in raw_state:
+                lines.append("Нет раздающих. Можно обновить подключение или выбрать другой релиз.")
+            elif "pause" in raw_state:
+                lines.append("Загрузка приостановлена. Нажми «Продолжить».")
+            else:
+                speed = int(item.get("download_speed") or 0)
+                lines.append(f"{human_size(speed)}/с · Осталось: {human_duration(int(item.get('eta') or 0))}")
+                lines.append("Файлы можно открыть после завершения загрузки.")
+            if "pause" in raw_state:
+                keyboard.append([{"text": "▶️ Продолжить", "callback_data": f"tctl:{torrent_id}:resume"}])
+            if status != "подготовка файлов":
+                keyboard.append([{"text": "📡 Обновить подключение", "callback_data": f"tctl:{torrent_id}:reannounce"}])
+        keyboard.append([{"text": "🔄 Обновить", "callback_data": f"tinfo:{torrent_id}"},
+                         {"text": "🗑 Удалить", "callback_data": f"delask:{torrent_id}"}])
+        keyboard.append(back)
+        self.send(chat_id, "\n".join(lines), keyboard)
+
+    def show_files(self, chat_id: int, torrent_id: int, page: int = 0, *, file_id: int | None = None) -> None:
+        back = [{"text": "← К загрузке", "callback_data": f"tinfo:{torrent_id}"}]
+        try:
+            torbox = self.torbox_for(chat_id)
+            item = torbox.get_torrent(torrent_id, bypass_cache=True)
+            if not item or not torrent_ready(item):
+                self.show_torrent(chat_id, torrent_id)
+                return
+            files = [f for f in item.get("files", []) if isinstance(f, dict) and f.get("id") is not None]
+            files.sort(key=lambda f: natural_file_key(str(f.get("name") or f.get("short_name") or "")))
+            if file_id is not None:
+                selected = next((f for f in files if safe_torrent_id(f["id"]) == file_id), None)
+                if selected is None:
+                    self.send(chat_id, "Этот файл больше не найден. Открой список заново.",
+                              [[{"text": "📂 Файлы", "callback_data": f"files:{torrent_id}:{page}"}], back])
+                    return
+                link = torbox.download_link(torrent_id, file_id)
+                name = str(selected.get("short_name") or selected.get("name") or "Файл")
+                self.send(chat_id,
+                          f"📄 <b>{html.escape(compact_title(name, 220))}</b>\n"
+                          f"{human_size(int(selected.get('size') or 0))}\n\n"
+                          "Открой ссылку в браузере или скопируй её из кнопки в свой плеер. "
+                          "Если ссылка перестала работать, получи новую.",
+                          [[{"text": "↗ Открыть / скачать", "url": link}],
+                           [{"text": "🔄 Новая ссылка", "callback_data": f"file:{torrent_id}:{file_id}:{page}"}],
+                           [{"text": "← К файлам", "callback_data": f"files:{torrent_id}:{page}"}]])
+                return
+            pages = max(1, (len(files) + FILE_PAGE_SIZE - 1) // FILE_PAGE_SIZE)
+            page = max(0, min(page, pages - 1))
+            lines = [f"📂 <b>{html.escape(compact_title(str(item.get('name') or 'Файлы'), 140))}</b>",
+                     f"Файлов: {len(files)} · {page + 1}/{pages}"]
+            keyboard = []
+            for file in files[page * FILE_PAGE_SIZE:(page + 1) * FILE_PAGE_SIZE]:
+                name = str(file.get("name") or file.get("short_name") or "Файл")
+                label = compact_title(name, 100)
+                lines.append(f"\n{html.escape(label)}\n{human_size(int(file.get('size') or 0))}")
+                keyboard.append([{"text": compact_title(str(file.get('short_name') or name), 52),
+                                  "callback_data": f"file:{torrent_id}:{safe_torrent_id(file['id'])}:{page}"}])
+            if not files:
+                lines.append("\nTorBox ещё подготавливает список файлов. Обнови его чуть позже.")
+            nav = []
+            if page:
+                nav.append({"text": "← Назад", "callback_data": f"files:{torrent_id}:{page - 1}"})
+            if page + 1 < pages:
+                nav.append({"text": "Далее →", "callback_data": f"files:{torrent_id}:{page + 1}"})
+            if nav:
+                keyboard.append(nav)
+            keyboard.append([{"text": "🔄 Обновить файлы", "callback_data": f"files:{torrent_id}:{page}"}])
+            keyboard.append(back)
+            self.send(chat_id, "\n".join(lines), keyboard)
+        except Exception:
+            LOG.warning("Could not open TorBox files for user %s", chat_id)
+            retry = f"file:{torrent_id}:{file_id}:{page}" if file_id is not None else f"files:{torrent_id}:{page}"
+            self.send(chat_id, "Не удалось получить файл из TorBox. Попробуй ещё раз чуть позже.",
+                      [[{"text": "🔄 Повторить", "callback_data": retry}], back])
 
     @staticmethod
     def notification_key(item: dict[str, Any]) -> str:
@@ -2316,15 +3122,24 @@ class TelegramBot:
         return f"🔔 <b>{title}</b>\n{message}{date_line}"
 
     def show_notifications(self, chat_id: int) -> None:
+        self.state.set_mode(chat_id, None)
+        if not self.has_torbox(chat_id):
+            self.show_account(chat_id)
+            return
+        enabled = self.state.ui_value(chat_id, "notifications_enabled", True)
+        toggle = [{"text": "🔕 Выключить уведомления" if enabled else "🔔 Включить уведомления",
+                   "callback_data": "notifytoggle"}]
+        preference = ("Автоуведомления включены." if enabled else "Автоуведомления выключены.") if self.notifications_enabled else "Автоуведомления отключены на сервере."
         try:
             items = self.torbox_for(chat_id).notifications()
         except Exception as exc:
-            self.send(chat_id, f"❌ Не удалось получить уведомления: {html.escape(str(exc))}", self.menu_keyboard())
+            self.send(chat_id, f"❌ Не удалось получить уведомления: {public_error(exc)}", self.menu_keyboard())
             return
         if not items:
             self.send(
-                chat_id, "🔔 <b>Новых уведомлений нет</b>",
-                [[{"text": "🔄 Обновить", "callback_data": "notifications"}], [self.home_button()]],
+                chat_id, "🔔 <b>Уведомлений пока нет</b>\n\n" + preference,
+                [[{"text": "🔄 Обновить", "callback_data": "notifications"}]] +
+                ([toggle] if self.notifications_enabled else []) + [[self.home_button()]],
             )
             return
         items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
@@ -2333,17 +3148,19 @@ class TelegramBot:
             [self.notification_key(item) for item in items],
             self._maintenance_state_user(chat_id),
         )
-        text = "<b>Последние уведомления TorBox</b>\n\n" + "\n\n".join(self.notification_text(item) for item in visible)
+        text = "<b>Последние уведомления TorBox</b>\n" + preference + "\n\n" + "\n\n".join(self.notification_text(item) for item in visible)
         self.send(
             chat_id, text,
-            [[{"text": "🔄 Обновить", "callback_data": "notifications"}, {"text": "🧹 Очистить", "callback_data": "nclearask"}],
-             [self.home_button()]],
+            [[{"text": "🔄 Обновить", "callback_data": "notifications"}, {"text": "🧹 Очистить", "callback_data": "nclearask"}]] +
+            ([toggle] if self.notifications_enabled else []) + [[self.home_button()]],
         )
 
     def poll_notifications(self, user_id: int | None = None, *, force: bool = False) -> bool:
         if not self.notifications_enabled:
             return True
         user_id = self.owner_id if user_id is None else user_id
+        if not self.state.ui_value(user_id, "notifications_enabled", True):
+            return True
         state_user = self._maintenance_state_user(user_id)
         now = time.monotonic()
         if not force and now - self.last_notification_poll.get(user_id, 0.0) < self.notification_poll_seconds:
@@ -2359,7 +3176,7 @@ class TelegramBot:
             new_items = [item for item in items if self.notification_key(item) not in seen]
             new_items.sort(key=lambda item: str(item.get("created_at") or ""))
             delivered: list[str] = []
-            for item in new_items:
+            for item in new_items[:10]:
                 self._send_new(
                     user_id, self.notification_text(item),
                     [[{"text": BTN_TORRENTS, "callback_data": "list:0"}, {"text": BTN_NOTIFICATIONS, "callback_data": "notifications"}]],
@@ -2375,6 +3192,8 @@ class TelegramBot:
 
     def poll_torrent_health(self, user_id: int | None = None, *, force: bool = False) -> bool:
         user_id = self.owner_id if user_id is None else user_id
+        if not self.state.ui_value(user_id, "notifications_enabled", True):
+            return True
         state_user = self._maintenance_state_user(user_id)
         now_monotonic = time.monotonic()
         if not force and now_monotonic - self.last_health_poll.get(user_id, 0.0) < 60:
@@ -2412,24 +3231,47 @@ class TelegramBot:
             LOG.warning("Could not poll TorBox torrent health", exc_info=True)
             return False
 
+    def _maintain_user(self, user_id: int) -> None:
+        lock = self.user_lock(user_id)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            if not self.has_torbox(user_id) or self.state.ui_value(user_id, "delivery_blocked", False):
+                return
+            self.poll_notifications(user_id)
+            if not self.state.ui_value(user_id, "delivery_blocked", False):
+                self.poll_torrent_health(user_id)
+        finally:
+            lock.release()
+
     def maintenance_loop(self) -> None:
-        """Run slow TorBox checks away from Telegram's interactive update loop."""
-        force = True
-        while not STOP.is_set():
-            notifications_ok = True
-            health_ok = True
+        """Slow or invalid accounts never hold up other users' background checks."""
+        while not STOP.is_set() and not self._closing.is_set():
+            now = time.monotonic()
             for user_id in self.connected_user_ids():
-                notifications_ok = self.poll_notifications(user_id, force=force) and notifications_ok
-                health_ok = self.poll_torrent_health(user_id, force=force) and health_ok
-            force = False
-            # TorBox occasionally responds with long timeouts or Cloudflare
-            # errors. Back off after a failure instead of continuously retrying.
-            STOP.wait(5 if notifications_ok and health_ok else 60)
+                if STOP.is_set() or self._closing.is_set():
+                    break
+                if (self.state.ui_value(user_id, "delivery_blocked", False) or
+                        not self.state.ui_value(user_id, "notifications_enabled", True)):
+                    continue
+                if (now - self.last_notification_poll.get(user_id, 0.0) >= self.notification_poll_seconds or
+                        now - self.last_health_poll.get(user_id, 0.0) >= 60):
+                    self.maintenance_jobs.submit(user_id, lambda uid=user_id: self._maintain_user(uid))
+            STOP.wait(5)
 
     def confirm_add(self, chat_id: int, release: Release | None = None) -> None:
         release = release or self.state.pop_pending(chat_id)
         if not release:
             self.send(chat_id, "Подтверждение устарело. Выбери раздачу ещё раз.", self.menu_keyboard())
+            return
+        added_key = release_dedupe_key(release)
+        recent_adds = {key: value for key, value in self.state.ui_value(chat_id, "recent_adds", {}).items()
+                       if value.get("expires", 0) > time.time()}
+        if added_key in recent_adds:
+            torrent_id = recent_adds[added_key].get("torrent_id")
+            button = {"text": "📂 Открыть загрузку", "callback_data": f"tinfo:{torrent_id}"} if torrent_id is not None else {"text": "📥 Мои загрузки", "callback_data": "list:0"}
+            self.send(chat_id, "✅ Этот релиз уже добавлен. TorBox обрабатывает загрузку.",
+                      [[button], [{"text": "← К результатам", "callback_data": "results"}]])
             return
         try:
             torbox = self.torbox_for(chat_id)
@@ -2476,14 +3318,15 @@ class TelegramBot:
             self.send(
                 chat_id,
                 f"❌ Не добавлено в TorBox: {html.escape(str(exc))}",
+                [[self.search_button("Новый поиск"), self.home_button()]],
             )
             return
-        except Exception as exc:
+        except Exception:
             LOG.exception("Could not add torrent")
             self.state.put_pending(chat_id, release)
             self.send(
                 chat_id,
-                f"❌ Не добавлено в TorBox: {html.escape(str(exc))}",
+                "Не удалось подтвердить добавление. Повтори попытку — сначала проверю, появился ли релиз в TorBox.",
                 [[{"text": "🔄 Повторить", "callback_data": "confirm"},
                   {"text": "Отмена", "callback_data": "cancel"}]],
             )
@@ -2493,6 +3336,10 @@ class TelegramBot:
         # deliberately outside that try-block: a failed confirmation message
         # must never put the release back into the retry queue and create a duplicate.
         try:
+            result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            recent_adds[added_key] = {"expires": time.time() + 300,
+                                     "torrent_id": existing.get("id") if existing else result_data.get("torrent_id")}
+            self.state.set_ui(chat_id, recent_adds=dict(list(recent_adds.items())[-20:]))
             if existing:
                 torrent_id = safe_torrent_id(existing.get("id"))
                 icon, status = status_label(existing)
@@ -2506,18 +3353,22 @@ class TelegramBot:
                 )
                 return
             result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            torrent_id = result_data.get("torrent_id")
+            next_step = {"text": "📥 Мои загрузки", "callback_data": "list:0"}
+            if torrent_id is not None:
+                next_step = {"text": "📂 Открыть загрузку", "callback_data": f"tinfo:{safe_torrent_id(torrent_id)}"}
             detail = result.get("detail") or result_data.get("detail") or "принято TorBox"
             quality = video_quality_summary(release, release.details_text)
             voiceover = voiceover_summary(release, release.details_text)
             self.send(
                 chat_id,
                 f"✅ <b>Добавлено в TorBox</b>\n\n"
-                f"🎬 {html.escape(release.title)}\n\n"
+                f"🎬 {html.escape(compact_title(release.title, 220))}\n\n"
                 f"🎙 <b>Озвучка:</b> {html.escape(voiceover)}\n"
                 f"🎞 <b>Качество:</b> {html.escape(quality)}\n"
                 f"📦 <b>{html.escape(release.size_text)}</b>\n"
                 f"🟢 {html.escape(friendly_torbox_status(str(detail)))}",
-                [[{"text": "← К результатам", "callback_data": "results"}]],
+                [[next_step], [{"text": "← К результатам", "callback_data": "results"}, self.home_button()]],
             )
         except Exception:
             LOG.warning("Torrent was added but Telegram confirmation failed", exc_info=True)
@@ -2528,29 +3379,111 @@ class TelegramBot:
         chat_id = message.get("chat", {}).get("id")
         inline_message_id = str(callback.get("inline_message_id") or "")
         sender_id = callback.get("from", {}).get("id")
-        if not isinstance(chat_id, int) and inline_message_id and isinstance(sender_id, int) and self.user_allowed(sender_id):
+        user_owned_card = bool(inline_message_id or message.get("via_bot") or
+                               message.get("from", {}).get("is_bot") is False)
+        if user_owned_card and isinstance(sender_id, int) and self.user_allowed(sender_id):
             chat_id = sender_id
         data = str(callback.get("data") or "")
         self.answer_callback(callback_id)
         if not isinstance(chat_id, int):
             return
         try:
-            self.callback_message_id = int(message.get("message_id")) if message.get("message_id") is not None else None
+            self.callback_message_id = int(message.get("message_id")) if not user_owned_card and message.get("message_id") is not None else None
         except (TypeError, ValueError):
             self.callback_message_id = None
-        self.callback_inline_message_id = inline_message_id
-        self.capture_screen = not bool(inline_message_id)
+        # Inline cards were sent by the user, possibly into a group. Never edit
+        # them: send a fresh bot-owned response in the sender's private chat.
+        self.callback_inline_message_id = ""
+        self.capture_screen = True
         if self.callback_message_id:
             self.state.set_screen_message_id(chat_id, self.callback_message_id)
         parts = data.split(":")
         command = parts[0]
         try:
+            # Inline messages may live in a group. Account contents and download
+            # links belong exclusively in the user's private bot conversation.
+            if user_owned_card and command not in {"search", "catalog", "release", "info", "results", "sr", "retry", "noop", "seasons", "season"}:
+                destination = "search_settings" if command == "searchsettings" else "start"
+                if command in {"add", "queue"} and len(parts) == 3 and parts[2] == self.state.search_revision(chat_id):
+                    release = self.state.get_release(chat_id, int(parts[1]))
+                    if release:
+                        destination = "private_" + os.urandom(8).hex()
+                        self.state.put_inline_item(destination, {"kind": "release", "owner": chat_id, "release": release.to_dict()})
+                self.send(chat_id, "Продолжи в личном чате — там доступны твои загрузки и настройки.",
+                          [[{"text": "Открыть TorBox", "url": self._deep_link(destination)}]])
+                return
+            if self.credentials and command in {"tctl", "delconfirm", "nclearconfirm", "file", "files", "tinfo", "delask"}:
+                if parts[-1] != "a" + self.account_revision(chat_id):
+                    self.send(chat_id, "Эта кнопка относится к прежнему подключению. Открой актуальные загрузки.",
+                              [[{"text": "Мои загрузки", "callback_data": "list:0"}]])
+                    return
+                parts.pop()
+            if command == "noop":
+                return
+            if command not in {"connect"}:
+                self.state.set_mode(chat_id, None)
             if command == "home":
                 self.show_home(chat_id)
+            elif command == "searchsettings":
+                self.show_search_settings(chat_id)
+            elif command == "sp":
+                self.change_search_preference(chat_id, parts[1], parts[2])
+            elif command == "seasons":
+                self.show_seasons(chat_id, parts[1], int(parts[2]) if len(parts) > 2 else 0)
+            elif command == "season":
+                stored = self.state.get_search(chat_id)
+                if not stored or parts[1] != self.state.search_revision(chat_id):
+                    self.show_seasons(chat_id, parts[1])
+                    return
+                if parts[2] not in {"all", "packs"} and not (parts[2].isdigit() and 1 <= int(parts[2]) <= 99):
+                    raise ValueError("Invalid season")
+                self.state.set_ui(chat_id, search_season=parts[2], search_page=0, search_filter="all")
+                query, sources, releases = stored
+                self.render_search_results(chat_id, query, releases, sources)
+            elif command in {"history", "favorites"}:
+                self.show_saved_queries(chat_id, favorites=command == "favorites")
+            elif command == "historyclear":
+                self.state.set_ui(chat_id, history=[])
+                self.show_saved_queries(chat_id)
+            elif command == "retry":
+                stored_query = self.state.get_inline_item(parts[1])
+                if stored_query and stored_query.get("owner") == chat_id and stored_query.get("kind") == "query":
+                    self.show_search(chat_id, str(stored_query["query"]))
+                else:
+                    self.prompt_search(chat_id)
+            elif command in {"sr", "favorite"}:
+                stored = self.state.get_search(chat_id)
+                if not stored or parts[1] != self.state.search_revision(chat_id):
+                    self.send(chat_id, "Этот поиск устарел. Открой актуальные результаты или начни новый поиск.",
+                              [[{"text": "Последние результаты", "callback_data": "results"}], [self.search_button()]])
+                    return
+                query, source_status, releases = stored
+                if command == "favorite":
+                    favorites = list(self.state.ui_value(chat_id, "favorites", []))
+                    if query in favorites:
+                        favorites.remove(query)
+                    elif len(favorites) < 20:
+                        favorites.insert(0, query)
+                    else:
+                        self.send(chat_id, "В избранном уже 20 названий. Убери одно через его результаты поиска.",
+                                  [[{"text": "⭐ Избранное", "callback_data": "favorites"}], [self.home_button()]])
+                        return
+                    self.state.set_ui(chat_id, favorites=favorites)
+                    self.render_search_results(chat_id, query, releases, source_status)
+                else:
+                    if parts[3] not in {"all", "cached", "hd", "small"}:
+                        raise ValueError("Unknown filter")
+                    self.render_search_results(chat_id, query, releases, source_status, page=int(parts[2]), filter_by=parts[3])
             elif command == "help":
                 self.show_help(chat_id)
             elif command == "account":
                 self.show_account(chat_id)
+            elif command == "privacy":
+                self.show_privacy(chat_id)
+            elif command == "forgetask":
+                self.forget_prompt(chat_id)
+            elif command == "forgetconfirm":
+                self.forget_user(chat_id)
             elif command == "connect":
                 self.prompt_connect(chat_id)
             elif command == "disconnectask":
@@ -2562,8 +3495,13 @@ class TelegramBot:
                       {"text": "Отмена", "callback_data": "account"}]],
                 )
             elif command == "disconnectconfirm":
+                previous_key = self.credentials.api_key(chat_id) if self.credentials else None
                 removed = self.credentials.remove_api_key(chat_id) if self.credentials else False
+                self.forget_log_key(previous_key)
                 self._torbox_clients.pop(chat_id, None)
+                self.state.reset_account(chat_id)
+                self.last_notification_poll.pop(chat_id, None)
+                self.last_health_poll.pop(chat_id, None)
                 self.state.set_mode(chat_id, None)
                 if removed:
                     self.send(chat_id, "✅ Личный API key удалён.", self.menu_keyboard())
@@ -2574,11 +3512,25 @@ class TelegramBot:
             elif command in {"list", "refresh"}:
                 page = max(0, int(parts[1])) if len(parts) > 1 else 0
                 self.show_torrents(chat_id, page, refresh=command == "refresh")
+            elif command == "library":
+                if parts[1] not in {"all", "active", "ready"}:
+                    raise ValueError("Unknown filter")
+                self.show_torrents(chat_id, int(parts[2]), filter_by=parts[1])
+            elif command == "files":
+                self.show_files(chat_id, safe_torrent_id(parts[1]), int(parts[2]))
+            elif command == "file":
+                self.show_files(chat_id, safe_torrent_id(parts[1]), int(parts[3]), file_id=safe_torrent_id(parts[2]))
             elif command == "notifications":
+                self.show_notifications(chat_id)
+            elif command == "notifytoggle":
+                enabled = not self.state.ui_value(chat_id, "notifications_enabled", True)
+                self.state.set_ui(chat_id, notifications_enabled=enabled)
                 self.show_notifications(chat_id)
             elif command in {"catalog", "release"}:
                 token = parts[1]
                 stored_inline = self.state.get_inline_item(token)
+                if stored_inline and stored_inline.get("owner", chat_id) != chat_id:
+                    stored_inline = None
                 if not stored_inline:
                     self.send(
                         chat_id,
@@ -2599,6 +3551,7 @@ class TelegramBot:
                     self.send(
                         chat_id,
                         "Результаты устарели. Запусти поиск заново.",
+                        [[self.search_button(), self.home_button()]],
                     )
                 else:
                     query, source_status, releases = stored
@@ -2613,6 +3566,12 @@ class TelegramBot:
                 self.torbox_for(chat_id).clear_notifications()
                 self.send(chat_id, "✅ Лента уведомлений очищена.", self.menu_keyboard())
             elif command in {"info", "queue", "add"}:
+                # An index alone could silently select a different film after a
+                # later search. Old keyboards must never cause that mutation.
+                if len(parts) != 3 or parts[2] != self.state.search_revision(chat_id):
+                    self.send(chat_id, "Эта кнопка из старого поиска. Выбери релиз в актуальной выдаче.",
+                              [[{"text": "Открыть результаты", "callback_data": "results"}], [self.search_button()]])
+                    return
                 index = int(parts[1])
                 release = self.state.get_release(chat_id, index)
                 if not release:
@@ -2622,8 +3581,8 @@ class TelegramBot:
                     self.send(chat_id, "⏳ Загружаю карточку релиза…")
                     try:
                         details = self.nnm.topic_summary(release)
-                    except Exception as exc:
-                        details = f"Карточка источника временно недоступна: {exc}"
+                    except Exception:
+                        details = release.details_text
                     release = replace(release, details_text=details)
                     self.state.update_release(chat_id, index, release)
                     quality = video_quality_summary(release, details)
@@ -2631,7 +3590,7 @@ class TelegramBot:
                     audio_track = audio_track_summary(details)
                     released_by = _labeled_value(details, "Релиз от")
                     detail_lines = [
-                        f"🎬 <b>{html.escape(release.title)}</b>",
+                        f"🎬 <b>{html.escape(compact_title(release.title, 220))}</b>",
                         f"🎙 <b>Озвучка:</b> {html.escape(voiceover)}",
                         f"🎞 <b>Качество:</b> {html.escape(quality)}",
                     ]
@@ -2644,7 +3603,7 @@ class TelegramBot:
                         f"📡 {html.escape(release.source_name)}",
                     ])
                     details_keyboard: list[list[dict[str, str]]] = [
-                        [{"text": "➕ Добавить сейчас", "callback_data": f"add:{index}"}],
+                        [{"text": "＋ Добавить в TorBox", "callback_data": f"add:{index}:{parts[2]}"}],
                     ]
                     if release.source_url:
                         details_keyboard.append([{"text": "↗️ Открыть источник", "url": release.source_url}])
@@ -2675,8 +3634,7 @@ class TelegramBot:
             elif command == "tctl":
                 torrent_id, operation = safe_torrent_id(parts[1]), parts[2]
                 self.torbox_for(chat_id).control_torrent(torrent_id, operation)
-                self.send(chat_id, "✅ Команда принята TorBox.")
-                self.show_torrent(chat_id, torrent_id)
+                self.show_torrent(chat_id, torrent_id, notice="✅ Команда принята. Статус обновится после обработки TorBox.")
             elif command == "delask":
                 torrent_id = safe_torrent_id(parts[1])
                 item = self.torbox_for(chat_id).get_torrent(torrent_id)
@@ -2691,8 +3649,10 @@ class TelegramBot:
             elif command == "delconfirm":
                 torrent_id = safe_torrent_id(parts[1])
                 self.torbox_for(chat_id).control_torrent(torrent_id, "delete")
+                self.state.set_ui(chat_id, recent_adds={k: v for k, v in self.state.ui_value(chat_id, "recent_adds", {}).items()
+                                                       if v.get("torrent_id") != torrent_id})
                 self.send(chat_id, f"✅ Загрузка <code>{torrent_id}</code> удалена из TorBox.")
-                self.show_torrents(chat_id, refresh=True)
+                self.show_torrents(chat_id, self.state.ui_value(chat_id, "library_page", 0), refresh=True)
             else:
                 self.send(chat_id, "Эта кнопка устарела. Открыл главное меню.")
                 self.show_home(chat_id)
@@ -2700,7 +3660,7 @@ class TelegramBot:
             self.send(chat_id, "Эта кнопка устарела. Открой нужный раздел заново.", self.menu_keyboard())
         except Exception as exc:
             LOG.exception("Callback action failed: %s", data)
-            self.send(chat_id, f"❌ Операция не выполнена: {html.escape(str(exc))}", self.menu_keyboard())
+            self.send(chat_id, f"❌ Операция не выполнена: {public_error(exc)}", self.menu_keyboard())
         finally:
             self.callback_message_id = None
             self.callback_inline_message_id = ""
@@ -2714,7 +3674,7 @@ class TelegramBot:
                 count = len(self.torbox_for(chat_id).list_torrents(limit=100))
                 torbox_status = f"доступен, загрузок: {count}"
             except Exception as exc:
-                torbox_status = f"ошибка: {exc}"
+                torbox_status = public_error(exc)
         notification_status = "включены" if self.notifications_enabled else "выключены"
         configured_providers = getattr(self.nnm, "providers", [self.nnm])
         search_names = ", ".join(str(getattr(provider, "name", "неизвестный")) for provider in configured_providers)
@@ -2736,6 +3696,9 @@ class TelegramBot:
             return
         if not self.is_owner(update):
             return
+        user_id = self.update_user(update)
+        if user_id and self.state.ui_value(user_id, "delivery_blocked", False):
+            self.state.set_ui(user_id, delivery_blocked=False)
         if callback := update.get("callback_query"):
             self.callback(callback)
             return
@@ -2752,25 +3715,24 @@ class TelegramBot:
             incoming_message_id = int(message.get("message_id"))
         except (TypeError, ValueError):
             incoming_message_id = 0
-        if incoming_message_id:
-            self.delete_user_message(chat_id, incoming_message_id)
-
         normalized_text = BOTTOM_ACTIONS.get(text, text)
         first, _, raw_argument = normalized_text.partition(" ")
         command = first.split("@", 1)[0].casefold() if first.startswith("/") else ""
         argument = raw_argument if command else ""
-
         # After a user clears the private chat Telegram removes the visible
         # reply keyboard, but our state may still point at the deleted screen.
         # /start is the explicit recovery action, so always recreate the
         # keyboard and obtain a fresh message id.
         force_keyboard = command == "/start"
+        fresh_screen_id = None
         if force_keyboard or self.state.bottom_keyboard_version(chat_id) < BOTTOM_KEYBOARD_VERSION:
             try:
-                self.install_bottom_keyboard(chat_id, force=force_keyboard)
+                fresh_screen_id = self.install_bottom_keyboard(chat_id, force=force_keyboard)
             except Exception:
                 LOG.warning("Could not install persistent Telegram controls", exc_info=True)
-        self.callback_message_id = self.state.screen_message_id(chat_id)
+        # Each typed request gets its own bot response after that request.
+        # Loading and button navigation then edit only that response.
+        self.callback_message_id = fresh_screen_id
         self.callback_inline_message_id = ""
         self.capture_screen = True
         try:
@@ -2778,8 +3740,12 @@ class TelegramBot:
             if command == "/start":
                 if argument == "connect":
                     self.prompt_connect(chat_id)
+                elif argument == "search_settings":
+                    self.show_search_settings(chat_id)
                 elif argument:
                     inline_item = self.state.get_inline_item(argument)
+                    if inline_item and inline_item.get("owner", chat_id) != chat_id:
+                        inline_item = None
                     if inline_item and inline_item.get("kind") == "catalog":
                         query = str(inline_item.get("query") or "").strip()
                         self.show_search(chat_id, query) if query else self.show_home(chat_id)
@@ -2792,12 +3758,19 @@ class TelegramBot:
                 else:
                     self.show_home(chat_id)
             elif command == "/cancel":
+                connecting = self.state.mode(chat_id) == "torbox_api_key"
                 self.state.set_mode(chat_id, None)
-                self.show_account(chat_id)
+                self.show_account(chat_id) if connecting else self.show_home(chat_id)
             elif command == "/connect":
                 self.prompt_connect(chat_id)
-            elif command in {"/account", "/settings"} or text == BTN_ACCOUNT:
+            elif command in {"/settings", "/searchsettings"}:
+                self.show_search_settings(chat_id)
+            elif command == "/account" or text == BTN_ACCOUNT:
                 self.show_account(chat_id)
+            elif command == "/privacy":
+                self.show_privacy(chat_id)
+            elif command == "/delete_data":
+                self.forget_prompt(chat_id)
             elif command == "/help" or text == BTN_HELP:
                 self.show_help(chat_id)
             elif command == "/search" or text == BTN_SEARCH:
@@ -2814,6 +3787,10 @@ class TelegramBot:
             elif command == "/status":
                 self.show_status(chat_id)
             elif self.state.mode(chat_id) == "torbox_api_key":
+                # Keep ordinary messages; remove only submitted credentials.
+                if not incoming_message_id or not self.delete_user_message(chat_id, incoming_message_id):
+                    self.send(chat_id, "Не удалось удалить сообщение с ключом. Удали его вручную и повтори /connect. Ключ не сохранён.")
+                    return
                 self.connect_torbox(chat_id, text)
             elif command:
                 self.send(chat_id, "Не знаю такой команды. Вот доступные действия:", self.menu_keyboard())
@@ -2839,12 +3816,15 @@ class TelegramBot:
         cosmetic_calls = [
             ("setMyName", {"name": os.getenv("TELEGRAM_BOT_NAME", "TorBox • Личный пульт")[:64]}),
             ("setMyShortDescription", {"short_description": "Поиск релизов и управление своим TorBox"}),
-            ("setMyDescription", {"description": "Подключи свой TorBox API key, находи релизы с постерами и управляй личными загрузками и уведомлениями."}),
+            ("setMyDescription", {"description": "Находи фильмы и сериалы, добавляй релизы в свой TorBox и смотри готовые файлы через Infuse. Нажми Start — внутри инструкция по настройке TorBox, бота и Infuse."}),
             ("setMyCommands", {"commands": [
-                {"command": "start", "description": "Главное меню"},
+                {"command": "start", "description": "Начать и открыть инструкцию"},
                 {"command": "connect", "description": "Подключить свой TorBox"},
                 {"command": "account", "description": "Настройки TorBox-аккаунта"},
+                {"command": "privacy", "description": "Как хранятся мои данные"},
+                {"command": "delete_data", "description": "Удалить мои данные из бота"},
                 {"command": "search", "description": "Найти фильм или сериал"},
+                {"command": "settings", "description": "Качество, озвучка и сезоны"},
                 {"command": "torrents", "description": "Мои загрузки TorBox"},
                 {"command": "notifications", "description": "Уведомления TorBox"},
                 {"command": "status", "description": "Проверить соединение"},
@@ -2871,23 +3851,29 @@ class TelegramBot:
         self.setup()
         maintenance = Thread(target=self.maintenance_loop, name="torbox-maintenance", daemon=True)
         maintenance.start()
-        while not STOP.is_set():
-            try:
-                updates = self.call(
-                    "getUpdates", offset=self.state.offset(), timeout=45,
-                    allowed_updates=["message", "callback_query", "inline_query", "chosen_inline_result"],
-                )
-                for update in updates:
-                    self.state.set_offset(update["update_id"] + 1)
-                    # Store the offset first so a process restart cannot replay a
-                    # destructive callback that already reached TorBox.
-                    self.handle(update)
-            except requests.RequestException as exc:
-                LOG.warning("Telegram network error: %s", exc)
-                STOP.wait(3)
-            except Exception:
-                LOG.exception("Unhandled bot error")
-                STOP.wait(2)
+        try:
+            while not STOP.is_set():
+                try:
+                    updates = self.call(
+                        "getUpdates", offset=self.state.offset(), timeout=45,
+                        allowed_updates=["message", "callback_query", "inline_query", "chosen_inline_result"],
+                    )
+                    for update in updates:
+                        if STOP.is_set():
+                            break
+                        # Persist before dispatch: a restart must not replay mutations.
+                        self.state.set_offset(update["update_id"] + 1)
+                        self.dispatch_update(update)
+                except requests.RequestException as exc:
+                    LOG.warning("Telegram network error: %s", exc)
+                    STOP.wait(3)
+                except Exception:
+                    LOG.exception("Unhandled bot error")
+                    STOP.wait(2)
+        finally:
+            self._closing.set()
+            maintenance.join(timeout=6)
+            self.close()
 
 
 def main() -> int:
@@ -2895,6 +3881,9 @@ def main() -> int:
         token = env_required("TELEGRAM_BOT_TOKEN")
         api_key = os.getenv("TORBOX_API_KEY", "").strip()
         owner_id = int(env_required("OWNER_TELEGRAM_ID"))
+        if owner_id <= 0:
+            raise ValueError("OWNER_TELEGRAM_ID must be positive")
+        workers = min(16, env_int("BOT_WORKERS", 8))
         multi_user_enabled = env_bool("MULTI_USER_ENABLED", True)
         notifications_enabled = env_bool("TORBOX_NOTIFICATIONS_ENABLED", True)
         notification_poll_seconds = env_int("NOTIFICATION_POLL_SECONDS", 60, minimum=30)
@@ -2923,6 +3912,7 @@ def main() -> int:
         notification_poll_seconds=notification_poll_seconds,
         credentials=CredentialStore(),
         multi_user_enabled=multi_user_enabled,
+        workers=workers,
     ).run()
     return 0
 
