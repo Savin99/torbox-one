@@ -254,3 +254,130 @@ class TMDBQueryTests(unittest.TestCase):
         service._tmdb_query(77)
         service.cache.put("tmdbq:77", {"title": "Cached", "year": "2011"})
         self.assertEqual(service._tmdb_query(77), ("Cached", 2011))
+
+
+class ParseReleaseScopeTests(unittest.TestCase):
+    """Строки взяты из настоящих имён раздач, уже разобранных выше в файле."""
+
+    def test_single_season(self) -> None:
+        scope = meta_service.parse_release_scope(
+            "Игра Престолов / Game of Thrones (Сезон 4) [2014, BDRip 1080p]"
+        )
+        self.assertEqual((scope.season_from, scope.season_to), (4, 4))
+        self.assertIsNone(scope.episode_from)
+        self.assertIsNone(scope.episodes_declared)
+
+    def test_season_range(self) -> None:
+        scope = meta_service.parse_release_scope(
+            "Игра престолов / Game of Thrones (Сезон 1-8) / 2011-2019, WEB-DL"
+        )
+        self.assertEqual((scope.season_from, scope.season_to), (1, 8))
+
+    def test_year_range_is_not_a_season_range(self) -> None:
+        scope = meta_service.parse_release_scope("Некий сериал / 2011-2019, WEB-DL 1080p")
+        self.assertIsNone(scope.season_from)
+        self.assertIsNone(scope.season_to)
+
+    def test_short_season_form(self) -> None:
+        scope = meta_service.parse_release_scope("Игра престолов S01 WEB-DL 1080p")
+        self.assertEqual((scope.season_from, scope.season_to), (1, 1))
+
+    def test_short_season_range(self) -> None:
+        scope = meta_service.parse_release_scope("The Wire S01-S03 1080p BDRip")
+        self.assertEqual((scope.season_from, scope.season_to), (1, 3))
+
+    def test_episode_range_with_declared_total(self) -> None:
+        scope = meta_service.parse_release_scope(
+            "Сорвиголова / Daredevil (Сезон 1, серии 1-8 из 10) [2025, WEB-DL 1080p]"
+        )
+        self.assertEqual((scope.season_from, scope.season_to), (1, 1))
+        self.assertEqual((scope.episode_from, scope.episode_to), (1, 8))
+        self.assertEqual(scope.episodes_declared, 10)
+
+    def test_single_episode_out_of_total(self) -> None:
+        scope = meta_service.parse_release_scope("Друзья (Сезон 2) 07 из 24 [WEB-DL]")
+        self.assertEqual((scope.episode_from, scope.episode_to), (7, 7))
+        self.assertEqual(scope.episodes_declared, 24)
+
+    def test_latin_episode_range(self) -> None:
+        scope = meta_service.parse_release_scope("Some Show S02E01-E12 1080p WEB-DL")
+        self.assertEqual((scope.season_from, scope.season_to), (2, 2))
+        self.assertEqual((scope.episode_from, scope.episode_to), (1, 12))
+        self.assertIsNone(scope.episodes_declared)
+
+    def test_single_episode_marker(self) -> None:
+        scope = meta_service.parse_release_scope("Некий сериал S01E07 WEB-DL 1080p")
+        self.assertEqual((scope.episode_from, scope.episode_to), (7, 7))
+
+    def test_movie_has_no_scope(self) -> None:
+        scope = meta_service.parse_release_scope("Дюна 2021 WEB-DL 1080p Дублированный")
+        self.assertEqual(
+            (scope.season_from, scope.season_to, scope.episode_from, scope.episode_to),
+            (None, None, None, None),
+        )
+
+    def test_resolution_is_not_an_episode_range(self) -> None:
+        scope = meta_service.parse_release_scope("Sharp.Obsession.2025.1080p.WEB-DL.x264")
+        self.assertIsNone(scope.episode_from)
+        self.assertIsNone(scope.episodes_declared)
+
+
+class VideoSpecTests(unittest.TestCase):
+    def test_web_dl_hevc_1080p(self) -> None:
+        spec = meta_service.parse_video_spec("Дюна 2021 WEB-DL 1080p H.265 HDR10")
+        self.assertEqual(spec.resolution, 1080)
+        self.assertEqual(spec.source_type, "web-dl")
+        self.assertEqual(spec.video_codec, "h265")
+        self.assertEqual(spec.hdr, "hdr10")
+
+    def test_remux_wins_over_bluray(self) -> None:
+        spec = meta_service.parse_video_spec("Фильм 2025 BDRemux 2160p Dolby Vision")
+        self.assertEqual(spec.source_type, "bdremux")
+        self.assertEqual(spec.resolution, 2160)
+        self.assertEqual(spec.hdr, "dolby_vision")
+
+    def test_4k_is_2160(self) -> None:
+        self.assertEqual(meta_service.parse_video_spec("Фильм 4K UHD BDRip").resolution, 2160)
+
+    def test_frame_size_from_topic_details(self) -> None:
+        spec = meta_service.parse_video_spec(
+            "Фильм 2025 BDRip", "Видео: MPEG-4 AVC, 1920x1080, 8000 kbps"
+        )
+        self.assertEqual(spec.resolution, 1080)
+        self.assertEqual(spec.video_codec, "h264")
+
+    def test_unknown_stays_none(self) -> None:
+        spec = meta_service.parse_video_spec("Просто название без технических слов")
+        self.assertIsNone(spec.resolution)
+        self.assertIsNone(spec.source_type)
+        self.assertIsNone(spec.video_codec)
+        self.assertIsNone(spec.hdr)
+
+
+class VoiceoverSpecTests(unittest.TestCase):
+    def test_dub_and_studio(self) -> None:
+        spec = meta_service.parse_voiceover_spec("Сериал S01 WEB-DL 1080p Дубляж LostFilm")
+        self.assertIn("dub", spec.kinds)
+        self.assertEqual(spec.studios, ["LostFilm"])
+
+    def test_track_codes_are_expanded(self) -> None:
+        spec = meta_service.parse_voiceover_spec("Фильм 2025 BDRip 1080p | D, P, A")
+        self.assertEqual(set(spec.kinds), {"dub", "professional", "author"})
+
+    def test_single_voice_is_marked(self) -> None:
+        spec = meta_service.parse_voiceover_spec("Фильм 2025 HDRip одноголосый закадровый")
+        self.assertIn("single", spec.kinds)
+        self.assertEqual(spec.studios, [])
+
+    def test_translation_field_from_topic(self) -> None:
+        spec = meta_service.parse_voiceover_spec(
+            "Фильм 2025 BDRip", "Перевод: профессиональный многоголосый, Кубик в Кубе"
+        )
+        self.assertIn("professional", spec.kinds)
+        self.assertIn("multi", spec.kinds)
+        self.assertEqual(spec.studios, ["Кубик в Кубе"])
+
+    def test_nothing_found_is_empty(self) -> None:
+        spec = meta_service.parse_voiceover_spec("Movie 2025 BDRip 1080p")
+        self.assertEqual(spec.kinds, [])
+        self.assertEqual(spec.studios, [])

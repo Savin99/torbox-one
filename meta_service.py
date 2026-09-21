@@ -243,6 +243,231 @@ def _is_latin(text: str) -> bool:
     return latin >= len(letters) / 2
 
 
+@dataclass
+class ReleaseScope:
+    """Границы сезонов и серий, объявленные в имени раздачи.
+
+    Это разбор имени *раздачи*, а не имени файла: он отвечает на вопрос «что
+    лежит внутри», а не «какая это серия». Чего в имени нет — остаётся None:
+    на этих полях клиент строит ранжирование, и «не знаю» там честнее догадки.
+    """
+
+    season_from: int | None = None
+    season_to: int | None = None
+    episode_from: int | None = None
+    episode_to: int | None = None
+    episodes_declared: int | None = None
+
+
+# «Сезоны 1-8», «Season 1-5», «S01-S03». Диапазон проверяется раньше одиночного
+# шаблона из SEASON_PATTERNS: тот откусил бы от диапазона только левую границу.
+SEASON_RANGE_PATTERNS = (
+    r"[Сс]езон\w*\s*[:\-]?\s*(\d{1,2})\s*[-–—]\s*(\d{1,2})",
+    r"\bseasons?\s*(\d{1,2})\s*[-–—]\s*(\d{1,2})",
+    r"\bS(\d{1,2})\s*[-–—]\s*S?(\d{1,2})\b",
+)
+
+# «серии 1-8 из 10», «(07 из 24)», «E01-E12», «Серия 5». Порядок важен:
+# без него «8 из 10» перебило бы «серии 1-8 из 10» и дало бы первую серию 8.
+EPISODE_PATTERNS = (
+    r"[Сс]ери[июяй]\w*\s*[:\-]?\s*(\d{1,3})\s*[-–—]\s*(\d{1,3})\s*(?:из|of)\s*(\d{1,3})",
+    r"(?<!\d)(\d{1,3})\s*[-–—]\s*(\d{1,3})\s*(?:из|of)\s*(\d{1,3})(?!\d)",
+    r"[Сс]ери[июяй]\w*\s*[:\-]?\s*(\d{1,3})\s*[-–—]\s*(\d{1,3})(?!\s*(?:из|of))",
+    # «S02E01-E12»: перед E стоит цифра сезона, поэтому не \b, а «не буква»
+    r"(?<![^\W\d_])[eEеЕ](\d{1,3})\s*[-–—]\s*[eEеЕ]?(\d{1,3})\b",
+    r"[Сс]ери[июяй]\w*\s*[:\-]?\s*(\d{1,3})\s*(?:из|of)\s*(\d{1,3})",
+    r"(?<!\d)(\d{1,3})\s*(?:из|of)\s*(\d{1,3})(?!\d)",
+    r"\bS\d{1,2}\s*[eEхx](\d{1,3})\b",
+    r"[Сс]ери[яи]\s*[:\-]?\s*(\d{1,3})\b",
+)
+
+
+def parse_release_scope(title: str) -> ReleaseScope:
+    """Разбирает имя раздачи на границы сезонов и серий.
+
+    Args:
+        title: Имя раздачи с трекера целиком, как его отдал источник.
+
+    Returns:
+        Найденные границы; поля, которых в имени нет, остаются None.
+    """
+    raw = title.strip()
+    season_from, season_to = _season_bounds(raw)
+    episode_from, episode_to, declared = _episode_bounds(raw)
+    return ReleaseScope(
+        season_from=season_from, season_to=season_to,
+        episode_from=episode_from, episode_to=episode_to, episodes_declared=declared,
+    )
+
+
+def _season_bounds(raw: str) -> tuple[int | None, int | None]:
+    for pattern in SEASON_RANGE_PATTERNS:
+        found = re.search(pattern, raw)
+        if found:
+            start, end = int(found.group(1)), int(found.group(2))
+            # «Сезон 3-1» — опечатка источника, такие границы не берём
+            if start <= end:
+                return start, end
+    single = _first_int(SEASON_PATTERNS, raw)
+    return (single, single) if single is not None else (None, None)
+
+
+def _episode_bounds(raw: str) -> tuple[int | None, int | None, int | None]:
+    for pattern in EPISODE_PATTERNS:
+        found = re.search(pattern, raw)
+        if not found:
+            continue
+        numbers = [int(value) for value in found.groups() if value is not None]
+        if len(numbers) == 3:
+            start, end, declared = numbers
+            if start <= end <= declared:
+                return start, end, declared
+        elif len(numbers) == 2:
+            first, second = numbers
+            # «07 из 24» — одна серия из объявленных 24, а не диапазон 7…24
+            if re.search(r"\bиз\b|\bof\b", found.group(0), re.I):
+                if first <= second:
+                    return first, first, second
+            elif first <= second:
+                return first, second, None
+        elif numbers:
+            return numbers[0], numbers[0], None
+    return None, None, None
+
+
+# Структурное качество: те же маркеры, что у video_quality_summary в боте, но
+# значениями, а не строкой для человека. Порядок — от точного к общему:
+# «BDRemux 1080p» это remux, хотя подходит и под bdrip, и под bluray.
+SOURCE_TYPE_PATTERNS = (
+    ("bdremux", r"\bbd[ .-]?remux\b"), ("remux", r"\bremux\b"),
+    ("bluray", r"\bblu[ .-]?ray\b|\bbdmv\b|\bbd(?:25|50)\b"),
+    ("bdrip", r"\bbd[ .-]?rip\b|\bbr[ .-]?rip\b"),
+    ("web-dl", r"\bweb[ .-]?dl\b"), ("webrip", r"\bweb[ .-]?rip\b"), ("web", r"\bweb\b"),
+    ("hdtv", r"\bhd[ .-]?tv(?:rip)?\b"), ("hdrip", r"\bhd[ .-]?rip\b"),
+    ("dvdrip", r"\bdvd[ .-]?rip\b"), ("dvd", r"\bdvd(?:5|9)?\b"),
+    ("satrip", r"\bsat[ .-]?rip\b"), ("ts", r"\bts\b|\btelesync\b"),
+    ("camrip", r"\bcam[ .-]?rip\b"),
+)
+
+VIDEO_CODEC_PATTERNS = (
+    ("av1", r"\bav1\b"),
+    ("h265", r"\bh[ .]?265\b|\bhevc\b|\bx265\b"),
+    ("h264", r"\bh[ .]?264\b|\bavc\b|\bx264\b"),
+    ("xvid", r"\bxvid\b"), ("divx", r"\bdivx\b"), ("mpeg2", r"\bmpeg[ .-]?2\b"),
+)
+
+HDR_PATTERNS = (
+    ("dolby_vision", r"\bdolby[ .-]?vision\b|\bdo?vi\b"),
+    ("hdr10plus", r"\bhdr10\+"), ("hdr10", r"\bhdr10\b"), ("hdr", r"\bhdr\b"),
+)
+
+KNOWN_RESOLUTIONS = (2160, 1440, 1080, 720, 576, 480, 360)
+
+
+@dataclass
+class VideoSpec:
+    """Разрешение, источник, кодек и HDR — значениями, а не одной строкой."""
+
+    resolution: int | None = None
+    source_type: str | None = None
+    video_codec: str | None = None
+    hdr: str | None = None
+
+
+def parse_video_spec(title: str, details: str = "") -> VideoSpec:
+    """Достаёт структурное качество из имени раздачи и описания темы.
+
+    Args:
+        title: Имя раздачи.
+        details: Текст темы с трекера, если он уже прочитан.
+
+    Returns:
+        Поля, которых в тексте нет, остаются None: «не указано» и «720p» —
+        разные ответы, и клиент обязан их различать.
+    """
+    text = f"{title}\n{details}"
+    return VideoSpec(
+        resolution=_resolution(text),
+        source_type=_first_label(SOURCE_TYPE_PATTERNS, text),
+        video_codec=_first_label(VIDEO_CODEC_PATTERNS, text),
+        hdr=_first_label(HDR_PATTERNS, text),
+    )
+
+
+def _resolution(text: str) -> int | None:
+    if re.search(r"\b4k\b|\buhd\b|\b2160[pi]\b", text, re.I):
+        return 2160
+    found = re.search(r"\b(\d{3,4})[pi]\b", text, re.I)
+    if found and int(found.group(1)) in KNOWN_RESOLUTIONS:
+        return int(found.group(1))
+    # «1920x1080» пишут в поле «Видео» темы, когда в имени разрешения нет
+    frame = re.search(r"\b\d{3,4}\s*[xх×]\s*(\d{3,4})\b", text, re.I)
+    if frame and int(frame.group(1)) in KNOWN_RESOLUTIONS:
+        return int(frame.group(1))
+    return None
+
+
+def _first_label(patterns: tuple[tuple[str, str], ...], text: str) -> str | None:
+    return next((label for label, pattern in patterns if re.search(pattern, text, re.I)), None)
+
+
+# Вид перевода отдельно от студии: клиенту нужно «есть ли дубляж», а строка
+# «Дубляж · LostFilm» отвечает на это только после разбора на его стороне.
+VOICEOVER_KIND_PATTERNS = (
+    ("dub", r"дублированн\w*|дубляж\w*|\bdub\b"),
+    ("multi", r"многоголос\w*|\bmvo\b"),
+    ("dual", r"двухголос\w*|\bdvo\b"),
+    ("single", r"одноголос\w*|\bavo\b"),
+    ("author", r"авторск\w*"),
+    ("professional", r"профессиональн\w*"),
+    ("licensed", r"лицензи\w*|\bitunes\b"),
+    ("subtitles", r"субтитр\w*|\bsub(?:s|title)?\b"),
+)
+
+VOICEOVER_STUDIO_PATTERNS = (
+    ("Кравец", r"\b(?:kravec|кравец)\b"), ("AlexFilm", r"\balexfilm\b"),
+    ("LostFilm", r"\blostfilm\b"), ("Amedia", r"\b(?:amedia|амедиа)\b"),
+    ("NewStudio", r"\bnewstudio\b"), ("HDRezka Studio", r"\bhdrezka(?:[ .-]?studio)?\b"),
+    ("Red Head Sound", r"\bred[ .-]?head[ .-]?sound\b"), ("Jaskier", r"\bjaskier\b"),
+    ("Кубик в Кубе", r"кубик\s+в\s+кубе"), ("TVShows", r"\btvshows\b"),
+    ("BaibaKo", r"\bbaibako\b"), ("ColdFilm", r"\bcoldfilm\b"), ("РенТВ", r"\bрентв\b"),
+)
+
+# «| D, P, A» в конце имени — компактная запись дорожек, её пишет половина
+# раздач вместо слов. Расшифровка та же, что у voiceover_summary в боте.
+TRACK_CODE_KINDS = {"D": "dub", "P": "professional", "A": "author"}
+
+
+@dataclass
+class VoiceoverSpec:
+    """Виды перевода и названные студии, найденные в имени раздачи."""
+
+    kinds: list[str] = field(default_factory=list)
+    studios: list[str] = field(default_factory=list)
+
+
+def parse_voiceover_spec(title: str, details: str = "") -> VoiceoverSpec:
+    """Достаёт структурную озвучку из имени раздачи и описания темы.
+
+    Args:
+        title: Имя раздачи.
+        details: Текст темы с трекера, если он уже прочитан.
+
+    Returns:
+        Списки видов перевода и студий; пустые значат «источник не указал».
+    """
+    text = f"{title}\n{details}"
+    kinds = [label for label, pattern in VOICEOVER_KIND_PATTERNS if re.search(pattern, text, re.I)]
+    coded = re.search(r"(?:\||\[)\s*((?:D|P|A)(?:\s*,\s*(?:D|P|A))+)", title, re.I)
+    if coded:
+        codes = {value.upper() for value in re.findall(r"[DPA]", coded.group(1), re.I)}
+        kinds.extend(TRACK_CODE_KINDS[code] for code in sorted(codes))
+    if re.search(r"\|\s*D(?:\s*[,|]|$)", title, re.I):
+        kinds.append("dub")
+    studios = [label for label, pattern in VOICEOVER_STUDIO_PATTERNS if re.search(pattern, text, re.I)]
+    return VoiceoverSpec(kinds=list(dict.fromkeys(kinds)), studios=studios)
+
+
 def normalize_title(text: str) -> list[str]:
     """Слова названия без пунктуации и регистра — для сравнения."""
     cleaned = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
