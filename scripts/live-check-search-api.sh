@@ -29,6 +29,9 @@ TOKEN="${SEARCH_API_TOKEN:-}"
 BASE_URL="${SEARCH_API_BASE_URL:-}"
 SERVER_PID=""
 LAST_BODY=""
+# Журнал сервера может содержать адреса с ключами и cookies трекера:
+# на экран его выводить только через redact, наружу — не выкладывать.
+LOG_FILE="${SEARCH_API_CHECK_LOG:-/tmp/live-check-search-api.log}"
 
 cleanup() {
     [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null || true
@@ -37,16 +40,21 @@ trap cleanup EXIT
 
 if [[ -z "$BASE_URL" ]]; then
     PORT="${SEARCH_API_PORT:-8787}"
+    # Чужой процесс на этом порту не трогаем: проверка не вправе его гасить
+    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        printf 'Порт %s занят чужим процессом. Задай свободный: SEARCH_API_PORT=8799\n' "$PORT" >&2
+        exit 1
+    fi
     BASE_URL="http://127.0.0.1:$PORT"
     printf 'Поднимаю сервер локально на %s\n' "$BASE_URL"
-    "$SCRIPT_DIR/run-search-api.sh" >/tmp/live-check-search-api.log 2>&1 &
+    "$SCRIPT_DIR/run-search-api.sh" >"$LOG_FILE" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 40); do
         curl -fsS --max-time 2 "$BASE_URL/health" >/dev/null 2>&1 && break
         sleep 0.5
     done
     curl -fsS --max-time 2 "$BASE_URL/health" >/dev/null 2>&1 || {
-        printf 'Сервер не поднялся, лог: /tmp/live-check-search-api.log\n' >&2
+        printf 'Сервер не поднялся, лог: %s\n' "$LOG_FILE" >&2
         exit 1
     }
 fi
@@ -135,11 +143,16 @@ call GET '/meta/match?name=%D0%98%D0%B3%D1%80%D0%B0%20%D0%9F%D1%80%D0%B5%D1%81%D
 printf '\n# Поиск: прежний вызов\n'
 call GET '/search?q=%D0%98%D0%BD%D1%82%D0%B5%D1%80%D1%81%D1%82%D0%B5%D0%BB%D0%BB%D0%B0%D1%80%202014'
 printf 'Старые поля на месте: '
+# Пустая выдача — это не «полей нет»: проверять просто не на чем, и путать
+# одно с другим нельзя. Живая проверка 21.09.2026 споткнулась ровно об это.
 printf '%s' "$LAST_BODY" | jq -r '
   ["id","title","size_text","size_bytes","seeders","leechers","source_name","category",
    "magnet_url","info_hash","quality_summary","voiceover_summary","source_url"] as $old
-  | (.results[0] // {}) | keys_unsorted as $have
-  | ($old - $have) | if length == 0 then "да" else "НЕТ: \(.)" end' 2>/dev/null || printf 'не разобрать\n'
+  | if (.results | length) == 0
+    then "проверять не на чем: выдача пуста, источники — \(.status)"
+    else ($old - (.results[0] | keys_unsorted))
+         | if length == 0 then "да" else "НЕТ, потерялись: \(.)" end
+    end' 2>/dev/null || printf 'не разобрать\n'
 
 printf '\n# Поиск: вызов приложения\n'
 if [[ -n "$SERIES_ID" && "$SERIES_ID" != "null" ]]; then
@@ -151,11 +164,16 @@ printf 'partial: %s, источники: ' "$(pick '.partial')"
 printf '%s' "$LAST_BODY" | jq -c '.status' 2>/dev/null || printf '\n'
 printf 'Без info_hash в выдаче: %s из %s\n' \
     "$(pick '[.results[] | select(.info_hash == "")] | length')" "$(pick '.results | length')"
-IDS="$(printf '%s' "$LAST_BODY" | jq -c '[.results[].id][:8]' 2>/dev/null || printf '[]')"
+IDS="$(printf '%s' "$LAST_BODY" | jq -c '[.results[].id][:4]' 2>/dev/null || printf '[]')"
 FIRST_ID="$(pick '.results[0].id')"
 
-printf '\n# Ленивые хэши для первых восьми\n'
-call POST /release/hashes "{\"ids\": $IDS, \"deadline\": 30}"
+printf '\n# Короткий срок на настоящем трекере\n'
+call GET '/search?q=%D0%98%D0%BD%D1%82%D0%B5%D1%80%D1%81%D1%82%D0%B5%D0%BB%D0%BB%D0%B0%D1%80%202014&deadline=0.3'
+printf 'partial: %s, источники: ' "$(pick '.partial')"
+printf '%s' "$LAST_BODY" | jq -c '.status' 2>/dev/null || printf '\n'
+
+printf '\n# Ленивые хэши для первых четырёх\n'
+call POST /release/hashes "{\"ids\": $IDS, \"limit\": 4, \"deadline\": 45}"
 printf 'Посчитано: %s из %s\n' \
     "$(pick '[.hashes[] | select(. != null)] | length')" "$(pick '.hashes | length')"
 printf 'Все сорок символов нижнего регистра: %s\n' \
@@ -178,7 +196,7 @@ if [[ -n "$FIRST_ID" && "$FIRST_ID" != "null" ]]; then
     if [[ -n "$SERVER_PID" ]]; then
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
-        "$SCRIPT_DIR/run-search-api.sh" >>/tmp/live-check-search-api.log 2>&1 &
+        "$SCRIPT_DIR/run-search-api.sh" >>"$LOG_FILE" 2>&1 &
         SERVER_PID=$!
         for _ in $(seq 1 40); do
             curl -fsS --max-time 2 "$BASE_URL/health" >/dev/null 2>&1 && break

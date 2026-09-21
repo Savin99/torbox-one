@@ -682,3 +682,56 @@ class CatalogEndpointTests(unittest.TestCase):
 
     def test_other_catalog_errors_stay_502(self) -> None:
         self.assertEqual(search_api.catalog_error(RuntimeError("сеть")).status_code, 502)
+
+
+class SourceStatusTests(unittest.TestCase):
+    """Живая проверка 21.09.2026: оба источника отказали (Cloudflare у NNM-Club,
+    Prowlarr не поднят), а ответ выглядел как обычная пустая выдача. Отличить
+    «ничего не нашлось» от «все трекеры легли» по строкам status нельзя."""
+
+    def test_all_sources_down_is_visible_without_parsing_strings(self) -> None:
+        class Failing(StaticProvider):
+            def search(self, query: str) -> list[bot.Release]:
+                raise RuntimeError("403 Forbidden")
+
+        with providers_replaced([Failing("nnm", "NNM-Club", []), Failing("p", "Prowlarr", [])]):
+            with cache_replaced(search_api.ReleaseCache()):
+                payload = search_api.tracker_search(q="Интерстеллар 2014")
+
+        self.assertEqual(payload.results, [])
+        self.assertFalse(payload.partial)
+        self.assertEqual({source.state for source in payload.sources}, {"error"})
+        self.assertTrue(all(source.found == 0 for source in payload.sources))
+        # Прежний словарь строк не изменился: его печатает бот и читает TorBox One
+        self.assertEqual(payload.status, {"NNM-Club": "ошибка", "Prowlarr": "ошибка"})
+
+    def test_empty_result_from_a_working_source_is_not_an_error(self) -> None:
+        with providers_replaced([StaticProvider("nnm", "NNM-Club", [])]):
+            with cache_replaced(search_api.ReleaseCache()):
+                payload = search_api.tracker_search(q="Интерстеллар 2014")
+        self.assertEqual([source.state for source in payload.sources], ["ok"])
+        self.assertEqual(payload.status, {"NNM-Club": "0"})
+
+    def test_timeout_state_matches_the_string_status(self) -> None:
+        fast = StaticProvider("nnm", "NNM-Club", [video_release("Дюна 2021 WEB-DL 1080p")])
+        slow = SlowProvider("slow", "Медленный трекер", delay=0.6)
+        with providers_replaced([fast, slow]), cache_replaced(search_api.ReleaseCache()):
+            payload = search_api.tracker_search(q="Дюна 2021", deadline=0.15)
+        by_name = {source.name: source for source in payload.sources}
+        self.assertEqual(by_name["Медленный трекер"].state, "timeout")
+        self.assertEqual(by_name["NNM-Club"].state, "ok")
+        self.assertEqual(by_name["NNM-Club"].found, 1)
+        self.assertTrue(slow.finished.wait(timeout=5))
+
+    def test_sources_and_status_never_disagree(self) -> None:
+        class Failing(StaticProvider):
+            def search(self, query: str) -> list[bot.Release]:
+                raise RuntimeError("трекер лежит")
+
+        good = StaticProvider("nnm", "NNM-Club", [video_release("Дюна 2021 WEB-DL 1080p")])
+        with providers_replaced([good, Failing("p", "Prowlarr", [])]):
+            with cache_replaced(search_api.ReleaseCache()):
+                payload = search_api.tracker_search(q="Дюна 2021")
+        expected = {"ok": "1", "error": "ошибка", "timeout": "таймаут"}
+        for source in payload.sources:
+            self.assertEqual(payload.status[source.name], expected[source.state])

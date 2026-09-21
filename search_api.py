@@ -487,7 +487,7 @@ def aggregate_releases(
         deadline: Срок в секундах; None — ждать всех, как прежде.
 
     Returns:
-        Кортеж «релизы, статус по источникам, признак неполноты».
+        Кортеж «релизы, статус строками, статус разбором, признак неполноты».
     """
     found: list[tuple[str, bot.Release]] = []
     counts: dict[str, int] = {provider.name: 0 for provider in providers}
@@ -522,14 +522,19 @@ def aggregate_releases(
         pool.shutdown(wait=False, cancel_futures=True)
 
     status: dict[str, str] = {}
+    sources: list[SourceStatus] = []
     for provider in providers:
         if pending[provider.name] > 0:
+            state = "timeout"
             status[provider.name] = "таймаут"
         elif failures[provider.name] and not counts[provider.name]:
+            state = "error"
             status[provider.name] = "ошибка"
         else:
+            state = "ok"
             status[provider.name] = str(counts[provider.name])
-    return rank_releases(found), status, partial
+        sources.append(SourceStatus(name=provider.name, state=state, found=counts[provider.name]))
+    return rank_releases(found), status, sources, partial
 
 
 def rank_releases(found: list[tuple[str, bot.Release]]) -> list[bot.Release]:
@@ -592,11 +597,28 @@ class ReleaseItem(BaseModel):
     published_at: str | None = None
 
 
+class SourceStatus(BaseModel):
+    """Состояние одного источника в этом поиске, разбором, а не строкой.
+
+    `status` рядом остаётся словарём строк: его печатает бот и разбирает
+    выпущенный TorBox One. Но «ошибка» и «18» там лежат в одном поле, и
+    клиент, который хочет отличить «ничего не нашлось» от «все трекеры
+    легли», вынужден сравнивать строки. Живая проверка это и показала:
+    оба источника отказали, а ответ выглядел как пустая выдача.
+    """
+
+    name: str
+    # ok — ответил, error — отказал, timeout — не успел к сроку
+    state: str
+    found: int = 0
+
+
 class SearchResult(BaseModel):
     """Ответ `/search`: статус по источникам и найденные раздачи."""
 
     status: dict[str, str]
     partial: bool = False
+    sources: list[SourceStatus] = Field(default_factory=list)
     results: list[ReleaseItem] = Field(default_factory=list)
 
 
@@ -772,7 +794,7 @@ def tracker_search(
         raise HTTPException(status_code=400, detail="Запрос слишком короткий")
     wanted = min(max(limit, 1), MAX_SEARCH_LIMIT)
 
-    releases, status, partial = aggregate_releases(list(PROVIDERS), queries, deadline)
+    releases, status, sources, partial = aggregate_releases(list(PROVIDERS), queries, deadline)
     # Два прохода разнообразия — как у бота: сначала широкий срез кандидатов,
     # потом короткий список. Для limit <= 24 результат тот же, что прежде.
     candidates = bot.select_diverse_releases(releases, max(bot.MAX_SEARCH_CANDIDATES, wanted))
@@ -782,6 +804,7 @@ def tracker_search(
     return SearchResult(
         status=status,
         partial=partial,
+        sources=sources,
         results=[
             ReleaseItem.model_validate(release_payload(release_id, release))
             for release_id, release in stored
