@@ -129,6 +129,9 @@ class Release:
     magnet_url: str = ""
     details_text: str = ""
     cached: bool | None = None
+    # Publication date as the indexer reported it. Empty when the source does
+    # not expose one: NNM-Club search results carry no date.
+    published_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -1122,6 +1125,7 @@ class ProwlarrClient:
                 info_hash=info_hash,
                 magnet_url=magnet_url,
                 details_text="\n".join(details),
+                published_at=str(item.get("publishDate") or "").strip(),
             ))
         return sorted(releases, key=lambda item: item.score, reverse=True)[:MAX_PROVIDER_RESULTS]
 
