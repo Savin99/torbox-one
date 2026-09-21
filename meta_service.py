@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
@@ -23,8 +24,51 @@ import torbox_tg_bot as bot
 
 LOG = logging.getLogger("meta_service")
 
+# Каталог рабочих файлов. На VPS сервис живёт под DynamicUser с ProtectSystem,
+# и рабочий каталог у него только для чтения — кэши кладутся в StateDirectory.
+STATE_DIR = Path(os.getenv("SEARCH_API_STATE_DIR", "").strip() or ".")
+
 CACHE_TTL_SECONDS = 30 * 24 * 3600
-CACHE_PATH = Path(os.getenv("META_CACHE_PATH", "meta_cache.json"))
+CACHE_PATH = Path(os.getenv("META_CACHE_PATH", "").strip() or STATE_DIR / "meta_cache.json")
+
+# Полки живут отдельным кэшем: топы и премьеры меняются за сутки, а карточка
+# фильма — нет. Один TTL на оба не подобрать, поэтому и файла два.
+SHELF_TTL_SECONDS = 12 * 3600
+SHELF_CACHE_PATH = Path(os.getenv("SHELF_CACHE_PATH", "").strip() or STATE_DIR / "shelf_cache.json")
+
+# Полки Главного — ровно то, что даёт API Кинопоиска. `top` без уточнения
+# считается топом фильмов: так называется полка в интерфейсе приложения.
+# Отдельного эндпоинта «топ фильмов» у API больше нет — v2.2/films/top убран
+# из документации, его заменили подборки.
+SHELF_COLLECTIONS = {
+    "popular": "TOP_POPULAR_ALL",
+    "popular_movies": "TOP_POPULAR_MOVIES",
+    "popular_series": "POPULAR_SERIES",
+    "top": "TOP_250_MOVIES",
+    "top_movies": "TOP_250_MOVIES",
+    "top_series": "TOP_250_TV_SHOWS",
+    "top_xxi": "TOP_100_GREATEST_MOVIES_XXI",
+    "closest_releases": "CLOSES_RELEASES",
+    "family": "FAMILY",
+    "comics": "COMICS_THEME",
+    "vampires": "VAMPIRE_THEME",
+    "zombies": "ZOMBIE_THEME",
+    "catastrophe": "CATASTROPHE_THEME",
+    "love": "LOVE_THEME",
+    "kids_animation": "KIDS_ANIMATION_THEME",
+    "programmers": "PROGRAMMERS_THEME",
+    "oscar_2021": "OSKAR_WINNERS_2021",
+}
+
+MONTH_NAMES = (
+    "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE",
+    "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+)
+
+# v2.2/films отдаёт не больше 400 карточек (20 страниц по 20), подборки — 50
+# страниц. Дальше каталог просто отвечает пустым списком.
+MAX_FILTER_PAGE = 20
+MAX_COLLECTION_PAGE = 50
 
 # Технический хвост в именах раздач: до него — название, после — мусор релиза.
 NOISE_WORDS = {
@@ -104,6 +148,29 @@ class EpisodeMeta:
     overview: str = ""
     air_date: str = ""
     still_url: str = ""
+
+
+@dataclass
+class SeasonBrief:
+    """Сколько серий в сезоне: приложению этого хватает, чтобы нарисовать выбор."""
+
+    season: int
+    episodes: int
+
+
+@dataclass
+class TitleCard:
+    """Карточка по идентификатору каталога: TitleMeta плюс внешние id и сезоны.
+
+    Отдельный тип, а не поля в TitleMeta: `meta/match` ищет тайтл по имени
+    раздачи и ни tmdb_id, ни состава сезонов не знает, а форму его ответа
+    уже разбирает выпущенное приложение.
+    """
+
+    meta: TitleMeta
+    tmdb_id: int = 0
+    imdb_id: str = ""
+    seasons: list[SeasonBrief] = field(default_factory=list)
 
 
 class TTLCache:
@@ -538,50 +605,139 @@ def score_candidate(item: dict[str, Any], parsed: ParsedName, query: str) -> flo
     return score
 
 
+class CatalogLimitError(RuntimeError):
+    """Каталог отказал по лимиту: суточная квота (402) или запросы в секунду (429).
+
+    Отдельный тип, потому что лечится он не повтором запроса, а ожиданием, и
+    приложению об этом надо сказать словами, а не «каталог недоступен».
+    """
+
+
 class KinopoiskMeta:
-    """Кинопоиск как источник карточек и русских названий серий."""
+    """Кинопоиск как источник карточек, полок и русских названий серий."""
 
     SEARCH_URL = "https://kinopoiskapiunofficial.tech/api/v2.1/films/search-by-keyword"
     FILM_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/{film_id}"
     SEASONS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/{film_id}/seasons"
     STAFF_URL = "https://kinopoiskapiunofficial.tech/api/v1/staff"
+    COLLECTIONS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/collections"
+    FILMS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films"
+    PREMIERES_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/premieres"
+    FILTERS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/filters"
+    QUOTA_URL = "https://kinopoiskapiunofficial.tech/api/v1/api_keys/{api_key}"
 
     def __init__(self, api_key: str) -> None:
         self.http = requests.Session()
         bot.configure_read_retries(self.http)
+        self._api_key = api_key.strip()
         self.http.headers.update(
             {
-                "X-API-KEY": api_key.strip(),
+                "X-API-KEY": self._api_key,
                 "Accept": "application/json",
                 "User-Agent": bot.USER_AGENT,
             }
         )
 
-    def search(self, query: str) -> list[dict[str, Any]]:
-        response = self.http.get(self.SEARCH_URL, params={"keyword": query, "page": 1}, timeout=15)
+    def _get(self, url: str, params: dict[str, Any] | None = None, timeout: int = 15) -> Any:
+        """Один запрос к каталогу с разбором лимитов.
+
+        Args:
+            url: Полный адрес эндпоинта.
+            params: Параметры запроса.
+            timeout: Таймаут в секундах.
+
+        Returns:
+            Разобранный JSON ответа.
+
+        Raises:
+            CatalogLimitError: Суточная квота (402) или запросы в секунду (429).
+        """
+        response = self.http.get(url, params=params, timeout=timeout)
+        # 402 — кончилась суточная или общая квота, 429 — слишком часто.
+        # Документация лимитов: kinopoiskapiunofficial.tech/documentation/api/
+        if response.status_code == 402:
+            raise CatalogLimitError("Дневная квота Кинопоиска исчерпана")
+        if response.status_code == 429:
+            raise CatalogLimitError("Кинопоиск просит сбавить темп запросов")
         response.raise_for_status()
-        payload = response.json()
+        return response.json()
+
+    def search(self, query: str) -> list[dict[str, Any]]:
+        payload = self._get(self.SEARCH_URL, {"keyword": query, "page": 1})
         films = payload.get("films") if isinstance(payload, dict) else None
         return [item for item in films or [] if isinstance(item, dict)]
 
     def film(self, film_id: int) -> dict[str, Any]:
-        response = self.http.get(self.FILM_URL.format(film_id=film_id), timeout=15)
-        response.raise_for_status()
-        payload = response.json()
+        payload = self._get(self.FILM_URL.format(film_id=film_id))
         return payload if isinstance(payload, dict) else {}
 
     def staff(self, film_id: int) -> list[dict[str, Any]]:
-        response = self.http.get(self.STAFF_URL, params={"filmId": film_id}, timeout=20)
-        response.raise_for_status()
-        payload = response.json()
+        payload = self._get(self.STAFF_URL, {"filmId": film_id}, timeout=20)
         return [item for item in payload or [] if isinstance(item, dict)]
 
     def seasons(self, film_id: int) -> list[dict[str, Any]]:
-        response = self.http.get(self.SEASONS_URL.format(film_id=film_id), timeout=20)
-        response.raise_for_status()
-        payload = response.json()
+        payload = self._get(self.SEASONS_URL.format(film_id=film_id), timeout=20)
         items = payload.get("items") if isinstance(payload, dict) else None
         return [item for item in items or [] if isinstance(item, dict)]
+
+    def collection(self, collection_type: str, page: int = 1) -> list[dict[str, Any]]:
+        """Подборка Кинопоиска: топы, популярное, тематические списки.
+
+        Args:
+            collection_type: Константа из COLLECTION_TYPES.
+            page: Страница, 1…50; на странице не больше 20 карточек.
+
+        Returns:
+            Карточки подборки в том виде, в каком их отдал каталог.
+        """
+        payload = self._get(self.COLLECTIONS_URL, {"type": collection_type, "page": page})
+        return _items(payload)
+
+    def films(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Фильтр каталога: жанр, страна, годы, тип, сортировка.
+
+        Args:
+            params: Параметры v2.2/films. Жанр и страна — не больше одного
+                значения каждая: это ограничение самого API, не наше.
+
+        Returns:
+            Карточки выдачи фильтра.
+        """
+        payload = self._get(self.FILMS_URL, params)
+        return _items(payload)
+
+    def premieres(self, year: int, month: str) -> list[dict[str, Any]]:
+        """Премьеры месяца.
+
+        Args:
+            year: Год премьеры.
+            month: Месяц заглавными латиницей, JANUARY…DECEMBER.
+
+        Returns:
+            Карточки премьер; пагинации у этого эндпоинта нет.
+        """
+        payload = self._get(self.PREMIERES_URL, {"year": year, "month": month})
+        return _items(payload)
+
+    def filters(self) -> dict[str, Any]:
+        """Справочник жанров и стран: числовые id для фильтра v2.2/films."""
+        payload = self._get(self.FILTERS_URL)
+        return payload if isinstance(payload, dict) else {}
+
+    def quota(self) -> dict[str, Any]:
+        """Остаток квоты ключа — бесплатный способ узнать её до платных вызовов.
+
+        Ключ у этого эндпоинта идёт в путь: так устроен сам API. Адрес с ним
+        не логируется — в лог уходит только результат.
+        """
+        payload = self._get(self.QUOTA_URL.format(api_key=self._api_key))
+        return payload if isinstance(payload, dict) else {}
+
+
+def _items(payload: Any) -> list[dict[str, Any]]:
+    """Список `items` из ответа каталога; у всех списочных ответов он такой."""
+    items = payload.get("items") if isinstance(payload, dict) else None
+    return [item for item in items or [] if isinstance(item, dict)]
 
 
 class TMDBStills:
@@ -641,10 +797,12 @@ class MetaService:
         kinopoisk: KinopoiskMeta | None,
         tmdb: TMDBStills | None = None,
         cache: TTLCache | None = None,
+        shelf_cache: TTLCache | None = None,
     ) -> None:
         self.kinopoisk = kinopoisk
         self.tmdb = tmdb
         self.cache = cache or TTLCache()
+        self.shelf_cache = shelf_cache or TTLCache(SHELF_CACHE_PATH, SHELF_TTL_SECONDS)
 
     @property
     def available(self) -> bool:
@@ -701,13 +859,35 @@ class MetaService:
                 break
         return best
 
+    def _film(self, film_id: int) -> dict[str, Any]:
+        """Карточка фильма из каталога с кэшем.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+
+        Returns:
+            Ответ v2.2/films/{id} или пустой словарь, если каталог не ответил.
+        """
+        if not film_id or self.kinopoisk is None:
+            return {}
+        cache_key = f"film:{film_id}"
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            details = self.kinopoisk.film(film_id)
+        except CatalogLimitError:
+            raise
+        except Exception:
+            LOG.warning("Не получилось прочитать карточку %s", film_id, exc_info=True)
+            return {}
+        self.cache.put(cache_key, details)
+        return details
+
     def _build_meta(self, film_id: int, item: dict[str, Any], parsed: ParsedName) -> TitleMeta:
-        details: dict[str, Any] = {}
-        if film_id and self.kinopoisk is not None:
-            try:
-                details = self.kinopoisk.film(film_id)
-            except Exception:
-                LOG.warning("Не получилось прочитать карточку %s", film_id, exc_info=True)
+        # Через _film, а не напрямую: одна и та же карточка нужна и match,
+        # и title_card, и _tmdb_query, а суточная квота каталога — 500 запросов
+        details = self._film(film_id)
 
         media_type = str(details.get("type") or item.get("type") or "").upper()
         seasons_count = 0
@@ -797,6 +977,145 @@ class MetaService:
             return []
         self.cache.put(cache_key, seasons)
         return seasons
+
+    def title_card(self, film_id: int) -> TitleCard:
+        """Карточка тайтла по идентификатору каталога.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+
+        Returns:
+            TitleMeta плюс tmdb_id, imdb_id и состав сезонов. Если каталог
+            тайтла не знает, внутри лежит TitleMeta.empty().
+
+        Raises:
+            CatalogLimitError: Квота каталога исчерпана.
+        """
+        if self.kinopoisk is None:
+            return TitleCard(meta=TitleMeta.empty())
+        details = self._film(film_id)
+        if not details:
+            return TitleCard(meta=TitleMeta.empty())
+        parsed = ParsedName(queries=[], year=None, season=None, is_series=None)
+        meta = self._build_meta(film_id, details, parsed)
+        self.remember_title(film_id, meta.original_title or meta.title, meta.year)
+        seasons = [
+            SeasonBrief(
+                season=int(entry.get("number") or 0),
+                episodes=len([item for item in entry.get("episodes", []) or [] if isinstance(item, dict)]),
+            )
+            for entry in self._seasons(film_id)
+        ]
+        return TitleCard(
+            meta=meta,
+            # tmdb_id Кинопоиск не отдаёт ни одним эндпоинтом — его приходится
+            # искать в самом TMDB по оригинальному названию и году
+            tmdb_id=self._tmdb_id(film_id) if seasons else 0,
+            imdb_id=str(details.get("imdbId") or "").strip(),
+            seasons=[item for item in seasons if item.season],
+        )
+
+    def _tmdb_id(self, film_id: int) -> int:
+        """Идентификатор сериала в TMDB: нужен кадрам серий, у Кинопоиска его нет."""
+        if self.tmdb is None:
+            return 0
+        cached = self.cache.get(f"tmdb:{film_id}")
+        if cached is not None:
+            return int(cached or 0)
+        query, year = self._tmdb_query(film_id)
+        if not query:
+            return 0
+        try:
+            tv_id = self.tmdb.find_series(query, year)
+        except Exception:
+            LOG.warning("TMDB не ответил на «%s»", query, exc_info=True)
+            return 0
+        self.cache.put(f"tmdb:{film_id}", tv_id or 0)
+        return int(tv_id or 0)
+
+    def shelf(self, kind: str, page: int = 1) -> list[bot.CatalogTitle]:
+        """Полка Главного экрана.
+
+        Args:
+            kind: Ключ полки: значение из SHELF_COLLECTIONS, `premieres`,
+                `genre/<название>` или `year/<год>`.
+            page: Страница выдачи, начиная с 1.
+
+        Returns:
+            Карточки полки в той же форме, что и `/catalog/popular`.
+
+        Raises:
+            ValueError: Полки с таким ключом у каталога нет.
+            CatalogLimitError: Квота каталога исчерпана.
+        """
+        if self.kinopoisk is None:
+            return []
+        cache_key = f"shelf:{kind.casefold()}:{page}"
+        cached = self.shelf_cache.get(cache_key)
+        if cached is None:
+            cached = self._load_shelf(kind, page)
+            self.shelf_cache.put(cache_key, cached)
+        # Тот же маппер, что у бота: карточка полки и карточка каталога
+        # обязаны быть одной формы, иначе приложение разбирает их дважды
+        return bot.KinopoiskCatalog._titles_from_items(cached)
+
+    def _load_shelf(self, kind: str, page: int) -> list[dict[str, Any]]:
+        assert self.kinopoisk is not None
+        key = kind.strip().strip("/").casefold()
+        if key in SHELF_COLLECTIONS:
+            return self.kinopoisk.collection(SHELF_COLLECTIONS[key], min(max(page, 1), MAX_COLLECTION_PAGE))
+        if key == "premieres":
+            today = datetime.date.today()
+            return self.kinopoisk.premieres(today.year, MONTH_NAMES[today.month - 1])
+        prefix, _, value = key.partition("/")
+        safe_page = min(max(page, 1), MAX_FILTER_PAGE)
+        if prefix == "genre" and value:
+            genre_id = self.genre_id(value)
+            if genre_id is None:
+                raise ValueError(f"Каталог не знает жанра «{value}»")
+            return self.kinopoisk.films({"genres": genre_id, "order": "RATING", "page": safe_page})
+        if prefix == "year" and value.isdigit():
+            year = int(value)
+            return self.kinopoisk.films(
+                {"yearFrom": year, "yearTo": year, "order": "RATING", "page": safe_page}
+            )
+        raise ValueError(f"Неизвестная полка «{kind}»")
+
+    def genres(self) -> list[dict[str, Any]]:
+        """Справочник жанров каталога: числовые id для фильтра по жанру."""
+        if self.kinopoisk is None:
+            return []
+        cached = self.cache.get("filters:genres")
+        if cached is not None:
+            return cached
+        try:
+            payload = self.kinopoisk.filters()
+        except CatalogLimitError:
+            raise
+        except Exception:
+            LOG.warning("Не получилось прочитать справочник жанров", exc_info=True)
+            return []
+        genres = [
+            {"id": int(entry["id"]), "genre": str(entry.get("genre") or "")}
+            for entry in payload.get("genres", []) or []
+            if isinstance(entry, dict) and str(entry.get("id") or "").isdigit() and entry.get("genre")
+        ]
+        self.cache.put("filters:genres", genres)
+        return genres
+
+    def genre_id(self, name: str) -> int | None:
+        """Числовой id жанра по русскому названию; без него фильтр не работает."""
+        wanted = name.strip().casefold()
+        return next(
+            (entry["id"] for entry in self.genres() if str(entry["genre"]).casefold() == wanted),
+            None,
+        )
+
+    def quota(self) -> dict[str, Any]:
+        """Остаток суточной квоты каталога — без кэша, иначе цифра врёт."""
+        if self.kinopoisk is None:
+            return {}
+        return self.kinopoisk.quota()
 
     def episodes(self, film_id: int, season: int | None = None) -> list[EpisodeMeta]:
         """Серии тайтла: названия и описания из Кинопоиска, кадры — из TMDB."""

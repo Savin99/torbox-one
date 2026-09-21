@@ -381,3 +381,273 @@ class VoiceoverSpecTests(unittest.TestCase):
         spec = meta_service.parse_voiceover_spec("Movie 2025 BDRip 1080p")
         self.assertEqual(spec.kinds, [])
         self.assertEqual(spec.studios, [])
+
+
+class FakeHttpResponse:
+    def __init__(self, payload: Any, status_code: int = 200) -> None:
+        self.payload = payload
+        self.status_code = status_code
+
+    def json(self) -> Any:
+        return self.payload
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class FakeHttp:
+    """Подмена сессии на границе HTTP: проверяем и разбор ответа, и лимиты."""
+
+    def __init__(self, routes: dict[str, Any], status: int = 200) -> None:
+        self.routes = routes
+        self.status = status
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.headers: dict[str, str] = {}
+
+    def get(self, url: str, params: dict[str, Any] | None = None, timeout: int = 0) -> FakeHttpResponse:
+        self.calls.append((url, dict(params or {})))
+        key = next((route for route in self.routes if route in url), "")
+        return FakeHttpResponse(self.routes.get(key, {}), self.status)
+
+
+# Формы ответов — из документации Kinopoisk API Unofficial (openapi.json).
+# Ловушки оттуда же: year строкой в подборках и числом в фильтре, опечатка
+# ratingImbd в подборках, filmId вместо kinopoiskId в поиске по слову.
+COLLECTION_PAYLOAD = {
+    "total": 2,
+    "totalPages": 1,
+    "items": [
+        {
+            "kinopoiskId": 301,
+            "nameRu": "Матрица",
+            "nameEn": None,
+            "nameOriginal": "The Matrix",
+            "countries": [{"country": "США"}],
+            "genres": [{"genre": "фантастика"}],
+            "ratingKinopoisk": 8.5,
+            "ratingImbd": 8.7,
+            "year": "1999",
+            "type": "FILM",
+            "posterUrl": "http://example.org/poster.jpg",
+            "posterUrlPreview": "http://example.org/preview.jpg",
+        }
+    ],
+}
+
+FILTER_PAYLOAD = {
+    "total": 1,
+    "totalPages": 1,
+    "items": [
+        {
+            "kinopoiskId": 555,
+            "imdbId": "tt0111161",
+            "nameRu": "Побег из Шоушенка",
+            "nameOriginal": "The Shawshank Redemption",
+            "countries": [{"country": "США"}],
+            "genres": [{"genre": "драма"}],
+            "ratingKinopoisk": 9.1,
+            "ratingImdb": 9.3,
+            "year": 1994,
+            "type": "FILM",
+            "posterUrl": "https://example.org/p.jpg",
+            "posterUrlPreview": "https://example.org/pp.jpg",
+        }
+    ],
+}
+
+PREMIERES_PAYLOAD = {
+    "total": 1,
+    "items": [
+        {
+            "kinopoiskId": 777,
+            "nameRu": "Новинка",
+            "nameEn": "Newcomer",
+            "year": 2026,
+            "posterUrl": "https://example.org/n.jpg",
+            "posterUrlPreview": "https://example.org/np.jpg",
+            "countries": [{"country": "Россия"}],
+            "genres": [{"genre": "комедия"}],
+            "duration": 101,
+            "premiereRu": "2026-10-01",
+        }
+    ],
+}
+
+FILTERS_PAYLOAD = {
+    "genres": [{"id": 11, "genre": "боевик"}, {"id": 8, "genre": "драма"}],
+    "countries": [{"id": 1, "country": "США"}],
+}
+
+SERIES_FILM_PAYLOAD = {
+    "kinopoiskId": 4444,
+    "imdbId": "tt0944947",
+    "nameRu": "Игра престолов",
+    "nameOriginal": "Game of Thrones",
+    "year": 2011,
+    "type": "TV_SERIES",
+    "serial": True,
+    "ratingKinopoisk": 9.0,
+    "description": "Описание",
+    "posterUrl": "http://example.org/got.jpg",
+    "coverUrl": "https://example.org/got-cover.jpg",
+    "genres": [{"genre": "фэнтези"}],
+    "countries": [{"country": "США"}],
+    "filmLength": 55,
+}
+
+SEASONS_PAYLOAD = {
+    "total": 2,
+    "items": [
+        {
+            "number": 1,
+            "episodes": [
+                {"seasonNumber": 1, "episodeNumber": 1, "nameRu": "Зима близко", "releaseDate": "2011-04-17"},
+                {"seasonNumber": 1, "episodeNumber": 2, "nameRu": "Дорога короля"},
+            ],
+        },
+        {"number": 2, "episodes": [{"seasonNumber": 2, "episodeNumber": 1, "nameRu": "Север помнит"}]},
+    ],
+}
+
+
+def catalog_service(routes: dict[str, Any], status: int = 200) -> tuple[meta_service.MetaService, FakeHttp]:
+    kinopoisk = meta_service.KinopoiskMeta("test-key")
+    http = FakeHttp(routes, status)
+    kinopoisk.http = http  # type: ignore[assignment]
+    folder = Path(tempfile.mkdtemp())
+    service = meta_service.MetaService(
+        kinopoisk=kinopoisk,
+        tmdb=None,
+        cache=meta_service.TTLCache(folder / "meta.json"),
+        shelf_cache=meta_service.TTLCache(folder / "shelf.json", 3600),
+    )
+    return service, http
+
+
+class CatalogShelfTests(unittest.TestCase):
+    def test_collection_shelf_maps_cards(self) -> None:
+        service, http = catalog_service({"films/collections": COLLECTION_PAYLOAD})
+        [title] = service.shelf("top_series")
+        self.assertEqual(title.catalog_id, 301)
+        self.assertEqual(title.name, "Матрица")
+        self.assertEqual(title.original_name, "The Matrix")
+        self.assertEqual(title.year, "1999")
+        self.assertEqual(title.rating, "8.5")
+        self.assertEqual(title.genres, ("фантастика",))
+        # http:// в постерах Кинопоиска переписывается на https
+        self.assertTrue(title.poster_url.startswith("https://"))
+        self.assertEqual(http.calls[0][1], {"type": "TOP_250_TV_SHOWS", "page": 1})
+
+    def test_each_shelf_asks_its_own_collection(self) -> None:
+        service, http = catalog_service({"films/collections": COLLECTION_PAYLOAD})
+        for kind, expected in (
+            ("popular", "TOP_POPULAR_ALL"),
+            ("top_movies", "TOP_250_MOVIES"),
+            ("popular_series", "POPULAR_SERIES"),
+            ("closest_releases", "CLOSES_RELEASES"),
+        ):
+            service.shelf(kind)
+            self.assertEqual(http.calls[-1][1]["type"], expected)
+
+    def test_genre_shelf_resolves_numeric_id_first(self) -> None:
+        service, http = catalog_service(
+            {"films/filters": FILTERS_PAYLOAD, "api/v2.2/films": FILTER_PAYLOAD}
+        )
+        [title] = service.shelf("genre/Боевик")
+        self.assertEqual(title.catalog_id, 555)
+        self.assertEqual(title.year, "1994")
+        # Фильтр принимает только числовой id жанра, названия он не знает
+        self.assertEqual(http.calls[-1][1], {"genres": 11, "order": "RATING", "page": 1})
+
+    def test_unknown_genre_is_reported(self) -> None:
+        service, _ = catalog_service({"films/filters": FILTERS_PAYLOAD})
+        with self.assertRaises(ValueError):
+            service.shelf("genre/киберпанк")
+
+    def test_year_shelf_uses_both_bounds(self) -> None:
+        service, http = catalog_service({"api/v2.2/films": FILTER_PAYLOAD})
+        service.shelf("year/1994")
+        self.assertEqual(http.calls[-1][1], {"yearFrom": 1994, "yearTo": 1994, "order": "RATING", "page": 1})
+
+    def test_premieres_shelf_asks_for_a_month(self) -> None:
+        service, http = catalog_service({"films/premieres": PREMIERES_PAYLOAD})
+        [title] = service.shelf("premieres")
+        self.assertEqual(title.catalog_id, 777)
+        self.assertEqual(title.rating, "")
+        self.assertIn(http.calls[-1][1]["month"], meta_service.MONTH_NAMES)
+
+    def test_unknown_shelf_is_rejected(self) -> None:
+        service, _ = catalog_service({})
+        with self.assertRaises(ValueError):
+            service.shelf("что-нибудь")
+
+    def test_shelf_is_cached(self) -> None:
+        service, http = catalog_service({"films/collections": COLLECTION_PAYLOAD})
+        service.shelf("popular")
+        service.shelf("popular")
+        self.assertEqual(len(http.calls), 1)
+
+    def test_page_is_clamped_to_what_the_api_serves(self) -> None:
+        service, http = catalog_service({"films/collections": COLLECTION_PAYLOAD})
+        service.shelf("popular", page=9999)
+        self.assertEqual(http.calls[-1][1]["page"], meta_service.MAX_COLLECTION_PAGE)
+
+    def test_daily_quota_is_its_own_error(self) -> None:
+        service, _ = catalog_service({"films/collections": COLLECTION_PAYLOAD}, status=402)
+        with self.assertRaises(meta_service.CatalogLimitError):
+            service.shelf("popular")
+
+    def test_rate_limit_is_its_own_error(self) -> None:
+        service, _ = catalog_service({"films/collections": COLLECTION_PAYLOAD}, status=429)
+        with self.assertRaises(meta_service.CatalogLimitError):
+            service.shelf("popular")
+
+
+class TitleCardTests(unittest.TestCase):
+    def routes(self) -> dict[str, Any]:
+        return {
+            "films/4444/seasons": SEASONS_PAYLOAD,
+            "api/v2.2/films/4444": SERIES_FILM_PAYLOAD,
+            "v1/staff": [],
+        }
+
+    def test_card_carries_seasons_and_external_ids(self) -> None:
+        service, _ = catalog_service(self.routes())
+        card = service.title_card(4444)
+        self.assertTrue(card.meta.matched)
+        self.assertEqual(card.meta.title, "Игра престолов")
+        self.assertEqual(card.meta.original_title, "Game of Thrones")
+        self.assertEqual(card.imdb_id, "tt0944947")
+        self.assertEqual([(item.season, item.episodes) for item in card.seasons], [(1, 2), (2, 1)])
+        # tmdb_id Кинопоиск не отдаёт, а TMDB в этой сборке не настроен
+        self.assertEqual(card.tmdb_id, 0)
+
+    def test_card_is_cached_between_calls(self) -> None:
+        service, http = catalog_service(self.routes())
+        service.title_card(4444)
+        calls = len(http.calls)
+        service.title_card(4444)
+        self.assertEqual(len(http.calls), calls)
+
+    def test_card_costs_three_catalog_requests(self) -> None:
+        service, http = catalog_service(self.routes())
+        service.title_card(4444)
+        # Карточка, состав и сезоны — и ни одного лишнего запроса из 500 в сутки
+        self.assertEqual(len(http.calls), 3)
+
+    def test_unknown_title_is_not_matched(self) -> None:
+        service, _ = catalog_service({})
+        self.assertFalse(service.title_card(999).meta.matched)
+
+
+class GenreDirectoryTests(unittest.TestCase):
+    def test_genres_are_cached(self) -> None:
+        service, http = catalog_service({"films/filters": FILTERS_PAYLOAD})
+        self.assertEqual(service.genre_id("драма"), 8)
+        self.assertEqual(service.genre_id("ДРАМА"), 8)
+        self.assertEqual(len(http.calls), 1)
+
+    def test_unknown_genre_has_no_id(self) -> None:
+        service, _ = catalog_service({"films/filters": FILTERS_PAYLOAD})
+        self.assertIsNone(service.genre_id("киберпанк"))
