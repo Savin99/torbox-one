@@ -350,6 +350,134 @@ class InfoHashTests(unittest.TestCase):
         self.assertEqual(result.limit, search_api.MAX_HASH_IDS)
 
 
+UPDATED_INFO_DICT = {**INFO_DICT, b"length": 2048, b"name": b"release-e02.mkv"}
+UPDATED_TORRENT = bencodepy.encode({b"announce": b"https://tracker.test/ann", b"info": UPDATED_INFO_DICT})
+UPDATED_HASH = hashlib.sha1(bencodepy.encode(UPDATED_INFO_DICT)).hexdigest()
+
+
+class UpdatingTopicProvider:
+    """Тема NNM-Club, в которой раздающий меняет `.torrent`, как у онгоинга.
+
+    Номер темы прежний, а новый файл ложится новым вложением — под новым
+    `download.php?id=`. Поиск отдаёт то вложение, что лежит в теме сейчас.
+    """
+
+    key = "nnm"
+    name = "NNM-Club"
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+        self.attachment = ""
+        self.downloads = 0
+
+    def publish(self, attachment: str, torrent: bytes) -> None:
+        self.files[attachment] = torrent
+        self.attachment = attachment
+
+    def search(self, query: str) -> list[bot.Release]:
+        return [
+            make_release(
+                title="Сериал (Сезон 1) WEB-DL 1080p",
+                torrent_id=self.attachment,
+                topic_id="100500",
+                download_url=f"https://nnm.test/forum/download.php?id={self.attachment}",
+                info_hash="",
+                magnet_url="",
+            )
+        ]
+
+    def topic_summary(self, release: bot.Release) -> str:
+        return ""
+
+    def download_torrent(self, release: bot.Release) -> bytes:
+        self.downloads += 1
+        return self.files[release.torrent_id]
+
+
+def search_and_hash(query: str) -> tuple[str, str | None]:
+    """Как KinoApp: поиск, затем хэш первой раздачи через `/release/hashes`."""
+    [item] = search_api.tracker_search(q=query).results
+    return item.id, search_api.release_hashes(search_api.HashRequest(ids=[item.id])).hashes[item.id]
+
+
+class UpdatedTopicHashTests(unittest.TestCase):
+    """Онгоинг обновился новым `.torrent` в той же теме.
+
+    Кэш хэша жил под `hash:nnm:<тема>` сутки, а тема у обновлённой раздачи
+    та же. KinoApp получал хэш прежнего файла, находил его в кэше TorBox и
+    ждал файлы, а TorBox получал уже новый `.torrent` — «TorBox принял
+    раздачу, но файлы так и не появились».
+    """
+
+    def test_new_attachment_gets_its_hash_without_waiting_for_the_ttl(self) -> None:
+        tracker = UpdatingTopicProvider()
+        with providers_replaced([tracker]), cache_replaced(search_api.ReleaseCache()):
+            tracker.publish("777", SMALL_TORRENT)
+            first_id, before = search_and_hash("Сериал")
+
+            tracker.publish("778", UPDATED_TORRENT)
+            later_id, after = search_and_hash("Сериал")
+            served = search_api.release_torrent(later_id).body
+
+        self.assertEqual(first_id, later_id, "тема та же — и id тот же")
+        self.assertEqual(before, EXPECTED_HASH)
+        self.assertEqual(after, UPDATED_HASH)
+        # Хэш обязан описывать ровно тот файл, который получит TorBox
+        self.assertEqual(bot.torrent_fingerprint(served), after)
+
+    def test_same_attachment_is_downloaded_once(self) -> None:
+        tracker = UpdatingTopicProvider()
+        with providers_replaced([tracker]), cache_replaced(search_api.ReleaseCache()):
+            tracker.publish("777", SMALL_TORRENT)
+            _, first = search_and_hash("Сериал")
+            _, again = search_and_hash("Сериал")
+        self.assertEqual(first, again)
+        self.assertEqual(tracker.downloads, 1)
+
+    def test_hash_cached_by_the_previous_version_is_not_read(self) -> None:
+        # Прежняя версия клала хэш под ключом без файла. После выкладки такая
+        # запись ещё сутки лежит на диске, и верить ей нельзя
+        tracker = UpdatingTopicProvider()
+        with providers_replaced([tracker]), cache_replaced(search_api.ReleaseCache()):
+            search_api.HASH_CACHE.put("hash:nnm:100500", EXPECTED_HASH)
+            tracker.publish("778", UPDATED_TORRENT)
+            _, value = search_and_hash("Сериал")
+        self.assertEqual(value, UPDATED_HASH)
+
+    def test_hash_from_the_indexer_beats_the_cache(self) -> None:
+        # RuTor через Prowlarr отдаёт хэш в самой выдаче, и после обновления
+        # раздачи он уже новый. Он из той же выдачи, что и файл, — главнее кэша
+        guid = "https://d.rutor.test/download/851209"
+        old = make_release(provider="prowlarr", torrent_id=guid, info_hash="a" * 40)
+        new = make_release(provider="prowlarr", torrent_id=guid, info_hash="b" * 40)
+        with providers_replaced([FakeNnmClient()]), cache_replaced(search_api.ReleaseCache()):
+            search_api.release_info_hash("prowlarr:rutor:1", old)
+            self.assertEqual(search_api.release_info_hash("prowlarr:rutor:1", new), "b" * 40)
+
+    def test_hash_from_the_topic_page_serves_the_same_file_from_search(self) -> None:
+        # Восстановленный релиз несёт magnet со страницы темы, а тот же файл
+        # из поиска NNM-Club — уже без него. Качать его ради хэша незачем
+        client = FakeNnmClient(page=TOPIC_PAGE, torrent=SMALL_TORRENT)
+        from_search = make_release(provider="nnm", topic_id="100500", torrent_id="777", info_hash="", magnet_url="")
+        with providers_replaced([client]), cache_replaced(search_api.ReleaseCache()):
+            search_api.release_info_hash("nnm:100500", search_api.restore_nnm_topic(client, "100500"))
+            value = search_api.release_info_hash("nnm:100500", from_search)
+        self.assertEqual(value, "0123456789abcdef0123456789abcdef01234567")
+        self.assertEqual(client.downloads, 0)
+
+    def test_key_names_the_file_without_the_prowlarr_api_key(self) -> None:
+        nnm = make_release(provider="nnm", topic_id="100500", torrent_id="979391")
+        self.assertEqual(search_api.hash_cache_key("nnm:100500", nnm), "hash:nnm:100500:979391")
+        prowlarr = make_release(
+            provider="prowlarr",
+            torrent_id="https://bigfangroup.test/download.php?id=289856",
+            download_url="http://127.0.0.1:9696/2/download?apikey=SEKRET&link=x",
+        )
+        key = search_api.hash_cache_key("prowlarr:bigfangroup:1", prowlarr)
+        self.assertRegex(key, r"^hash:prowlarr:bigfangroup:1:[0-9a-f]{16}$")
+        self.assertEqual(search_api.hash_cache_key("nnm:1", make_release(torrent_id=" ")), "")
+
+
 class StaticProvider:
     """Источник, который отдаёт заранее заданные релизы на любой запрос."""
 

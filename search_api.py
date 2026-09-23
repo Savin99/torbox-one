@@ -372,6 +372,34 @@ def normalized_info_hash(value: str) -> str:
     return ""
 
 
+def hash_cache_key(release_id: str, release: bot.Release) -> str:
+    """Ключ кэша хэша: не только релиз, но и сам файл раздачи.
+
+    Онгоинг на NNM-Club обновляется в той же теме новым `.torrent`: номер
+    темы, а с ним и стабильный id, остаются прежними, а вложение и info_hash
+    — новые. Под ключом одного id кэш сутки отдавал хэш прежнего файла:
+    KinoApp видел раздачу «в кэше TorBox», а TorBox получал уже другой
+    `.torrent`, и файлы так и не появлялись.
+
+    Файл называет `torrent_id`: у NNM-Club это номер вложения из
+    `download.php?id=`, у Prowlarr — guid индексера (у RuTor и BigFANGroup
+    это ссылка на сам файл). Адрес закачки не годится: у Prowlarr в нём
+    ключ API.
+
+    Args:
+        release_id: Стабильный идентификатор релиза.
+        release: Релиз, чей файл отдаст `/release/{id}/torrent`.
+
+    Returns:
+        Ключ или пустую строку, если файл назвать нечем, — тогда хэш не
+        кэшируется вовсе.
+    """
+    file_id = release.torrent_id.strip()
+    if not file_id:
+        return ""
+    return f"hash:{release_id}:{file_id if file_id.isdigit() else _digest(file_id)}"
+
+
 def release_info_hash(release_id: str, release: bot.Release) -> str | None:
     """Считает info_hash релиза, скачивая `.torrent`, и кэширует результат.
 
@@ -380,6 +408,9 @@ def release_info_hash(release_id: str, release: bot.Release) -> str | None:
     нельзя — это десятки лишних запросов к трекеру, поэтому он считается
     лениво и только для тех релизов, о которых спросил клиент.
 
+    Хэш, который релиз принёс сам — от индексера или в magnet, — главнее
+    кэша: он из той же выдачи, что и файл. Кэш нужен только закачке.
+
     Args:
         release_id: Стабильный идентификатор релиза.
         release: Релиз, для которого нужен хэш.
@@ -387,17 +418,20 @@ def release_info_hash(release_id: str, release: bot.Release) -> str | None:
     Returns:
         hex40 в нижнем регистре или None, если источник хэш не отдал.
     """
-    cache_key = f"hash:{release_id}"
-    cached = HASH_CACHE.get(cache_key)
-    if isinstance(cached, str) and cached:
-        return cached
-
+    cache_key = hash_cache_key(release_id, release)
     known = normalized_info_hash(release.info_hash) or normalized_info_hash(
         bot.magnet_info_hash(release.magnet_url)
     )
     if known:
-        HASH_CACHE.put(cache_key, known)
+        # Запоминаем под файлом: у того же вложения из поиска NNM-Club
+        # magnet уже не будет, а хэш у файла тот же
+        if cache_key and HASH_CACHE.get(cache_key) != known:
+            HASH_CACHE.put(cache_key, known)
         return known
+
+    cached = HASH_CACHE.get(cache_key) if cache_key else None
+    if isinstance(cached, str) and cached:
+        return cached
 
     provider = PROVIDER_BY_KEY.get(release.provider)
     if provider is None:
@@ -406,7 +440,8 @@ def release_info_hash(release_id: str, release: bot.Release) -> str | None:
     value = bot.torrent_fingerprint(payload).casefold()
     if not INFO_HASH_RE.match(value):
         return None
-    HASH_CACHE.put(cache_key, value)
+    if cache_key:
+        HASH_CACHE.put(cache_key, value)
     return value
 
 
