@@ -14,6 +14,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -66,10 +67,27 @@ MONTH_NAMES = (
     "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
 )
 
-# v2.2/films отдаёт не больше 400 карточек (20 страниц по 20), подборки — 50
-# страниц. Дальше каталог просто отвечает пустым списком.
+# v2.2/films по документации отдаёт не больше 400 карточек (20 страниц по 20),
+# подборки — 50 страниц. Дальше каталог просто отвечает пустым списком.
+# Живьём 23.09.2026 фильтр отдавал меньше: `total: 100`, `totalPages: 5` на
+# каждом из десяти разных запросов, включая «все фильмы с оценкой от 7».
 MAX_FILTER_PAGE = 20
 MAX_COLLECTION_PAGE = 50
+
+# Подбор для «Что смотреть» в KinoApp (`MetaService.discover`). Значения —
+# перечисления фильтра v2.2/films из openapi.json Кинопоиска.
+DISCOVER_TYPES = ("ALL", "FILM", "TV_SERIES", "MINI_SERIES", "TV_SHOW")
+DISCOVER_ORDERS = ("NUM_VOTE", "RATING", "YEAR")
+# У «похожих» в ответе только id, названия и постер, и каждый дополняется
+# карточкой фильма — запросом из суточной квоты на холодном кэше. Потолок по
+# умолчанию держит цену одного вызова в 13 запросах.
+DEFAULT_SIMILAR_LIMIT = 12
+MAX_SIMILAR_LIMIT = 20
+# Карточек в одном `briefs`: лента просит их порциями по мере прокрутки.
+MAX_BRIEF_IDS = 20
+# Карточки фильмов пачкой идут параллельно. Лимит эндпоинта карточки — общий,
+# 25 запросов в секунду; четырёх потоков хватает с запасом.
+DETAIL_WORKERS = 4
 
 # Технический хвост в именах раздач: до него — название, после — мусор релиза.
 NOISE_WORDS = {
@@ -630,6 +648,7 @@ class KinopoiskMeta:
     FILMS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films"
     PREMIERES_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/premieres"
     FILTERS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/filters"
+    SIMILARS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/{film_id}/similars"
     QUOTA_URL = "https://kinopoiskapiunofficial.tech/api/v1/api_keys/{api_key}"
 
     def __init__(self, api_key: str) -> None:
@@ -730,6 +749,19 @@ class KinopoiskMeta:
         payload = self._get(self.FILTERS_URL)
         return payload if isinstance(payload, dict) else {}
 
+    def similars(self, film_id: int) -> list[dict[str, Any]]:
+        """«Похожие» Кинопоиска.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+
+        Returns:
+            Элементы в порядке каталога. В элементе только `filmId`, названия,
+            постер и `relationType` — ни страны, ни жанров, ни оценки.
+        """
+        payload = self._get(self.SIMILARS_URL.format(film_id=film_id))
+        return _items(payload)
+
     def quota(self) -> dict[str, Any]:
         """Остаток квоты ключа — бесплатный способ узнать её до платных вызовов.
 
@@ -744,6 +776,70 @@ def _items(payload: Any) -> list[dict[str, Any]]:
     """Список `items` из ответа каталога; у всех списочных ответов он такой."""
     items = payload.get("items") if isinstance(payload, dict) else None
     return [item for item in items or [] if isinstance(item, dict)]
+
+
+def catalog_card(item: dict[str, Any], details: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Расширенная карточка для ленты «Что смотреть».
+
+    Первые десять полей — та же форма, что у `/catalog/popular` и полок
+    (`search_api.catalog_payload`): приложение разбирает их одним типом.
+    Дальше — то, чего в карточке полки нет: оценка IMDb, а когда известна
+    карточка фильма — число голосов, обложка, логотип и «о чём».
+
+    Ловушки ответов Кинопоиска здесь сглажены: `year` строкой в подборках и
+    числом в фильтре, `ratingImbd` с опечаткой в подборках, `filmId` вместо
+    `kinopoiskId` у «похожих». `year`, `rating` и `rating_imdb` — строки,
+    как у остальных карточек сервера.
+
+    Args:
+        item: Элемент списочного ответа (фильтр, подборка, «похожие»).
+        details: Ответ v2.2/films/{id}; его непустые поля главнее.
+
+    Returns:
+        Словарь карточки. `detailed` — пришла ли карточка фильма: без неё
+        пустые `tagline` и `backdrop_url` значат «не спрашивали», а не «нет».
+    """
+    extra = {key: value for key, value in (details or {}).items() if value not in (None, "", [])}
+    merged = {**item, **extra}
+    name = str(merged.get("nameRu") or merged.get("nameEn") or merged.get("nameOriginal") or "Без названия").strip()
+    original_name = str(merged.get("nameEn") or merged.get("nameOriginal") or "").strip()
+    year = str(merged.get("year") or "").strip()
+    length = merged.get("filmLength")
+    return {
+        "catalog_id": int(merged.get("kinopoiskId") or merged.get("filmId") or 0),
+        "name": name,
+        "original_name": original_name if original_name.casefold() != name.casefold() else "",
+        "media_type": str(merged.get("type") or "UNKNOWN"),
+        "year": year,
+        "rating": _rating_text(merged.get("ratingKinopoisk")),
+        "countries": [
+            str(entry.get("country"))
+            for entry in merged.get("countries", []) or []
+            if isinstance(entry, dict) and entry.get("country")
+        ],
+        "genres": [
+            str(entry.get("genre"))
+            for entry in merged.get("genres", []) or []
+            if isinstance(entry, dict) and entry.get("genre")
+        ],
+        "poster_url": _https(str(merged.get("posterUrlPreview") or merged.get("posterUrl") or "")),
+        "search_query": " ".join(part for part in (name, year) if part).strip(),
+        "rating_imdb": _rating_text(merged.get("ratingImdb") or merged.get("ratingImbd")),
+        "votes": int(merged.get("ratingKinopoiskVoteCount") or 0),
+        "tagline": str(merged.get("shortDescription") or "").strip(),
+        "overview": str(merged.get("description") or "").strip(),
+        "backdrop_url": _https(str(merged.get("coverUrl") or "")),
+        "logo_url": _https(str(merged.get("logoUrl") or "")),
+        "duration_minutes": int(length) if isinstance(length, int) else 0,
+        "detailed": bool(details),
+    }
+
+
+def _rating_text(value: Any) -> str:
+    """Оценка строкой, как у остальных карточек сервера; нет оценки — пустая строка."""
+    if value in (None, "", 0):
+        return ""
+    return str(value).strip()
 
 
 class TMDBStills:
@@ -1131,9 +1227,21 @@ class MetaService:
 
     def genres(self) -> list[dict[str, Any]]:
         """Справочник жанров каталога: числовые id для фильтра по жанру."""
+        return self._directory("genres")
+
+    def countries(self) -> list[dict[str, Any]]:
+        """Справочник стран каталога: числовые id для фильтра по стране."""
+        return self._directory("countries")
+
+    def _directory(self, kind: str) -> list[dict[str, Any]]:
+        """Справочник `genres` или `countries` из v2.2/films/filters.
+
+        Оба приходят одним ответом и кэшируются разом: иначе второй
+        справочник стоил бы второго запроса из той же суточной квоты.
+        """
         if self.kinopoisk is None:
             return []
-        cached = self.cache.get("filters:genres")
+        cached = self.cache.get(f"filters:{kind}")
         if cached is not None:
             return cached
         try:
@@ -1141,15 +1249,19 @@ class MetaService:
         except CatalogLimitError:
             raise
         except Exception:
-            LOG.warning("Не получилось прочитать справочник жанров", exc_info=True)
+            LOG.warning("Не получилось прочитать справочник жанров и стран", exc_info=True)
             return []
-        genres = [
-            {"id": int(entry["id"]), "genre": str(entry.get("genre") or "")}
-            for entry in payload.get("genres", []) or []
-            if isinstance(entry, dict) and str(entry.get("id") or "").isdigit() and entry.get("genre")
-        ]
-        self.cache.put("filters:genres", genres)
-        return genres
+        wanted: list[dict[str, Any]] = []
+        for name, field_name in (("genres", "genre"), ("countries", "country")):
+            entries = [
+                {"id": int(entry["id"]), field_name: str(entry.get(field_name) or "")}
+                for entry in payload.get(name, []) or []
+                if isinstance(entry, dict) and str(entry.get("id") or "").isdigit() and entry.get(field_name)
+            ]
+            self.cache.put(f"filters:{name}", entries)
+            if name == kind:
+                wanted = entries
+        return wanted
 
     def genre_id(self, name: str) -> int | None:
         """Числовой id жанра по русскому названию; без него фильтр не работает."""
@@ -1158,6 +1270,174 @@ class MetaService:
             (entry["id"] for entry in self.genres() if str(entry["genre"]).casefold() == wanted),
             None,
         )
+
+    def country_id(self, name: str) -> int | None:
+        """Числовой id страны по русскому названию, как в карточке: «США», «Корея Южная»."""
+        wanted = name.strip().casefold()
+        return next(
+            (entry["id"] for entry in self.countries() if str(entry["country"]).casefold() == wanted),
+            None,
+        )
+
+    def discover(
+        self,
+        media_type: str = "ALL",
+        genre: str = "",
+        country: str = "",
+        year_from: int | None = None,
+        year_to: int | None = None,
+        rating_from: float | None = None,
+        order: str = "NUM_VOTE",
+        page: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Подбор по фильтру каталога — лента «Что смотреть» в KinoApp.
+
+        В отличие от полок жанра и года, по умолчанию идёт по числу голосов.
+        Сортировка по оценке без порога голосов поднимает наверх то, что
+        оценили двадцать человек: живьём 23.09.2026 первые двадцать фильмов
+        2025–2026 по оценке оказались короткометражками, «фильмами о фильме»
+        и спортивной документалкой. По голосам сверху — то, что смотрели.
+
+        Страна — главный рычаг: без неё верх новинок по голосам занят тем, за
+        что голосует аудитория Кинопоиска. Живьём все двадцать сериалов
+        2024–2026 на первой странице оказались российскими, а с `country=США`
+        первая страница — «Сёгун», «Фоллаут» и «Питт».
+
+        Args:
+            media_type: `ALL`, `FILM`, `TV_SERIES`, `MINI_SERIES` или `TV_SHOW`.
+            genre: Жанр по-русски, как в карточке; пусто — любой.
+            country: Страна по-русски, как в карточке; пусто — любая.
+            year_from: Нижняя граница года.
+            year_to: Верхняя граница года.
+            rating_from: Порог оценки Кинопоиска.
+            order: `NUM_VOTE`, `RATING` или `YEAR`.
+            page: Страница, с 1.
+
+        Returns:
+            Расширенные карточки (`catalog_card`) без полей карточки фильма.
+
+        Raises:
+            ValueError: Незнакомые каталогу тип, порядок, жанр или страна.
+            CatalogLimitError: Квота каталога исчерпана.
+        """
+        if self.kinopoisk is None:
+            return []
+        kind = media_type.strip().upper() or "ALL"
+        if kind not in DISCOVER_TYPES:
+            raise ValueError(f"Неизвестный тип «{media_type}»")
+        sort = order.strip().upper() or "NUM_VOTE"
+        if sort not in DISCOVER_ORDERS:
+            raise ValueError(f"Неизвестный порядок «{order}»")
+        params: dict[str, Any] = {"order": sort, "page": min(max(page, 1), MAX_FILTER_PAGE)}
+        if kind != "ALL":
+            params["type"] = kind
+        if genre.strip():
+            genre_id = self.genre_id(genre)
+            if genre_id is None:
+                raise ValueError(f"Каталог не знает жанра «{genre.strip()}»")
+            params["genres"] = genre_id
+        if country.strip():
+            country_id = self.country_id(country)
+            if country_id is None:
+                raise ValueError(f"Каталог не знает страны «{country.strip()}»")
+            params["countries"] = country_id
+        if year_from:
+            params["yearFrom"] = year_from
+        if year_to:
+            params["yearTo"] = year_to
+        if rating_from is not None:
+            params["ratingFrom"] = rating_from
+        # Ключ — сами параметры запроса: по ним одна выдача отличается от другой
+        cache_key = "discover:" + json.dumps(params, sort_keys=True, ensure_ascii=False)
+        cached = self.shelf_cache.get(cache_key)
+        if cached is None:
+            cached = self.kinopoisk.films(params)
+            self.shelf_cache.put(cache_key, cached)
+        return [catalog_card(item) for item in cached]
+
+    def similar(self, film_id: int, limit: int = DEFAULT_SIMILAR_LIMIT) -> list[dict[str, Any]]:
+        """«Похожие» Кинопоиска — каждый с карточкой фильма.
+
+        У самих «похожих» в элементе нет ни страны, ни жанров, ни оценки, а
+        без страны приложение не может отсеять то, чего не смотрит. Поэтому
+        каждый дополняется карточкой v2.2/films/{id} — той же, что кэширует
+        страница тайтла, так что открытие похожего потом ничего не стоит.
+
+        Цена на холодном кэше — 1 + limit запросов, дальше 0 в течение 30 дней.
+
+        Args:
+            film_id: Тайтл, к которому ищем похожие.
+            limit: Сколько первых похожих отдать, 1…MAX_SIMILAR_LIMIT.
+
+        Returns:
+            Расширенные карточки в порядке каталога. Похожий, чья карточка не
+            пришла, остаётся с `detailed: false` и без страны.
+
+        Raises:
+            CatalogLimitError: Квота исчерпана раньше, чем пришёл список.
+        """
+        if self.kinopoisk is None or film_id <= 0:
+            return []
+        cache_key = f"similars:{film_id}"
+        items = self.cache.get(cache_key)
+        if items is None:
+            items = self.kinopoisk.similars(film_id)
+            self.cache.put(cache_key, items)
+        head = [item for item in items if str(item.get("filmId") or "").isdigit()]
+        head = head[: min(max(limit, 1), MAX_SIMILAR_LIMIT)]
+        details = self._films([int(item["filmId"]) for item in head])
+        return [catalog_card(item, details.get(int(item["filmId"]))) for item in head]
+
+    def briefs(self, film_ids: list[int]) -> list[dict[str, Any]]:
+        """Карточки для ленты: обложка, логотип и «о чём» пачкой.
+
+        Args:
+            film_ids: Идентификаторы Кинопоиска; дальше MAX_BRIEF_IDS не читаются.
+
+        Returns:
+            Расширенные карточки в порядке запроса. Тайтлов, которых каталог
+            не отдал, в ответе нет.
+
+        Raises:
+            CatalogLimitError: Квота исчерпана, и ни одной карточки нет в кэше.
+        """
+        if self.kinopoisk is None:
+            return []
+        wanted = list(dict.fromkeys(film_id for film_id in film_ids if film_id > 0))[:MAX_BRIEF_IDS]
+        details = self._films(wanted)
+        return [catalog_card(details[film_id], details[film_id]) for film_id in wanted if film_id in details]
+
+    def _films(self, film_ids: list[int]) -> dict[int, dict[str, Any]]:
+        """Карточки фильмов пачкой: кэш сразу, недостающие — параллельно.
+
+        Квота, кончившаяся посреди пачки, не роняет её целиком: что успели,
+        то и отдаём. CatalogLimitError поднимается, только если не нашлось
+        ни одной карточки — иначе пустой ответ выглядел бы «похожих нет».
+        """
+        found: dict[int, dict[str, Any]] = {}
+        missing: list[int] = []
+        for film_id in dict.fromkeys(film_ids):
+            cached = self.cache.get(f"film:{film_id}")
+            if cached:
+                found[film_id] = cached
+            else:
+                missing.append(film_id)
+        if not missing:
+            return found
+        limit_error: CatalogLimitError | None = None
+        with ThreadPoolExecutor(max_workers=min(DETAIL_WORKERS, len(missing))) as pool:
+            futures = {pool.submit(self._film, film_id): film_id for film_id in missing}
+            for future in as_completed(futures):
+                try:
+                    details = future.result()
+                except CatalogLimitError as exc:
+                    limit_error = exc
+                    continue
+                if details:
+                    found[futures[future]] = details
+        if limit_error is not None and not found:
+            raise limit_error
+        return found
 
     def quota(self) -> dict[str, Any]:
         """Остаток суточной квоты каталога — без кэша, иначе цифра врёт."""

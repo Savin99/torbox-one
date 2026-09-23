@@ -685,6 +685,239 @@ class GenreDirectoryTests(unittest.TestCase):
         service, _ = catalog_service({"films/filters": FILTERS_PAYLOAD})
         self.assertIsNone(service.genre_id("киберпанк"))
 
+    def test_genres_and_countries_share_one_request(self) -> None:
+        service, http = catalog_service({"films/filters": FILTERS_PAYLOAD})
+        self.assertEqual(service.genre_id("драма"), 8)
+        self.assertEqual(service.country_id("США"), 1)
+        # Оба справочника приходят одним ответом: второй из кэша, без запроса
+        self.assertEqual(len(http.calls), 1)
+
+    def test_unknown_country_has_no_id(self) -> None:
+        service, _ = catalog_service({"films/filters": FILTERS_PAYLOAD})
+        self.assertIsNone(service.country_id("Атлантида"))
+
+
+# Формы и значения — из живых ответов Кинопоиска 23.09.2026 (запросы с VPS):
+# у «похожих» в элементе нет ни страны, ни оценки, а у советского «Соляриса»
+# нет и оригинального названия.
+SIMILARS_PAYLOAD = {
+    "total": 3,
+    "items": [
+        {
+            "filmId": 1236063,
+            "nameRu": "Довод",
+            "nameEn": "Tenet",
+            "nameOriginal": "Tenet",
+            "posterUrl": "https://kinopoiskapiunofficial.tech/images/posters/kp/1236063.jpg",
+            "posterUrlPreview": "https://kinopoiskapiunofficial.tech/images/posters/kp_small/1236063.jpg",
+            "relationType": "SIMILAR",
+        },
+        {
+            "filmId": 43911,
+            "nameRu": "Солярис",
+            "nameEn": None,
+            "nameOriginal": None,
+            "posterUrl": "https://kinopoiskapiunofficial.tech/images/posters/kp/43911.jpg",
+            "posterUrlPreview": "https://kinopoiskapiunofficial.tech/images/posters/kp_small/43911.jpg",
+            "relationType": "SIMILAR",
+        },
+        {
+            "filmId": 718811,
+            "nameRu": "Прибытие",
+            "nameEn": "Arrival",
+            "nameOriginal": "Arrival",
+            "posterUrl": "https://kinopoiskapiunofficial.tech/images/posters/kp/718811.jpg",
+            "posterUrlPreview": "https://kinopoiskapiunofficial.tech/images/posters/kp_small/718811.jpg",
+            "relationType": "SIMILAR",
+        },
+    ],
+}
+
+TENET_FILM_PAYLOAD = {
+    "kinopoiskId": 1236063,
+    "imdbId": "tt6723592",
+    "nameRu": "Довод",
+    "nameEn": None,
+    "nameOriginal": "Tenet",
+    "posterUrl": "https://kinopoiskapiunofficial.tech/images/posters/kp/1236063.jpg",
+    "posterUrlPreview": "https://kinopoiskapiunofficial.tech/images/posters/kp_small/1236063.jpg",
+    "coverUrl": "https://avatars.mds.yandex.net/get-ott/1531675/2a0000017c2d2fe7c91f8b446084b299d7a2/orig",
+    "logoUrl": "https://avatars.mds.yandex.net/get-ott/239697/2a000001806006ba05ae72483e16dd65706b/orig",
+    "ratingKinopoisk": 7.5,
+    "ratingKinopoiskVoteCount": 592560,
+    "ratingImdb": 7.3,
+    "year": 2020,
+    "filmLength": 150,
+    "shortDescription": "«Не пытайся понять — почувствуй» Виртуозный фантастический боевик Кристофера Нолана",
+    "description": "После теракта в киевском оперном театре агент ЦРУ объединяется с британской разведкой.",
+    "type": "FILM",
+    "countries": [{"country": "США"}, {"country": "Великобритания"}],
+    "genres": [{"genre": "фантастика"}, {"genre": "боевик"}, {"genre": "триллер"}],
+}
+
+SOLARIS_FILM_PAYLOAD = {
+    "kinopoiskId": 43911,
+    "nameRu": "Солярис",
+    "nameEn": None,
+    "nameOriginal": None,
+    "posterUrl": "https://kinopoiskapiunofficial.tech/images/posters/kp/43911.jpg",
+    "posterUrlPreview": "https://kinopoiskapiunofficial.tech/images/posters/kp_small/43911.jpg",
+    "coverUrl": None,
+    "logoUrl": None,
+    "ratingKinopoisk": 7.8,
+    "ratingImdb": 8.0,
+    "year": 1972,
+    "filmLength": 169,
+    "shortDescription": None,
+    "type": "FILM",
+    "countries": [{"country": "СССР"}],
+    "genres": [{"genre": "драма"}, {"genre": "фантастика"}],
+}
+
+
+def similar_routes() -> dict[str, Any]:
+    # Порядок ключей важен: FakeHttp берёт первый ключ, входящий в адрес,
+    # а адрес «похожих» содержит в себе адрес карточки фильма
+    return {
+        "films/258687/similars": SIMILARS_PAYLOAD,
+        "api/v2.2/films/1236063": TENET_FILM_PAYLOAD,
+        "api/v2.2/films/43911": SOLARIS_FILM_PAYLOAD,
+    }
+
+
+class DiscoverTests(unittest.TestCase):
+    def test_discover_goes_by_votes_with_every_filter(self) -> None:
+        service, http = catalog_service({"films/filters": FILTERS_PAYLOAD, "api/v2.2/films": FILTER_PAYLOAD})
+        service.discover(
+            media_type="tv_series", genre="Драма", country="США",
+            year_from=2024, year_to=2026, rating_from=7.5, page=2,
+        )
+        self.assertEqual(
+            http.calls[-1][1],
+            {
+                "order": "NUM_VOTE", "page": 2, "type": "TV_SERIES", "genres": 8, "countries": 1,
+                "yearFrom": 2024, "yearTo": 2026, "ratingFrom": 7.5,
+            },
+        )
+
+    def test_default_is_every_type_by_votes(self) -> None:
+        service, http = catalog_service({"api/v2.2/films": FILTER_PAYLOAD})
+        service.discover()
+        # Ни типа, ни порога: фильтр получает ровно то, что задано
+        self.assertEqual(http.calls[-1][1], {"order": "NUM_VOTE", "page": 1})
+
+    def test_card_carries_imdb_rating_as_a_string(self) -> None:
+        service, _ = catalog_service({"api/v2.2/films": FILTER_PAYLOAD})
+        [card] = service.discover(media_type="FILM")
+        self.assertEqual(card["catalog_id"], 555)
+        self.assertEqual(card["year"], "1994")
+        self.assertEqual(card["rating"], "9.1")
+        self.assertEqual(card["rating_imdb"], "9.3")
+        self.assertEqual(card["countries"], ["США"])
+        self.assertFalse(card["detailed"])
+        self.assertEqual(card["tagline"], "")
+
+    def test_unknown_values_are_reported(self) -> None:
+        service, _ = catalog_service({"films/filters": FILTERS_PAYLOAD})
+        for kwargs in ({"country": "Атлантида"}, {"genre": "киберпанк"}, {"media_type": "CARTOON"}, {"order": "RANDOM"}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                service.discover(**kwargs)
+
+    def test_discover_is_cached_by_its_parameters(self) -> None:
+        service, http = catalog_service({"api/v2.2/films": FILTER_PAYLOAD})
+        service.discover(media_type="FILM", year_from=2025)
+        service.discover(media_type="FILM", year_from=2025)
+        self.assertEqual(len(http.calls), 1)
+        service.discover(media_type="FILM", year_from=2024)
+        self.assertEqual(len(http.calls), 2)
+
+    def test_page_is_clamped(self) -> None:
+        service, http = catalog_service({"api/v2.2/films": FILTER_PAYLOAD})
+        service.discover(page=999)
+        self.assertEqual(http.calls[-1][1]["page"], meta_service.MAX_FILTER_PAGE)
+
+
+class SimilarTests(unittest.TestCase):
+    def test_each_similar_gets_country_and_cover_from_its_film_card(self) -> None:
+        service, _ = catalog_service(similar_routes())
+        tenet, solaris, arrival = service.similar(258687)
+        self.assertEqual(tenet["countries"], ["США", "Великобритания"])
+        self.assertEqual(tenet["rating_imdb"], "7.3")
+        self.assertEqual(tenet["votes"], 592560)
+        self.assertEqual(tenet["duration_minutes"], 150)
+        self.assertTrue(tenet["backdrop_url"].startswith("https://avatars.mds.yandex.net/"))
+        self.assertTrue(tenet["tagline"].startswith("«Не пытайся понять"))
+        self.assertTrue(tenet["detailed"])
+        self.assertEqual(solaris["countries"], ["СССР"])
+        # Пустые поля карточки фильма не затирают элемент «похожих»
+        self.assertEqual(solaris["name"], "Солярис")
+        self.assertEqual(solaris["backdrop_url"], "")
+        # Карточка «Прибытия» не пришла: похожий остаётся, но без страны
+        self.assertFalse(arrival["detailed"])
+        self.assertEqual(arrival["countries"], [])
+        self.assertEqual(arrival["name"], "Прибытие")
+
+    def test_limit_keeps_the_head_of_the_list(self) -> None:
+        service, http = catalog_service(similar_routes())
+        cards = service.similar(258687, limit=1)
+        self.assertEqual([card["catalog_id"] for card in cards], [1236063])
+        # Список похожих и одна карточка — и больше ни одного запроса
+        self.assertEqual(len(http.calls), 2)
+
+    def test_similars_and_film_cards_are_cached(self) -> None:
+        service, http = catalog_service(similar_routes())
+        service.similar(258687, limit=2)
+        calls = len(http.calls)
+        service.similar(258687, limit=2)
+        self.assertEqual(len(http.calls), calls)
+
+    def test_quota_with_nothing_in_cache_is_an_error(self) -> None:
+        service, _ = catalog_service(similar_routes(), status=402)
+        with self.assertRaises(meta_service.CatalogLimitError):
+            service.similar(258687)
+
+
+class BriefsTests(unittest.TestCase):
+    def test_briefs_keep_request_order_and_skip_the_missing(self) -> None:
+        service, _ = catalog_service(similar_routes())
+        cards = service.briefs([43911, 999, 1236063, 43911])
+        self.assertEqual([card["catalog_id"] for card in cards], [43911, 1236063])
+        self.assertTrue(all(card["detailed"] for card in cards))
+
+    def test_briefs_have_a_ceiling(self) -> None:
+        service, http = catalog_service({})
+        service.briefs(list(range(1, 100)))
+        self.assertEqual(len(http.calls), meta_service.MAX_BRIEF_IDS)
+
+    def test_brief_from_cache_costs_nothing(self) -> None:
+        service, http = catalog_service(similar_routes())
+        service.briefs([1236063])
+        service.briefs([1236063])
+        self.assertEqual(len(http.calls), 1)
+
+
+class CatalogCardTests(unittest.TestCase):
+    def test_collection_item_with_the_imdb_typo(self) -> None:
+        card = meta_service.catalog_card(COLLECTION_PAYLOAD["items"][0])
+        self.assertEqual(card["rating_imdb"], "8.7")
+        self.assertEqual(card["original_name"], "The Matrix")
+        self.assertTrue(card["poster_url"].startswith("https://"))
+
+    def test_same_first_fields_as_a_shelf_card(self) -> None:
+        card = meta_service.catalog_card(FILTER_PAYLOAD["items"][0])
+        # Форма `/catalog/popular` — приложение разбирает обе одним типом
+        for key in ("catalog_id", "name", "original_name", "media_type", "year", "rating",
+                    "countries", "genres", "poster_url", "search_query"):
+            self.assertIn(key, card)
+        self.assertEqual(card["search_query"], "Побег из Шоушенка 1994")
+
+    def test_missing_rating_is_an_empty_string(self) -> None:
+        card = meta_service.catalog_card({"kinopoiskId": 1, "nameRu": "Премьера", "ratingKinopoisk": None})
+        self.assertEqual(card["rating"], "")
+        self.assertEqual(card["rating_imdb"], "")
+        self.assertEqual(card["votes"], 0)
+        self.assertEqual(card["duration_minutes"], 0)
+
 
 class RealTrackerNamesTests(unittest.TestCase):
     """Имена сняты живьём с NNM-Club и Prowlarr 21.09.2026. Это публичные

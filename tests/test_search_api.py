@@ -13,6 +13,7 @@ import time
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import bencodepy
 from fastapi import HTTPException
@@ -687,6 +688,71 @@ class CatalogEndpointTests(unittest.TestCase):
 
     def test_other_catalog_errors_stay_502(self) -> None:
         self.assertEqual(search_api.catalog_error(RuntimeError("сеть")).status_code, 502)
+
+
+class DiscoverMeta(FakeMeta):
+    """Каталог для маршрутов ленты: запоминает, с чем его позвали."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        super().__init__(None)
+        self.error = error
+        self.calls: list[tuple[str, Any]] = []
+
+    def _answer(self, name: str, value: Any) -> list[dict[str, Any]]:
+        self.calls.append((name, value))
+        if self.error is not None:
+            raise self.error
+        return [{"catalog_id": 1, "detailed": name != "discover"}]
+
+    def discover(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._answer("discover", kwargs)
+
+    def similar(self, film_id: int, limit: int) -> list[dict[str, Any]]:
+        return self._answer("similar", (film_id, limit))
+
+    def briefs(self, film_ids: list[int]) -> list[dict[str, Any]]:
+        return self._answer("briefs", film_ids)
+
+
+class DiscoverEndpointTests(unittest.TestCase):
+    def test_discover_passes_every_filter_through(self) -> None:
+        meta = DiscoverMeta()
+        with meta_replaced(meta):
+            search_api.catalog_discover(
+                media_type="FILM", genre="драма", country="США", year_from=2025,
+                year_to=2026, rating_from=7.0, order="NUM_VOTE", page=2,
+            )
+        self.assertEqual(
+            meta.calls,
+            [("discover", {
+                "media_type": "FILM", "genre": "драма", "country": "США", "year_from": 2025,
+                "year_to": 2026, "rating_from": 7.0, "order": "NUM_VOTE", "page": 2,
+            })],
+        )
+
+    def test_unknown_country_is_404(self) -> None:
+        with meta_replaced(DiscoverMeta(ValueError("Каталог не знает страны «Атлантида»"))):
+            with self.assertRaises(HTTPException) as ctx:
+                search_api.catalog_discover(country="Атлантида")
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_quota_on_similar_is_429(self) -> None:
+        with meta_replaced(DiscoverMeta(meta_service.CatalogLimitError("квота"))):
+            with self.assertRaises(HTTPException) as ctx:
+                search_api.catalog_similar(258687, limit=12)
+        self.assertEqual(ctx.exception.status_code, 429)
+
+    def test_briefs_take_ids_from_the_body(self) -> None:
+        meta = DiscoverMeta()
+        with meta_replaced(meta):
+            cards = search_api.catalog_briefs(search_api.BriefRequest(ids=[301, 258687]))
+        self.assertEqual(meta.calls, [("briefs", [301, 258687])])
+        self.assertTrue(cards[0]["detailed"])
+
+    def test_discover_route_reads_the_type_parameter(self) -> None:
+        # Параметр в адресе — `type`, а имя в Python другое: `type` занят встроенным
+        parameters = search_api.app.openapi()["paths"]["/catalog/discover"]["get"]["parameters"]
+        self.assertIn("type", [parameter["name"] for parameter in parameters])
 
 
 class SourceStatusTests(unittest.TestCase):

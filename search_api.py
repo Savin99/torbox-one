@@ -57,7 +57,7 @@ def configure_logging() -> None:
 
 configure_logging()
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 import meta_service
@@ -65,7 +65,7 @@ import torbox_tg_bot as bot
 
 LOG = logging.getLogger("search_api")
 
-API_VERSION = "1.1"
+API_VERSION = "1.2"
 API_TOKEN = os.getenv("SEARCH_API_TOKEN", "").strip()
 RESULTS_TTL_SECONDS = 3600
 MAX_APP_RESULTS = bot.MAX_RESULTS
@@ -656,6 +656,12 @@ class HashRequest(BaseModel):
     deadline: float | None = None
 
 
+class BriefRequest(BaseModel):
+    """Тайтлы, которым лента «Что смотреть» просит обложку, логотип и «о чём»."""
+
+    ids: list[int] = Field(default_factory=list)
+
+
 class HashResult(BaseModel):
     """Ответ `/release/hashes`: хэш или None на каждый обработанный релиз."""
 
@@ -927,6 +933,92 @@ def catalog_shelf(kind: str, page: int = 1) -> list[dict[str, Any]]:
         return [catalog_payload(title) for title in META.shelf(kind, page)]
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise catalog_error(exc) from exc
+
+
+@app.get("/catalog/discover", dependencies=[Depends(require_token)])
+def catalog_discover(
+    media_type: str = Query("ALL", alias="type"),
+    genre: str = "",
+    country: str = "",
+    year_from: int | None = None,
+    year_to: int | None = None,
+    rating_from: float | None = None,
+    order: str = "NUM_VOTE",
+    page: int = 1,
+) -> list[dict[str, Any]]:
+    """Подбор по фильтру каталога для ленты «Что смотреть».
+
+    Args:
+        media_type: Параметр `type`: `ALL`, `FILM`, `TV_SERIES`, `MINI_SERIES`, `TV_SHOW`.
+        genre: Жанр по-русски, как в карточке.
+        country: Страна по-русски, как в карточке.
+        year_from: Нижняя граница года.
+        year_to: Верхняя граница года.
+        rating_from: Порог оценки Кинопоиска.
+        order: `NUM_VOTE` (по умолчанию), `RATING` или `YEAR`.
+        page: Страница выдачи, начиная с 1.
+
+    Returns:
+        Расширенные карточки: форма полки плюс `rating_imdb`. Полей карточки
+        фильма здесь нет (`detailed: false`) — их просят через `/catalog/briefs`.
+    """
+    if not META.available:
+        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+    try:
+        return META.discover(
+            media_type=media_type,
+            genre=genre,
+            country=country,
+            year_from=year_from,
+            year_to=year_to,
+            rating_from=rating_from,
+            order=order,
+            page=page,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise catalog_error(exc) from exc
+
+
+@app.get("/catalog/similar/{kp_id}", dependencies=[Depends(require_token)])
+def catalog_similar(kp_id: int, limit: int = meta_service.DEFAULT_SIMILAR_LIMIT) -> list[dict[str, Any]]:
+    """«Похожие» Кинопоиска, каждый с карточкой фильма: страна, жанры, оценки, обложка.
+
+    Args:
+        kp_id: Тайтл, к которому ищем похожие.
+        limit: Сколько первых похожих отдать; каждый стоит запроса карточки
+            на холодном кэше.
+
+    Returns:
+        Расширенные карточки в порядке каталога.
+    """
+    if not META.available:
+        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+    try:
+        return META.similar(kp_id, limit)
+    except Exception as exc:
+        raise catalog_error(exc) from exc
+
+
+@app.post("/catalog/briefs", dependencies=[Depends(require_token)])
+def catalog_briefs(request: BriefRequest) -> list[dict[str, Any]]:
+    """Обложка, логотип и «о чём» для карточек ленты — пачкой.
+
+    Args:
+        request: Идентификаторы Кинопоиска; читаются первые
+            `meta_service.MAX_BRIEF_IDS`, лишние просто не попадают в ответ.
+
+    Returns:
+        Расширенные карточки с `detailed: true` в порядке запроса; тайтлов,
+        которых каталог не отдал, в ответе нет.
+    """
+    if not META.available:
+        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+    try:
+        return META.briefs(request.ids)
     except Exception as exc:
         raise catalog_error(exc) from exc
 
