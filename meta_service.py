@@ -33,6 +33,17 @@ STATE_DIR = Path(os.getenv("SEARCH_API_STATE_DIR", "").strip() or ".")
 CACHE_TTL_SECONDS = 30 * 24 * 3600
 CACHE_PATH = Path(os.getenv("META_CACHE_PATH", "").strip() or STATE_DIR / "meta_cache.json")
 
+# Состав сезонов идущего сериала меняется каждую неделю: выходит серия, у
+# заглушки появляются дата и название. С 30-дневным сроком карточки сервер
+# месяц не видел бы ни новой строки, ни исправления Кинопоиска, а KinoApp
+# держит серии сутки и ждёт строку раз в неделю. Поэтому идущий последний
+# сезон (`season_is_airing`) перечитывается раз в сутки, завершённые — как
+# прежде, раз в 30 дней.
+SEASONS_AIRING_TTL_SECONDS = 24 * 3600
+# «Недавно вышла»: четыре недельных цикла после даты серии. Дальше сезон
+# считается завершённым, и его поправки подхватит обычный 30-дневный срок.
+SEASON_RECENT_DAYS = 28
+
 # Полки живут отдельным кэшем: топы и премьеры меняются за сутки, а карточка
 # фильма — нет. Один TTL на оба не подобрать, поэтому и файла два.
 SHELF_TTL_SECONDS = 12 * 3600
@@ -206,6 +217,21 @@ class TTLCache:
         self._load()
 
     def get(self, key: str) -> Any | None:
+        found = self.entry(key)
+        return None if found is None else found[1]
+
+    def entry(self, key: str) -> tuple[float, Any] | None:
+        """Значение вместе с моментом записи.
+
+        Для записей, чей срок зависит от содержимого: общий TTL кэша остаётся
+        верхней границей, а перечитать раньше решает вызывающий.
+
+        Args:
+            key: Ключ записи.
+
+        Returns:
+            Пару «момент записи по time.time(), значение» или None.
+        """
         with self._lock:
             entry = self._items.get(key)
             if entry is None:
@@ -214,7 +240,7 @@ class TTLCache:
             if time.time() - stamp > self._ttl:
                 del self._items[key]
                 return None
-            return value
+            return stamp, value
 
     def put(self, key: str, value: Any) -> None:
         with self._lock:
@@ -919,6 +945,52 @@ def resolve_tmdb_library_id(imdb_id: str, expected_type: str) -> tuple[int | Non
         return None, None
 
 
+def season_is_airing(seasons: Any, today: datetime.date | None = None) -> bool:
+    """Идёт ли последний сезон: тогда его состав перечитывается раз в сутки.
+
+    Сезон идёт, если у него нет серий вовсе или есть серия без даты, с датой
+    в будущем, вышедшая за последние SEASON_RECENT_DAYS дней либо с
+    датой-заглушкой. Заглушка — 1 января у двух и больше серий сезона. Так
+    живьём 23.09.2026 выглядел 4 сезон «Теда Лассо» у самого Кинопоиска: у
+    всех десяти серий 2026-01-01 и имена «Episode #4.N», хотя по TMDB серии
+    выходят еженедельно с 4 августа. Одна серия 1 января бывает и настоящей
+    (новогодний выпуск), её заглушкой не считаем.
+
+    Args:
+        seasons: Элементы `items` ответа v2.2/films/{id}/seasons.
+        today: Сегодняшняя дата; по умолчанию — по часам сервера.
+
+    Returns:
+        True, если последний сезон ещё может измениться.
+    """
+    items = [item for item in seasons if isinstance(item, dict)] if isinstance(seasons, list) else []
+    if not items:
+        return False
+    last = max(items, key=lambda item: item.get("number") if isinstance(item.get("number"), int) else 0)
+    episodes = [item for item in last.get("episodes") or [] if isinstance(item, dict)]
+    if not episodes:
+        return True
+    dates = [_release_date(episode.get("releaseDate")) for episode in episodes]
+    recent = (today or datetime.date.today()) - datetime.timedelta(days=SEASON_RECENT_DAYS)
+    if any(date is None or date > recent for date in dates):
+        return True
+    new_year = [date for date in dates if date is not None and (date.month, date.day) == (1, 1)]
+    return any(new_year.count(date) >= 2 for date in set(new_year))
+
+
+def _release_date(value: Any) -> datetime.date | None:
+    """Дата серии из `releaseDate`; нет её или она не разбирается — None."""
+    try:
+        return datetime.date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return None
+
+
+def _seasons_fresh(stamp: float, seasons: Any) -> bool:
+    """Свежа ли запись сезонов: у идущего срок — сутки, у завершённого — общий TTL кэша."""
+    return not season_is_airing(seasons) or time.time() - stamp <= SEASONS_AIRING_TTL_SECONDS
+
+
 class MetaService:
     """Фасад: имя раздачи → карточка и серии, всё с кэшем."""
 
@@ -933,6 +1005,8 @@ class MetaService:
         self.tmdb = tmdb
         self.cache = cache or TTLCache()
         self.shelf_cache = shelf_cache or TTLCache(SHELF_CACHE_PATH, SHELF_TTL_SECONDS)
+        self._locks_guard = threading.Lock()
+        self._seasons_locks: dict[int, threading.Lock] = {}
 
     @property
     def available(self) -> bool:
@@ -1098,19 +1172,50 @@ class MetaService:
         return len(seasons)
 
     def _seasons(self, film_id: int) -> list[dict[str, Any]]:
+        """Сезоны и серии тайтла из каталога, с кэшем по состоянию сезона.
+
+        Завершённый сериал держится 30 дней, как карточка, идущий последний
+        сезон (`season_is_airing`) — сутки. Срок решается при чтении, по
+        содержимому, поэтому записи прежней версии, положенные на 30 дней,
+        перечитываются так же.
+
+        Перечитывает один поток: KinoApp спрашивает карточку и серии тайтла в
+        одну секунду, и без замка в каталог пошли бы оба. Не вышло перечитать
+        — квота, сеть — остаётся прежний ответ: устаревший состав сезонов
+        лучше карточки без сезонов.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+
+        Returns:
+            Элементы `items` ответа v2.2/films/{id}/seasons; у фильма пусто.
+        """
         if not film_id or self.kinopoisk is None:
             return []
         cache_key = f"seasons:{film_id}"
-        cached = self.cache.get(cache_key)
-        if cached is not None:
-            return cached
-        try:
-            seasons = self.kinopoisk.seasons(film_id)
-        except Exception:
-            LOG.warning("Не получилось прочитать сезоны %s", film_id, exc_info=True)
-            return []
-        self.cache.put(cache_key, seasons)
-        return seasons
+        entry = self.cache.entry(cache_key)
+        if entry is not None and _seasons_fresh(*entry):
+            return entry[1]
+        with self._seasons_lock(film_id):
+            # Пока ждали замок, соседний запрос мог уже перечитать
+            entry = self.cache.entry(cache_key)
+            if entry is not None and _seasons_fresh(*entry):
+                return entry[1]
+            try:
+                seasons = self.kinopoisk.seasons(film_id)
+            except Exception:
+                if entry is None:
+                    LOG.warning("Не получилось прочитать сезоны %s", film_id, exc_info=True)
+                    return []
+                LOG.warning("Не получилось перечитать сезоны %s, отдаю прежние", film_id, exc_info=True)
+                return entry[1]
+            self.cache.put(cache_key, seasons)
+            return seasons
+
+    def _seasons_lock(self, film_id: int) -> threading.Lock:
+        """Замок на тайтл: состав его сезонов перечитывает один поток."""
+        with self._locks_guard:
+            return self._seasons_locks.setdefault(film_id, threading.Lock())
 
     def title_card(self, film_id: int) -> TitleCard:
         """Карточка тайтла по идентификатору каталога.

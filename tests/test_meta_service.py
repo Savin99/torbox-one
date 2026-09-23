@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
 import json
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Iterator
@@ -222,6 +224,16 @@ class TTLCacheTests(unittest.TestCase):
         self.assertIsNone(cache.get("key"))
         cache.put("key", "value")
         self.assertEqual(json.loads(path.read_text())["key"]["value"], "value")
+
+    def test_entry_carries_the_moment_of_writing(self) -> None:
+        cache = meta_service.TTLCache(path=Path(tempfile.mkdtemp()) / "cache.json")
+        before = time.time()
+        cache.put("key", [1, 2])
+        found = cache.entry("key")
+        assert found is not None
+        self.assertGreaterEqual(found[0], before)
+        self.assertEqual(found[1], [1, 2])
+        self.assertIsNone(cache.entry("missing"))
 
 
 if __name__ == "__main__":
@@ -672,6 +684,167 @@ class TitleCardTests(unittest.TestCase):
     def test_unknown_title_is_not_matched(self) -> None:
         service, _ = catalog_service({})
         self.assertFalse(service.title_card(999).meta.matched)
+
+
+DAY = 24 * 3600
+TODAY = datetime.date(2026, 9, 23)
+
+
+def season(number: int, *dates: str | None) -> dict[str, Any]:
+    """Сезон в форме ответа v2.2/films/{id}/seasons: по серии на каждую дату."""
+    return {
+        "number": number,
+        "episodes": [
+            {"seasonNumber": number, "episodeNumber": index, "nameEn": f"Episode #{number}.{index}", "releaseDate": date}
+            for index, date in enumerate(dates, start=1)
+        ],
+    }
+
+
+# 4 сезон «Теда Лассо», каким его отдавал Кинопоиск живьём 23.09.2026
+TED_LASSO_PLACEHOLDER = [season(3, "2023-03-15", "2023-05-31"), season(4, *["2026-01-01"] * 10)]
+FINISHED = [season(1, "2020-08-14", "2020-10-02"), season(3, "2023-03-15", "2023-05-31")]
+
+
+class SeasonIsAiringTests(unittest.TestCase):
+    """Какой состав сезонов перечитывать раз в сутки, а какой держать 30 дней.
+
+    Случаи — из кэша боевого сервера на 23.09.2026: правило пометило 3
+    сериала из 9, ровно эти три.
+    """
+
+    def airing(self, *seasons: dict[str, Any]) -> bool:
+        return meta_service.season_is_airing(list(seasons), today=TODAY)
+
+    def test_finished_season_is_not_airing(self) -> None:
+        self.assertFalse(meta_service.season_is_airing(FINISHED, today=TODAY))
+
+    def test_new_year_placeholder_is_airing(self) -> None:
+        self.assertTrue(meta_service.season_is_airing(TED_LASSO_PLACEHOLDER, today=TODAY))
+
+    def test_single_real_new_year_episode_is_not_a_placeholder(self) -> None:
+        # Новогодний выпуск бывает настоящим: 4 сезон «Шерлока» начался 1 января
+        self.assertFalse(self.airing(season(4, "2017-01-01", "2017-01-08", "2017-01-15")))
+
+    def test_episode_without_a_date_is_airing(self) -> None:
+        # «Джентльмены», 3 сезон: у первой серии дата есть, у остальных нет
+        self.assertTrue(self.airing(season(3, "2026-09-03", None, None)))
+
+    def test_future_episode_is_airing(self) -> None:
+        self.assertTrue(self.airing(season(1, "2024-01-10"), season(2, "2027-03-01")))
+
+    def test_recent_episode_keeps_the_season_airing_for_four_weeks(self) -> None:
+        # «Холод»: последняя серия вышла 17.09 — сезон ещё может прирасти
+        self.assertTrue(self.airing(season(1, "2026-07-16", "2026-09-17")))
+        self.assertFalse(self.airing(season(1, "2026-07-16", "2026-08-19")))
+
+    def test_only_the_last_season_by_number_counts(self) -> None:
+        # Пробелы в датах старого сезона не делают сериал идущим, а последний
+        # сезон ищется по номеру, а не по месту в списке
+        self.assertFalse(self.airing(season(2, "2019-05-01"), season(1, None, None)))
+
+    def test_announced_season_without_episodes_is_airing(self) -> None:
+        self.assertTrue(self.airing(season(1, "2024-01-10"), {"number": 2, "episodes": []}))
+
+    def test_film_is_not_airing(self) -> None:
+        # У фильма Кинопоиск отдаёт пустой список сезонов
+        self.assertFalse(meta_service.season_is_airing([], today=TODAY))
+        self.assertFalse(meta_service.season_is_airing(None, today=TODAY))
+
+
+def seasons_service(
+    payload: Any, cached: list[dict[str, Any]] | None = None, age: float = 0, status: int = 200
+) -> tuple[meta_service.MetaService, FakeHttp]:
+    """Сервис с записью `seasons:4444` заданного возраста — как её оставила прежняя версия."""
+    kinopoisk = meta_service.KinopoiskMeta("test-key")
+    http = FakeHttp({"films/4444/seasons": payload}, status)
+    kinopoisk.http = http  # type: ignore[assignment]
+    folder = Path(tempfile.mkdtemp())
+    if cached is not None:
+        entry = {"stamp": time.time() - age, "value": cached}
+        (folder / "meta.json").write_text(json.dumps({"seasons:4444": entry}), encoding="utf-8")
+    service = meta_service.MetaService(
+        kinopoisk=kinopoisk,
+        tmdb=None,
+        cache=meta_service.TTLCache(folder / "meta.json"),
+        shelf_cache=meta_service.TTLCache(folder / "shelf.json", 3600),
+    )
+    return service, http
+
+
+class SlowSeasons:
+    """Каталог, который отвечает на сезоны не сразу, как живой."""
+
+    def __init__(self, items: list[dict[str, Any]]) -> None:
+        self.items = items
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def seasons(self, film_id: int) -> list[dict[str, Any]]:
+        with self._lock:
+            self.calls += 1
+        time.sleep(0.2)
+        return self.items
+
+
+class SeasonsRefreshTests(unittest.TestCase):
+    """Срок записи `seasons:` решается при чтении, по её содержимому.
+
+    Прежде она лежала в общем кэше 30 дней. Живьём 23.09.2026 запись «Теда
+    Лассо» была суточной давности и совпадала с ответом Кинопоиска, то есть
+    заглушки отдаёт он сам — но исправление тот же срок заморозил бы на месяц.
+    """
+
+    def test_airing_season_is_reread_after_a_day(self) -> None:
+        fresh = [season(4, "2026-08-04", "2026-08-11")]
+        service, http = seasons_service({"items": fresh}, cached=TED_LASSO_PLACEHOLDER, age=2 * DAY)
+        episodes = service.episodes(4444, 4)
+        self.assertEqual(len(http.calls), 1)
+        self.assertEqual([item.air_date for item in episodes], ["2026-08-04", "2026-08-11"])
+
+    def test_airing_season_is_not_reread_within_a_day(self) -> None:
+        service, http = seasons_service({"items": []}, cached=TED_LASSO_PLACEHOLDER, age=3600)
+        self.assertEqual(len(service.episodes(4444, 4)), 10)
+        self.assertEqual(http.calls, [])
+
+    def test_finished_season_keeps_its_thirty_days(self) -> None:
+        service, http = seasons_service({"items": []}, cached=FINISHED, age=20 * DAY)
+        self.assertEqual(len(service.episodes(4444, 3)), 2)
+        self.assertEqual(http.calls, [])
+
+    def test_failed_reread_keeps_the_previous_answer(self) -> None:
+        # Квота кончилась посреди дня: вчерашний состав лучше карточки без сезонов
+        service, http = seasons_service({}, cached=TED_LASSO_PLACEHOLDER, age=2 * DAY, status=402)
+        self.assertEqual(len(service.episodes(4444, 4)), 10)
+        self.assertEqual(len(http.calls), 1)
+
+    def test_parallel_reads_cost_one_request(self) -> None:
+        # KinoApp спрашивает карточку и серии тайтла в одну секунду, и обе
+        # ручки читают один и тот же состав сезонов
+        folder = Path(tempfile.mkdtemp())
+        entry = {"stamp": time.time() - 2 * DAY, "value": TED_LASSO_PLACEHOLDER}
+        (folder / "meta.json").write_text(json.dumps({"seasons:4444": entry}), encoding="utf-8")
+        catalog = SlowSeasons([season(4, "2026-08-04")])
+        service = meta_service.MetaService(
+            kinopoisk=catalog,  # type: ignore[arg-type]
+            tmdb=None,
+            cache=meta_service.TTLCache(folder / "meta.json"),
+            shelf_cache=meta_service.TTLCache(folder / "shelf.json", 3600),
+        )
+        start = threading.Barrier(2)
+        answers: list[int] = []
+
+        def read() -> None:
+            start.wait()
+            answers.append(len(service.episodes(4444, 4)))
+
+        threads = [threading.Thread(target=read) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(catalog.calls, 1)
+        self.assertEqual(answers, [1, 1])
 
 
 class GenreDirectoryTests(unittest.TestCase):
