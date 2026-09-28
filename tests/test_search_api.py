@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import json
 import logging
 import sys
 import tempfile
@@ -17,6 +18,7 @@ from typing import Any
 
 import bencodepy
 from fastapi import HTTPException
+from fastapi.encoders import jsonable_encoder
 
 import meta_service
 import search_api
@@ -816,6 +818,66 @@ class CatalogEndpointTests(unittest.TestCase):
 
     def test_other_catalog_errors_stay_502(self) -> None:
         self.assertEqual(search_api.catalog_error(RuntimeError("сеть")).status_code, 502)
+
+
+class GentlemenMeta(FakeMeta):
+    """Каталог с невышедшим 3 сезоном — как «Джентльмены» 28.09.2026."""
+
+    def episodes(self, film_id: int, season: int | None = None) -> list[meta_service.EpisodeMeta]:
+        self.asked.append(film_id)
+        items = [
+            meta_service.EpisodeMeta(season=2, episode=8, title="Episode #2.8", air_date="2026-09-03"),
+            meta_service.EpisodeMeta(
+                season=3, episode=1, title="Episode #3.1", air_date="2026-09-03", released=False
+            ),
+            meta_service.EpisodeMeta(season=3, episode=2, title="Episode #3.2", released=False),
+        ]
+        return [item for item in items if season is None or item.season == season]
+
+
+def gentlemen_card() -> meta_service.TitleCard:
+    return meta_service.TitleCard(
+        meta=meta_service.TitleMeta(
+            matched=True, source="kinopoisk", source_id=1435343, tmdb_id=236235, tmdb_media_type="tv",
+            title="Джентльмены", original_title="The Gentlemen", year="2024", media_type="TV_SERIES",
+            seasons_count=3,
+        ),
+        imdb_id="tt13210838",
+        seasons=[
+            meta_service.SeasonBrief(season=1, episodes=8),
+            meta_service.SeasonBrief(season=2, episodes=8),
+            meta_service.SeasonBrief(season=3, episodes=8, released=False),
+        ],
+    )
+
+
+class UnreleasedSeasonShapeTests(unittest.TestCase):
+    """Контракт 1.3: `released: false` у невышедшего сезона и его серий, у остальных поля нет."""
+
+    def test_title_card_marks_only_the_unreleased_season(self) -> None:
+        with meta_replaced(GentlemenMeta(gentlemen_card())):
+            result = search_api.catalog_title(1435343)
+        self.assertEqual(
+            result.model_dump()["seasons"],
+            [{"season": 1, "episodes": 8}, {"season": 2, "episodes": 8}, {"season": 3, "episodes": 8, "released": False}],
+        )
+        # JSON ответа: FastAPI сериализует модель тем же сериализатором
+        body = json.loads(result.model_dump_json())
+        self.assertEqual([item.get("released", "нет поля") for item in body["seasons"]], ["нет поля", "нет поля", False])
+        self.assertEqual(jsonable_encoder(result)["seasons"], body["seasons"])
+        # Прочие поля не тронуты: пустые значения meta остаются null, а не пропадают
+        self.assertEqual(body["meta"]["seasons_count"], 3)
+        self.assertIn("season_hint", body["meta"])
+        self.assertIsNone(body["meta"]["season_hint"])
+
+    def test_episodes_of_the_unreleased_season_are_marked(self) -> None:
+        with meta_replaced(GentlemenMeta(gentlemen_card())):
+            every = search_api.catalog_episodes(1435343)
+            third = search_api.catalog_episodes(1435343, season=3)
+            old_path = search_api.meta_episodes(1435343, season=3)
+        self.assertEqual(set(every[0]), {"season", "episode", "title", "overview", "air_date", "still_url"})
+        self.assertEqual([item["released"] for item in third], [False, False])
+        self.assertEqual(old_path, third)
 
 
 class DiscoverMeta(FakeMeta):

@@ -58,14 +58,14 @@ def configure_logging() -> None:
 configure_logging()
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_serializer
 
 import meta_service
 import torbox_tg_bot as bot
 
 LOG = logging.getLogger("search_api")
 
-API_VERSION = "1.2"
+API_VERSION = "1.3"
 API_TOKEN = os.getenv("SEARCH_API_TOKEN", "").strip()
 RESULTS_TTL_SECONDS = 3600
 MAX_APP_RESULTS = bot.MAX_RESULTS
@@ -705,10 +705,25 @@ class HashResult(BaseModel):
 
 
 class SeasonItem(BaseModel):
-    """Сезон и число серий в нём."""
+    """Сезон и число серий в нём.
+
+    `released: false` — сезон ещё не вышел (`meta_service.unreleased_seasons`).
+    У вышедшего сезона и у сезона, о котором судить не по чему, поля нет
+    вовсе, как до версии 1.3: `true` сервер не отдаёт.
+    """
 
     season: int
     episodes: int
+    released: bool | None = None
+
+    # Возврат без аннотации намеренно: с `-> dict[str, Any]` Pydantic берёт
+    # её за схему ответа, и в OpenAPI у сезона пропадают все поля
+    @model_serializer(mode="wrap")
+    def _drop_unknown_release(self, handler: SerializerFunctionWrapHandler):
+        payload = handler(self)
+        if payload.get("released") is None:
+            payload.pop("released", None)
+        return payload
 
 
 class TitleCardResult(BaseModel):
@@ -933,7 +948,8 @@ def catalog_title(kp_id: int) -> TitleCardResult:
         TitleMeta, идентификатор IMDb и состав сезонов. `tmdb_id` и
         `tmdb_media_type` приходят внутри `meta`: Кинопоиск их не отдаёт,
         и сервер выясняет их у самого TMDB по IMDb-идентификатору —
-        точным редиректом, без ключа API.
+        точным редиректом, без ключа API. У невышедшего сезона —
+        `released: false`.
     """
     if not META.available:
         raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
@@ -944,7 +960,10 @@ def catalog_title(kp_id: int) -> TitleCardResult:
     return TitleCardResult(
         meta=dataclasses.asdict(card.meta),
         imdb_id=card.imdb_id,
-        seasons=[SeasonItem(season=item.season, episodes=item.episodes) for item in card.seasons],
+        seasons=[
+            SeasonItem(season=item.season, episodes=item.episodes, released=item.released)
+            for item in card.seasons
+        ],
     )
 
 
@@ -1082,15 +1101,33 @@ def meta_match(name: str) -> dict[str, Any]:
 
 @app.get("/meta/{film_id}/episodes", dependencies=[Depends(require_token)])
 def meta_episodes(film_id: int, season: int | None = None) -> list[dict[str, Any]]:
-    """Серии тайтла: русские названия, описания и кадры (если настроен TMDB)."""
+    """Серии тайтла: русские названия, описания и кадры (если настроен TMDB).
+
+    У серий невышедшего сезона — `released: false`; у остальных поля нет.
+    """
     if not META.available:
         raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
     try:
-        return [dataclasses.asdict(item) for item in META.episodes(film_id, season)]
+        return [episode_payload(item) for item in META.episodes(film_id, season)]
     except Exception as exc:
         raise HTTPException(
             status_code=502, detail=f"Каталог метаданных недоступен: {exc}"
         ) from exc
+
+
+def episode_payload(episode: meta_service.EpisodeMeta) -> dict[str, Any]:
+    """Серия для ответа: `released` только у невышедшего сезона, как у `SeasonItem`.
+
+    Args:
+        episode: Серия из `MetaService.episodes`.
+
+    Returns:
+        Поля серии; `released` есть лишь со значением False.
+    """
+    payload = dataclasses.asdict(episode)
+    if payload.get("released") is None:
+        payload.pop("released", None)
+    return payload
 
 
 @app.get("/release/{release_id}/details", dependencies=[Depends(require_token)])

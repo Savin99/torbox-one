@@ -3,6 +3,8 @@
 Имя раздачи («Игра Престолов / Game of Thrones (Сезон 4) [2014, BDRip]»)
 превращается в карточку Кинопоиска с постером, обложкой и списком серий.
 Кадры серий отдаёт TMDB, если задан `TMDB_API_KEY` — у Кинопоиска их нет.
+По датам сезонов из TMDB сервер отличает вышедший сезон от заглушки
+Кинопоиска (`unreleased_seasons`).
 """
 
 from __future__ import annotations
@@ -43,6 +45,16 @@ SEASONS_AIRING_TTL_SECONDS = 24 * 3600
 # «Недавно вышла»: четыре недельных цикла после даты серии. Дальше сезон
 # считается завершённым, и его поправки подхватит обычный 30-дневный срок.
 SEASON_RECENT_DAYS = 28
+
+# Невышедший сезон (`unreleased_seasons`). Кинопоиск заводит сезон-заглушку
+# сразу после продления сериала: живьём 28.09.2026 у «Джентльменов» был
+# 3 сезон из восьми серий «Episode #3.N», дата только у первой — копия даты
+# 2 сезона. Одну серию с прошедшей датой правило поэтому терпит.
+UNRELEASED_MAX_PAST_EPISODES = 1
+# Даты сезонов из TMDB живут, как карточка, 30 дней, но запись, по которой
+# сезон не вышел, перепроверяется раз в сутки: иначе снимок, взятый до того,
+# как TMDB завёл новый сезон, прятал бы вышедшую первую серию до второй.
+UNRELEASED_RECHECK_SECONDS = 24 * 3600
 
 # Полки живут отдельным кэшем: топы и премьеры меняются за сутки, а карточка
 # фильма — нет. Один TTL на оба не подобрать, поэтому и файла два.
@@ -175,20 +187,32 @@ class PersonMeta:
 
 @dataclass
 class EpisodeMeta:
+    """Серия для приложения.
+
+    `released` — False у серий невышедшего сезона (`unreleased_seasons`).
+    None значит «вышел или судить не по чему»: в ответе поля тогда нет.
+    """
+
     season: int
     episode: int
     title: str = ""
     overview: str = ""
     air_date: str = ""
     still_url: str = ""
+    released: bool | None = None
 
 
 @dataclass
 class SeasonBrief:
-    """Сколько серий в сезоне: приложению этого хватает, чтобы нарисовать выбор."""
+    """Сколько серий в сезоне: приложению этого хватает, чтобы нарисовать выбор.
+
+    `released` — False, если сезон ещё не вышел (`unreleased_seasons`); None —
+    вышел или судить не по чему.
+    """
 
     season: int
     episodes: int
+    released: bool | None = None
 
 
 @dataclass
@@ -869,9 +893,10 @@ def _rating_text(value: Any) -> str:
 
 
 class TMDBStills:
-    """Кадры серий: у Кинопоиска их нет, поэтому опционально берём из TMDB."""
+    """TMDB: кадры серий и даты сезонов — у Кинопоиска нет ни того, ни другого надёжно."""
 
     SEARCH_URL = "https://api.themoviedb.org/3/search/tv"
+    SERIES_URL = "https://api.themoviedb.org/3/tv/{tv_id}"
     SEASON_URL = "https://api.themoviedb.org/3/tv/{tv_id}/season/{season}"
     IMAGE_BASE = "https://image.tmdb.org/t/p/w780"
 
@@ -914,6 +939,28 @@ class TMDBStills:
             still = episode.get("still_path")
             if isinstance(number, int) and still:
                 result[number] = f"{self.IMAGE_BASE}{still}"
+        return result
+
+    def season_dates(self, tv_id: int) -> dict[int, str]:
+        """Сезоны сериала в TMDB и дата выхода каждого — одним запросом на сериал.
+
+        `/3/tv/{id}` отдаёт список `seasons` целиком: `season_number` и
+        `air_date` (дата первой серии; у объявленного сезона бывает null).
+
+        Args:
+            tv_id: Идентификатор сериала в TMDB.
+
+        Returns:
+            Номер сезона → `air_date` строкой «YYYY-MM-DD»; у сезона без даты —
+            пустая строка. Спецвыпуски TMDB лежат под номером 0.
+        """
+        response = self.http.get(self.SERIES_URL.format(tv_id=tv_id), params=self._params(), timeout=10)
+        response.raise_for_status()
+        result: dict[int, str] = {}
+        for season in response.json().get("seasons") or []:
+            number = season.get("season_number") if isinstance(season, dict) else None
+            if isinstance(number, int):
+                result[number] = str(season.get("air_date") or "").strip()
         return result
 
 
@@ -989,6 +1036,70 @@ def _release_date(value: Any) -> datetime.date | None:
 def _seasons_fresh(stamp: float, seasons: Any) -> bool:
     """Свежа ли запись сезонов: у идущего срок — сутки, у завершённого — общий TTL кэша."""
     return not season_is_airing(seasons) or time.time() - stamp <= SEASONS_AIRING_TTL_SECONDS
+
+
+def unreleased_seasons(
+    seasons: Any, tmdb_dates: dict[int, str] | None, today: datetime.date | None = None
+) -> set[int]:
+    """Номера сезонов, которые ещё не вышли.
+
+    Сезон не вышел, если у сериала есть TMDB и TMDB этого сезона не знает или
+    ставит ему дату позже сегодняшней, а у Кинопоиска в этом сезоне не больше
+    одной серии с прошедшей датой. Сезон, который TMDB перечисляет без даты,
+    считается незнакомым: дата у TMDB появляется вместе с первой серией.
+
+    Кинопоиск — вторая половина правила, и она держит от ложных пометок: у
+    вышедшего сезона там серии с датами, как бы TMDB ни нумеровал сезоны
+    (аниме, российские сериалы). Одну серию правило терпит — заглушка
+    Кинопоиска копирует в неё дату прошлого сезона.
+
+    Args:
+        seasons: Элементы `items` ответа Кинопоиска v2.2/films/{id}/seasons.
+        tmdb_dates: Номер сезона в TMDB → `air_date` (`TMDBStills.season_dates`);
+            None — у сериала нет TMDB или он не ответил, и тогда судить не по
+            чему: все сезоны считаются вышедшими, как до правила.
+        today: Сегодняшняя дата; по умолчанию — по часам сервера.
+
+    Returns:
+        Номера невышедших сезонов по нумерации Кинопоиска.
+    """
+    if tmdb_dates is None:
+        return set()
+    day = today or datetime.date.today()
+    return _unconfirmed(_release_candidates(seasons, day), tmdb_dates, day)
+
+
+def _release_candidates(seasons: Any, today: datetime.date) -> set[int]:
+    """Сезоны, у которых на Кинопоиске не больше одной серии с прошедшей датой."""
+    items = [item for item in seasons if isinstance(item, dict)] if isinstance(seasons, list) else []
+    result: set[int] = set()
+    for item in items:
+        number = item.get("number")
+        if not isinstance(number, int) or number <= 0:
+            continue
+        episodes = [episode for episode in item.get("episodes") or [] if isinstance(episode, dict)]
+        dates = [_release_date(episode.get("releaseDate")) for episode in episodes]
+        if sum(1 for date in dates if date is not None and date <= today) <= UNRELEASED_MAX_PAST_EPISODES:
+            result.add(number)
+    return result
+
+
+def _unconfirmed(candidates: set[int], tmdb_dates: dict[int, str], today: datetime.date) -> set[int]:
+    """Кандидаты, выход которых TMDB не подтверждает: нет сезона, нет даты или она впереди."""
+    result: set[int] = set()
+    for number in candidates:
+        date = _release_date(tmdb_dates.get(number))
+        if date is None or date > today:
+            result.add(number)
+    return result
+
+
+def _tmdb_dates(record: Any) -> dict[int, str]:
+    """Даты сезонов из записи кэша `tmdb-seasons:`: номера сезонов там — строки JSON."""
+    seasons = record.get("seasons") if isinstance(record, dict) else None
+    if not isinstance(seasons, dict):
+        return {}
+    return {int(number): str(date or "") for number, date in seasons.items() if str(number).isdigit()}
 
 
 class MetaService:
@@ -1239,18 +1350,130 @@ class MetaService:
         parsed = ParsedName(queries=[], year=None, season=None, is_series=None)
         meta = self._build_meta(film_id, details, parsed)
         self.remember_title(film_id, meta.original_title or meta.title, meta.year)
+        entries = self._seasons(film_id)
+        # Считается при каждом ответе из того, что уже в кэше, а не хранится
+        # в нём: пометка появляется и у карточек, положенных до правила
+        unreleased = self._unreleased_seasons(film_id, entries)
         seasons = [
             SeasonBrief(
                 season=int(entry.get("number") or 0),
                 episodes=len([item for item in entry.get("episodes", []) or [] if isinstance(item, dict)]),
+                released=False if entry.get("number") in unreleased else None,
             )
-            for entry in self._seasons(film_id)
+            for entry in entries
         ]
         return TitleCard(
             meta=meta,
             imdb_id=str(details.get("imdbId") or "").strip(),
             seasons=[item for item in seasons if item.season],
         )
+
+    def _unreleased_seasons(self, film_id: int, seasons: list[dict[str, Any]]) -> set[int]:
+        """Невышедшие сезоны тайтла (`unreleased_seasons`) — одинаково для карточки и серий.
+
+        Своих запросов к Кинопоиску у правила нет: состав сезонов уже
+        прочитан, карточка фильма лежит в кэше с того же открытия
+        (`_tmdb_exact_id`). TMDB спрашивается, только если у Кинопоиска есть
+        сезон-кандидат — с одной серией с прошедшей датой или вовсе без них.
+        У вышедших сериалов таких нет, и правило им ничего не стоит.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+            seasons: Состав сезонов тайтла из `_seasons`.
+
+        Returns:
+            Номера невышедших сезонов. Без ключа TMDB, без точного id сериала
+            в TMDB и при любом сбое — пусто: все сезоны вышли, как до правила.
+        """
+        if self.tmdb is None or not seasons:
+            return set()
+        today = datetime.date.today()
+        candidates = _release_candidates(seasons, today)
+        if not candidates:
+            return set()
+        try:
+            return unreleased_seasons(seasons, self._tmdb_season_dates(film_id, candidates, today), today)
+        except Exception:
+            LOG.warning("Не получилось проверить выход сезонов %s", film_id, exc_info=True)
+            return set()
+
+    def _tmdb_season_dates(
+        self, film_id: int, candidates: set[int], today: datetime.date
+    ) -> dict[int, str] | None:
+        """Даты сезонов тайтла из TMDB с кэшем `tmdb-seasons:{film_id}`.
+
+        Сериал в TMDB ищется только точно — по IMDb-идентификатору, как
+        `tmdb_id` карточки. Нечёткий поиск по названию, запасной путь кадров,
+        здесь не годится: чужой сериал с другим числом сезонов пометил бы
+        вышедший сезон невышедшим.
+
+        Запись живёт 30 дней, как карточка, пока подтверждает выход всех
+        кандидатов. Если хоть один по ней не вышел, её перечитывают раз в
+        сутки (UNRELEASED_RECHECK_SECONDS). Не вышло перечитать — прежняя
+        запись живёт ещё сутки: при лежащем TMDB каждый ответ иначе ждал бы
+        его таймаута заново.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+            candidates: Номера сезонов-кандидатов (`_release_candidates`).
+            today: Сегодняшняя дата.
+
+        Returns:
+            Номер сезона → `air_date`; None, если точного сериала в TMDB нет.
+        """
+        assert self.tmdb is not None
+        cache_key = f"tmdb-seasons:{film_id}"
+        entry = self.cache.entry(cache_key)
+        if entry is not None:
+            stamp, record = entry
+            dates = _tmdb_dates(record)
+            if time.time() - stamp <= UNRELEASED_RECHECK_SECONDS or not _unconfirmed(candidates, dates, today):
+                return dates
+        tmdb_id = self._tmdb_exact_id(film_id)
+        if not tmdb_id:
+            return _tmdb_dates(entry[1]) if entry is not None else None
+        try:
+            dates = self.tmdb.season_dates(tmdb_id)
+        except Exception:
+            if entry is None:
+                raise
+            LOG.warning("TMDB не отдал сезоны %s, беру прежние на сутки", tmdb_id, exc_info=True)
+            self.cache.put(cache_key, entry[1])
+            return _tmdb_dates(entry[1])
+        self.cache.put(cache_key, {"tmdb_id": tmdb_id, "seasons": {str(number): date for number, date in dates.items()}})
+        return dates
+
+    def _tmdb_exact_id(self, film_id: int) -> int:
+        """Сериал в TMDB по IMDb-идентификатору — редиректом TMDB, один раз на тайтл.
+
+        Общий для кадров серий и правила невышедших сезонов: без него каждый
+        спрашивал бы редирект сам. Найденный id живёт 30 дней, промах —
+        сутки (UNRELEASED_RECHECK_SECONDS): редирект отвечает «нет» и тогда,
+        когда TMDB просто не ответил, а различить это нечем.
+
+        Карточка фильма берётся через `_film`, то есть из кэша: страница
+        тайтла кладёт её туда первым же шагом. Запрос к Кинопоиску здесь
+        случится, только если карточки в кэше нет, — тот же, что и прежде
+        делали кадры серий. Без карточки промах не запоминается.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+
+        Returns:
+            Идентификатор сериала в TMDB или 0.
+        """
+        cache_key = f"tmdb-imdb:{film_id}"
+        entry = self.cache.entry(cache_key)
+        if entry is not None:
+            stamp, cached = entry
+            if cached or time.time() - stamp <= UNRELEASED_RECHECK_SECONDS:
+                return int(cached or 0)
+        details = self._film(film_id)
+        if not details:
+            return 0
+        tmdb_id, _ = resolve_tmdb_library_id(str(details.get("imdbId") or ""), "tv")
+        self.cache.put(cache_key, tmdb_id or 0)
+        return int(tmdb_id or 0)
 
     def _tmdb_series_id(self, film_id: int) -> int:
         """Идентификатор сериала в TMDB, под которым лежат кадры серий.
@@ -1269,8 +1492,7 @@ class MetaService:
         if cached is not None:
             return int(cached or 0)
 
-        details = self._film(film_id)
-        tmdb_id, _ = resolve_tmdb_library_id(str(details.get("imdbId") or ""), "tv")
+        tmdb_id = self._tmdb_exact_id(film_id)
         if not tmdb_id and self.tmdb is not None:
             query, year = self._tmdb_query(film_id)
             if query:
@@ -1551,8 +1773,13 @@ class MetaService:
         return self.kinopoisk.quota()
 
     def episodes(self, film_id: int, season: int | None = None) -> list[EpisodeMeta]:
-        """Серии тайтла: названия и описания из Кинопоиска, кадры — из TMDB."""
+        """Серии тайтла: названия и описания из Кинопоиска, кадры — из TMDB.
+
+        У серий невышедшего сезона `released` — False, по тому же правилу и
+        из тех же данных, что у сезонов в `title_card`.
+        """
         seasons = self._seasons(film_id)
+        unreleased = self._unreleased_seasons(film_id, seasons)
         result: list[EpisodeMeta] = []
         for entry in seasons:
             number = entry.get("number")
@@ -1568,6 +1795,7 @@ class MetaService:
                         title=str(episode.get("nameRu") or episode.get("nameEn") or "").strip(),
                         overview=str(episode.get("synopsis") or "").strip(),
                         air_date=str(episode.get("releaseDate") or "").strip(),
+                        released=False if number in unreleased else None,
                     )
                 )
         self._attach_stills(film_id, result)

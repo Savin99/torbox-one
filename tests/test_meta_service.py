@@ -1254,3 +1254,277 @@ class StillsUseExactIdTests(unittest.TestCase):
             service.episodes(4444, season=1)
             service.episodes(4444, season=2)
         self.assertEqual(len(calls), 1, "редирект TMDB спрашиваем один раз на тайтл")
+
+
+# «Джентльмены» (kp 1435343, TMDB 236235), как их отдавали Кинопоиск и TMDB
+# живьём 28.09.2026: у Кинопоиска сезон-заглушка 3 — восемь серий
+# «Episode #3.N», дата только у первой, и та скопирована со 2 сезона. У TMDB
+# два сезона; Netflix продлил сериал в августе 2026, даты 3 сезона нет.
+GENTLEMEN_SEASONS = [
+    season(1, *["2024-03-07"] * 8),
+    season(2, *["2026-09-03"] * 8),
+    season(3, "2026-09-03", *[None] * 7),
+]
+GENTLEMEN_TMDB = {1: "2024-03-07", 2: "2026-09-03"}
+RULE_DAY = datetime.date(2026, 9, 28)
+
+
+class UnreleasedSeasonsTests(unittest.TestCase):
+    """Правило: сезон не вышел, если у сериала есть TMDB и TMDB этого сезона
+    не знает или ставит ему дату позже сегодняшней, а у Кинопоиска в этом
+    сезоне не больше одной серии с прошедшей датой."""
+
+    def unreleased(self, seasons: list[dict[str, Any]], tmdb: dict[int, str] | None) -> set[int]:
+        return meta_service.unreleased_seasons(seasons, tmdb, today=RULE_DAY)
+
+    def test_gentlemen_placeholder_season_is_unreleased(self) -> None:
+        self.assertEqual(self.unreleased(GENTLEMEN_SEASONS, GENTLEMEN_TMDB), {3})
+
+    def test_series_without_tmdb_is_left_as_it_was(self) -> None:
+        # Судить не по чему — поле не появляется, как до правила
+        self.assertEqual(self.unreleased(GENTLEMEN_SEASONS, None), set())
+
+    def test_tmdb_date_in_the_future_marks_the_season(self) -> None:
+        seasons = [season(1, "2024-01-10", "2024-01-17"), season(2, "2027-03-05", None)]
+        self.assertEqual(self.unreleased(seasons, {1: "2024-01-10", 2: "2027-03-05"}), {2})
+        # В день премьеры сезон уже вышел, даже если Кинопоиск ещё пуст
+        on_premiere = meta_service.unreleased_seasons(seasons, {2: "2027-03-05"}, today=datetime.date(2027, 3, 5))
+        self.assertEqual(on_premiere, set())
+
+    def test_released_seasons_under_other_numbering_are_not_marked(self) -> None:
+        # Аниме: у Кинопоиска три сезона, у TMDB всё лежит в одном. Даты
+        # серий Кинопоиска и держат правило от ложной пометки
+        seasons = [
+            season(1, "2013-04-07", "2013-04-14"),
+            season(2, "2017-04-01", "2017-04-08"),
+            season(3, "2018-07-23", "2018-07-30"),
+        ]
+        self.assertEqual(self.unreleased(seasons, {0: "", 1: "2013-04-07"}), set())
+        # И наоборот: у TMDB сезонов больше, чем у Кинопоиска
+        self.assertEqual(self.unreleased(seasons[:1], {1: "2013-04-07", 2: "2017-04-01"}), set())
+
+    def test_season_tmdb_lists_without_a_date_is_not_confirmed(self) -> None:
+        # Объявленный сезон TMDB заводит без даты — это ещё не выход
+        self.assertEqual(self.unreleased(GENTLEMEN_SEASONS, {**GENTLEMEN_TMDB, 3: ""}), {3})
+
+    def test_first_episode_of_an_airing_season_counts_as_released(self) -> None:
+        # Неделя премьеры: у Кинопоиска одна серия вышла, остальные впереди,
+        # а TMDB уже знает дату сезона
+        seasons = [season(4, "2026-09-23", "2026-09-30", "2026-10-07")]
+        self.assertEqual(self.unreleased(seasons, {4: "2026-09-23"}), set())
+
+    def test_kinopoisk_dates_outweigh_a_lagging_tmdb(self) -> None:
+        # Две вышедшие серии у Кинопоиска — сезон вышел, чего бы TMDB ни знал
+        seasons = [season(1, "2025-01-01", "2025-01-08"), season(2, "2026-09-20", "2026-09-27", None)]
+        self.assertEqual(self.unreleased(seasons, {1: "2025-01-01"}), set())
+
+    def test_announced_season_without_episodes(self) -> None:
+        seasons = [season(1, "2025-05-01", "2025-05-08"), {"number": 2, "episodes": []}]
+        self.assertEqual(self.unreleased(seasons, {1: "2025-05-01"}), {2})
+
+    def test_film_has_nothing_to_mark(self) -> None:
+        self.assertEqual(self.unreleased([], {}), set())
+
+
+class FakeTmdb:
+    """TMDB на границе клиента: даты сезонов, кадры и нечёткий поиск, со счётом вызовов."""
+
+    def __init__(self, dates: dict[int, str] | None = None, error: Exception | None = None) -> None:
+        self.dates = dict(GENTLEMEN_TMDB if dates is None else dates)
+        self.error = error
+        self.season_calls: list[int] = []
+        self.searches: list[str] = []
+
+    def season_dates(self, tv_id: int) -> dict[int, str]:
+        self.season_calls.append(tv_id)
+        if self.error is not None:
+            raise self.error
+        return dict(self.dates)
+
+    def stills(self, tv_id: int, season: int) -> dict[int, str]:
+        return {}
+
+    def find_series(self, query: str, year: int | None) -> int | None:
+        self.searches.append(query)
+        return 999
+
+
+GENTLEMEN_FILM = {
+    "kinopoiskId": 1435343,
+    "imdbId": "tt13210838",
+    "nameRu": "Джентльмены",
+    "nameOriginal": "The Gentlemen",
+    "year": 2024,
+    "type": "TV_SERIES",
+    "serial": True,
+}
+GENTLEMEN_REDIRECT = "https://www.themoviedb.org/tv/236235"
+
+
+def gentlemen_service(
+    tmdb: FakeTmdb,
+    seasons: list[dict[str, Any]] | None = None,
+    record: dict[int, str] | None = None,
+    record_age: float = 0,
+) -> tuple[meta_service.MetaService, FakeHttp]:
+    """Сервис с кэшем, какой лежал на сервере до правила: карточка, состав и сезоны.
+
+    `record` — запись дат TMDB заданного возраста, как её оставил прежний ответ.
+    """
+    now = time.time()
+    entries: dict[str, Any] = {
+        "film:1435343": {"stamp": now, "value": GENTLEMEN_FILM},
+        "staff:1435343": {"stamp": now, "value": []},
+        "seasons:1435343": {"stamp": now, "value": GENTLEMEN_SEASONS if seasons is None else seasons},
+    }
+    if record is not None:
+        value = {"tmdb_id": 236235, "seasons": {str(number): date for number, date in record.items()}}
+        entries["tmdb-seasons:1435343"] = {"stamp": now - record_age, "value": value}
+    folder = Path(tempfile.mkdtemp())
+    (folder / "meta.json").write_text(json.dumps(entries), encoding="utf-8")
+    kinopoisk = meta_service.KinopoiskMeta("test-key")
+    http = FakeHttp({})
+    kinopoisk.http = http  # type: ignore[assignment]
+    service = meta_service.MetaService(
+        kinopoisk=kinopoisk,
+        tmdb=tmdb,  # type: ignore[arg-type]
+        cache=meta_service.TTLCache(folder / "meta.json"),
+        shelf_cache=meta_service.TTLCache(folder / "shelf.json", 3600),
+    )
+    return service, http
+
+
+class UnreleasedSeasonServiceTests(unittest.TestCase):
+    """Пометка в карточке и сериях — из кэша, без запросов к Кинопоиску."""
+
+    def released(self, card: meta_service.TitleCard) -> list[tuple[int, bool | None]]:
+        return [(item.season, item.released) for item in card.seasons]
+
+    def test_card_cached_before_the_rule_gets_the_mark(self) -> None:
+        # Карточка и сезоны лежат в кэше с прошлой версии: пометка считается
+        # при ответе, ждать истечения кэша не нужно
+        tmdb = FakeTmdb()
+        service, http = gentlemen_service(tmdb)
+        with tmdb_redirect(GENTLEMEN_REDIRECT):
+            card = service.title_card(1435343)
+        self.assertEqual(self.released(card), [(1, None), (2, None), (3, False)])
+        self.assertEqual(card.meta.seasons_count, 3, "число сезонов правило не трогает")
+        self.assertEqual(http.calls, [], "ни одного запроса к Кинопоиску")
+        self.assertEqual(tmdb.season_calls, [236235])
+
+    def test_episodes_carry_the_same_mark(self) -> None:
+        tmdb = FakeTmdb()
+        service, http = gentlemen_service(tmdb)
+        with tmdb_redirect(GENTLEMEN_REDIRECT):
+            episodes = service.episodes(1435343)
+            third = service.episodes(1435343, season=3)
+        marks = {(item.season, item.released) for item in episodes}
+        self.assertEqual(marks, {(1, None), (2, None), (3, False)})
+        self.assertEqual([item.released for item in third], [False] * 8)
+        self.assertEqual(http.calls, [])
+
+    def test_card_and_episodes_share_one_tmdb_request(self) -> None:
+        tmdb = FakeTmdb()
+        service, _ = gentlemen_service(tmdb)
+        with tmdb_redirect(GENTLEMEN_REDIRECT) as redirects:
+            service.title_card(1435343)
+            service.episodes(1435343)
+            service.title_card(1435343)
+        self.assertEqual(tmdb.season_calls, [236235])
+        # Редирект карточки (tmdb_id в meta) звучит на каждый ответ, как и
+        # прежде; правило и кадры добавляют к нему один на тайтл
+        self.assertEqual(len(redirects), 3)
+
+    def test_mark_is_rechecked_after_a_day(self) -> None:
+        tmdb = FakeTmdb({**GENTLEMEN_TMDB, 3: "2026-09-25"})
+        service, _ = gentlemen_service(tmdb, record=GENTLEMEN_TMDB, record_age=2 * DAY)
+        with tmdb_redirect(GENTLEMEN_REDIRECT):
+            card = service.title_card(1435343)
+        # TMDB завёл вышедший сезон — пометка снята в тот же день
+        self.assertEqual(tmdb.season_calls, [236235])
+        self.assertEqual(self.released(card), [(1, None), (2, None), (3, None)])
+
+    def test_mark_is_not_rechecked_within_a_day(self) -> None:
+        tmdb = FakeTmdb()
+        service, _ = gentlemen_service(tmdb, record=GENTLEMEN_TMDB, record_age=3600)
+        with tmdb_redirect(GENTLEMEN_REDIRECT):
+            card = service.title_card(1435343)
+        self.assertEqual(tmdb.season_calls, [])
+        self.assertEqual(self.released(card)[-1], (3, False))
+
+    def test_record_that_confirms_every_season_keeps_thirty_days(self) -> None:
+        tmdb = FakeTmdb()
+        confirmed = {**GENTLEMEN_TMDB, 3: "2026-09-20"}
+        service, _ = gentlemen_service(tmdb, record=confirmed, record_age=20 * DAY)
+        with tmdb_redirect(GENTLEMEN_REDIRECT):
+            card = service.title_card(1435343)
+        self.assertEqual(tmdb.season_calls, [])
+        self.assertEqual(self.released(card)[-1], (3, None))
+
+    def test_released_series_never_asks_tmdb(self) -> None:
+        tmdb = FakeTmdb()
+        service, _ = gentlemen_service(tmdb, seasons=GENTLEMEN_SEASONS[:2])
+        with tmdb_redirect(GENTLEMEN_REDIRECT):
+            card = service.title_card(1435343)
+        self.assertEqual(tmdb.season_calls, [])
+        self.assertEqual(self.released(card), [(1, None), (2, None)])
+
+    def test_series_without_exact_tmdb_match_is_not_marked(self) -> None:
+        # Редирект по IMDb не нашёл сериал. Нечёткий поиск по названию нашёл
+        # бы что-то, но чужой сериал — не повод прятать сезон
+        tmdb = FakeTmdb()
+        service, _ = gentlemen_service(tmdb)
+        with tmdb_redirect(GENTLEMEN_REDIRECT, status_code=404):
+            card = service.title_card(1435343)
+            episodes = service.episodes(1435343, season=3)
+        self.assertEqual(self.released(card), [(1, None), (2, None), (3, None)])
+        self.assertEqual({item.released for item in episodes}, {None})
+        self.assertEqual(tmdb.season_calls, [], "даты чужого сериала не спрашиваем")
+
+    def test_without_tmdb_key_nothing_changes(self) -> None:
+        service, _ = gentlemen_service(FakeTmdb())
+        service.tmdb = None
+        with tmdb_redirect(GENTLEMEN_REDIRECT):
+            card = service.title_card(1435343)
+        self.assertEqual(self.released(card), [(1, None), (2, None), (3, None)])
+
+    def test_silent_tmdb_leaves_seasons_unmarked(self) -> None:
+        tmdb = FakeTmdb(error=RuntimeError("TMDB молчит"))
+        service, _ = gentlemen_service(tmdb)
+        with tmdb_redirect(GENTLEMEN_REDIRECT):
+            card = service.title_card(1435343)
+        self.assertEqual(self.released(card), [(1, None), (2, None), (3, None)])
+
+    def test_failed_recheck_keeps_the_previous_record_for_a_day(self) -> None:
+        tmdb = FakeTmdb(error=RuntimeError("TMDB молчит"))
+        service, _ = gentlemen_service(tmdb, record=GENTLEMEN_TMDB, record_age=2 * DAY)
+        with tmdb_redirect(GENTLEMEN_REDIRECT):
+            first = service.title_card(1435343)
+            second = service.title_card(1435343)
+        self.assertEqual(self.released(first)[-1], (3, False))
+        self.assertEqual(self.released(second)[-1], (3, False))
+        # Второй ответ таймаута TMDB уже не ждёт
+        self.assertEqual(tmdb.season_calls, [236235])
+
+
+class TmdbSeasonDatesTests(unittest.TestCase):
+    """Разбор /3/tv/{id}: форма — из живого ответа TMDB для «Джентльменов» 28.09.2026.
+
+    Третий сезон без даты дописан: `air_date: null` у TMDB бывает — так в тот
+    же день пришли спецвыпуски (сезон 0) сериала «BBC: Планеты».
+    """
+
+    def test_season_list_becomes_dates(self) -> None:
+        client = meta_service.TMDBStills("v3-key")
+        http = FakeHttp({"3/tv/236235": {
+            "id": 236235,
+            "number_of_seasons": 2,
+            "seasons": [
+                {"air_date": "2024-03-07", "episode_count": 8, "season_number": 1, "name": "Season 1"},
+                {"air_date": "2026-09-03", "episode_count": 8, "season_number": 2, "name": "Season 2"},
+                {"air_date": None, "episode_count": 0, "season_number": 3, "name": "Season 3"},
+            ],
+        }})
+        client.http = http  # type: ignore[assignment]
+        self.assertEqual(client.season_dates(236235), {1: "2024-03-07", 2: "2026-09-03", 3: ""})
+        self.assertEqual(http.calls, [("https://api.themoviedb.org/3/tv/236235", {"api_key": "v3-key"})])
