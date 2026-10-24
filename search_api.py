@@ -57,7 +57,8 @@ def configure_logging() -> None:
 
 configure_logging()
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_serializer
 
 import meta_service
@@ -65,7 +66,7 @@ import torbox_tg_bot as bot
 
 LOG = logging.getLogger("search_api")
 
-API_VERSION = "1.3"
+API_VERSION = "1.4"
 API_TOKEN = os.getenv("SEARCH_API_TOKEN", "").strip()
 RESULTS_TTL_SECONDS = 3600
 MAX_APP_RESULTS = bot.MAX_RESULTS
@@ -1058,8 +1059,11 @@ def catalog_similar(kp_id: int, limit: int = meta_service.DEFAULT_SIMILAR_LIMIT)
 
 
 @app.post("/catalog/briefs", dependencies=[Depends(require_token)])
-def catalog_briefs(request: BriefRequest) -> list[dict[str, Any]]:
+def catalog_briefs(request: BriefRequest, http_request: Request) -> list[dict[str, Any]]:
     """Обложка, логотип и «о чём» для карточек ленты — пачкой.
+
+    С версии 1.4 — ещё и картинки TMDB: логотип-название, если у Кинопоиска
+    его нет, и `art_url` — постер без надписей для слайда hero приложения.
 
     Args:
         request: Идентификаторы Кинопоиска; читаются первые
@@ -1072,9 +1076,39 @@ def catalog_briefs(request: BriefRequest) -> list[dict[str, Any]]:
     if not META.available:
         raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
     try:
-        return META.briefs(request.ids)
+        cards = META.briefs(request.ids)
     except Exception as exc:
         raise catalog_error(exc) from exc
+    return [absolute_art(card, http_request) for card in cards]
+
+
+def absolute_art(card: dict[str, Any], request: Request) -> dict[str, Any]:
+    """Пути картинок, которые сервер раздаёт сам, — полным адресом.
+
+    Адрес берётся из самого запроса: за nginx это `https://<хост>/` — nginx
+    передаёт `Host` и `X-Forwarded-Proto`, а uvicorn верит им с 127.0.0.1.
+    """
+    base = str(request.base_url).rstrip("/")
+    for key in ("logo_url", "art_url"):
+        value = card.get(key)
+        if isinstance(value, str) and value.startswith("/catalog/art/"):
+            card[key] = base + value
+    return card
+
+
+@app.get("/catalog/art/{size}/{name}")
+def catalog_art(size: str, name: str) -> FileResponse:
+    """Логотип или постер TMDB, скачанный сервером для `/catalog/briefs`.
+
+    Без токена: это картинка, как постер на CDN Кинопоиска, и загрузчик
+    картинок приложения заголовков не шлёт. Раздаётся только то, что сервер
+    скачал сам (`MetaService.art_file`), — по чужому имени ответ 404.
+    """
+    path = META.art_file(size, name)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Картинки нет")
+    media_type = "image/png" if name.endswith(".png") else "image/jpeg"
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "public, max-age=2592000"})
 
 
 @app.get("/catalog/{kp_id}/episodes", dependencies=[Depends(require_token)])

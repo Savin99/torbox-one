@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
@@ -694,6 +695,11 @@ class FakeMeta:
         return [meta_service.EpisodeMeta(season=season or 1, episode=1, title="Первая")]
 
 
+# Запрос, пришедший через nginx: uvicorn собирает base_url из Host и
+# X-Forwarded-Proto.
+PUBLIC_REQUEST = types.SimpleNamespace(base_url="https://kino.example/")
+
+
 @contextlib.contextmanager
 def meta_replaced(meta: FakeMeta) -> Iterator[None]:
     saved = search_api.META
@@ -935,9 +941,37 @@ class DiscoverEndpointTests(unittest.TestCase):
     def test_briefs_take_ids_from_the_body(self) -> None:
         meta = DiscoverMeta()
         with meta_replaced(meta):
-            cards = search_api.catalog_briefs(search_api.BriefRequest(ids=[301, 258687]))
+            cards = search_api.catalog_briefs(search_api.BriefRequest(ids=[301, 258687]), PUBLIC_REQUEST)
         self.assertEqual(meta.calls, [("briefs", [301, 258687])])
         self.assertTrue(cards[0]["detailed"])
+
+    def test_briefs_art_is_an_address_of_this_server(self) -> None:
+        class ArtMeta(DiscoverMeta):
+            def briefs(self, film_ids: list[int]) -> list[dict[str, Any]]:
+                return [{
+                    "catalog_id": 1,
+                    "logo_url": "/catalog/art/w500/ruLogo1234.png",
+                    "art_url": "",
+                    "poster_url": "https://avatars.mds.yandex.net/get-kinopoisk-image/1/x/600x900",
+                }]
+
+        with meta_replaced(ArtMeta()):
+            card, = search_api.catalog_briefs(search_api.BriefRequest(ids=[1]), PUBLIC_REQUEST)
+        self.assertEqual(card["logo_url"], "https://kino.example/catalog/art/w500/ruLogo1234.png")
+        self.assertEqual(card["art_url"], "")
+        self.assertTrue(card["poster_url"].startswith("https://avatars.mds.yandex.net/"))
+
+    def test_art_route_needs_no_token_and_knows_only_its_files(self) -> None:
+        class Files(DiscoverMeta):
+            def art_file(self, size: str, name: str) -> Path | None:
+                return None
+
+        with meta_replaced(Files()):
+            with self.assertRaises(HTTPException) as ctx:
+                search_api.catalog_art("w500", "unknown12345.png")
+        self.assertEqual(ctx.exception.status_code, 404)
+        route = next(r for r in search_api.app.routes if getattr(r, "path", "") == "/catalog/art/{size}/{name}")
+        self.assertEqual(getattr(route, "dependencies", []), [])
 
     def test_discover_route_reads_the_type_parameter(self) -> None:
         # Параметр в адресе — `type`, а имя в Python другое: `type` занят встроенным

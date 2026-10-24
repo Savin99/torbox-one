@@ -1528,3 +1528,149 @@ class TmdbSeasonDatesTests(unittest.TestCase):
         client.http = http  # type: ignore[assignment]
         self.assertEqual(client.season_dates(236235), {1: "2024-03-07", 2: "2026-09-03", 3: ""})
         self.assertEqual(http.calls, [("https://api.themoviedb.org/3/tv/236235", {"api_key": "v3-key"})])
+
+
+# Форма `/3/find` и `/3/movie/{id}/images` — из живых ответов TMDB для
+# «Человек-паук: Новый день» 24.10.2026, урезанная до нужных полей.
+SPIDER_FIND = {"movie_results": [{"id": 969681, "title": "Spider-Man: Brand New Day"}], "tv_results": []}
+SPIDER_IMAGES = {
+    "logos": [
+        {"iso_639_1": "en", "file_path": "/en-logo.png", "vote_average": 5.9, "vote_count": 3},
+        {"iso_639_1": "ru", "file_path": "/ru-logo.svg", "vote_average": 9.0, "vote_count": 9},
+        {"iso_639_1": "ru", "file_path": "/ru-logo-weak.png", "vote_average": 3.1, "vote_count": 1},
+        {"iso_639_1": "ru", "file_path": "/ru-logo.png", "vote_average": 5.3, "vote_count": 2},
+    ],
+    "posters": [
+        {"iso_639_1": "en", "file_path": "/en-poster.jpg", "vote_average": 9.9, "vote_count": 50},
+        {"iso_639_1": None, "file_path": "/clean-poster.jpg", "vote_average": 5.5, "vote_count": 4},
+        {"iso_639_1": None, "file_path": "/clean-poster-2.jpg", "vote_average": 5.5, "vote_count": 2},
+    ],
+    "backdrops": [],
+}
+
+
+class TmdbTitleArtTests(unittest.TestCase):
+    def client(self, routes: dict[str, Any]) -> tuple[meta_service.TMDBStills, FakeHttp]:
+        client = meta_service.TMDBStills("v3-key")
+        http = FakeHttp(routes)
+        client.http = http  # type: ignore[assignment]
+        return client, http
+
+    def test_russian_png_logo_and_textless_poster(self) -> None:
+        client, http = self.client({"3/find/tt22084616": SPIDER_FIND, "3/movie/969681/images": SPIDER_IMAGES})
+        art = client.title_art("tt22084616", is_series=False)
+        # SVG пропущен, хоть у него оценка выше: iOS его не нарисует
+        self.assertEqual(art["logo_url"], "https://image.tmdb.org/t/p/w500/ru-logo.png")
+        # Постер без текста, а не лучший постер вообще: на нём надпись
+        self.assertEqual(art["art_url"], "https://image.tmdb.org/t/p/w780/clean-poster.jpg")
+        self.assertEqual(http.calls[0][1], {"external_source": "imdb_id", "api_key": "v3-key"})
+        self.assertEqual(http.calls[1][1]["include_image_language"], "ru,en,null")
+
+    def test_english_logo_when_no_russian(self) -> None:
+        images = {"logos": [{"iso_639_1": "en", "file_path": "/en.png", "vote_average": 1, "vote_count": 1}]}
+        client, _ = self.client({"3/find/tt0816692": SPIDER_FIND, "3/movie/969681/images": images})
+        art = client.title_art("tt0816692", is_series=False)
+        self.assertEqual(art, {"logo_url": "https://image.tmdb.org/t/p/w500/en.png"})
+
+    def test_series_is_taken_from_tv_results(self) -> None:
+        found = {"movie_results": [{"id": 1}], "tv_results": [{"id": 1399}]}
+        client, http = self.client({"3/find/tt0944947": found, "3/tv/1399/images": SPIDER_IMAGES})
+        client.title_art("tt0944947", is_series=True)
+        self.assertIn("3/tv/1399/images", http.calls[1][0])
+
+    def test_no_imdb_id_asks_nothing(self) -> None:
+        client, http = self.client({})
+        self.assertEqual(client.title_art("", is_series=False), {})
+        self.assertEqual(http.calls, [])
+
+    def test_unknown_title_gives_nothing(self) -> None:
+        client, http = self.client({"3/find/tt1234567": {"movie_results": [], "tv_results": []}})
+        self.assertEqual(client.title_art("tt1234567", is_series=False), {})
+        self.assertEqual(len(http.calls), 1)
+
+
+class FakeArtTmdb:
+    """TMDB, у которого есть только картинки тайтлов, со счётом вызовов."""
+
+    def __init__(self, art: dict[str, str] | None = None, error: Exception | None = None) -> None:
+        self.art = dict(art or {})
+        self.error = error
+        self.calls: list[tuple[str, bool]] = []
+        self.downloads: list[str] = []
+
+    def download(self, url: str) -> bytes:
+        self.downloads.append(url)
+        return b"PNG" + url.encode()
+
+    def title_art(self, imdb_id: str, is_series: bool) -> dict[str, str]:
+        self.calls.append((imdb_id, is_series))
+        if self.error is not None:
+            raise self.error
+        return dict(self.art)
+
+
+class BriefArtTests(unittest.TestCase):
+    ART = {
+        "logo_url": "https://image.tmdb.org/t/p/w500/ruLogo1234.png",
+        "art_url": "https://image.tmdb.org/t/p/w780/cleanArt123.jpg",
+    }
+
+    def service(self, tmdb: FakeArtTmdb) -> meta_service.MetaService:
+        service, _ = catalog_service(similar_routes())
+        service.tmdb = tmdb  # type: ignore[assignment]
+        service.art_dir = Path(tempfile.mkdtemp())
+        return service
+
+    def test_briefs_carry_tmdb_art_served_by_us(self) -> None:
+        tmdb = FakeArtTmdb(self.ART)
+        service = self.service(tmdb)
+        tenet, = service.briefs([1236063])
+        # Не адрес TMDB, а путь сервера: из России image.tmdb.org не открывается
+        self.assertEqual(tenet["art_url"], "/catalog/art/w780/cleanArt123.jpg")
+        self.assertEqual(tmdb.calls, [("tt6723592", False)])
+        path = service.art_file("w780", "cleanArt123.jpg")
+        self.assertIsNotNone(path)
+        self.assertEqual(path.read_bytes(), b"PNG" + self.ART["art_url"].encode())  # type: ignore[union-attr]
+
+    def test_kinopoisk_logo_wins_over_tmdb(self) -> None:
+        tenet, = self.service(FakeArtTmdb(self.ART)).briefs([1236063])
+        self.assertTrue(tenet["logo_url"].startswith("https://avatars.mds.yandex.net/"))
+
+    def test_tmdb_logo_fills_the_gap(self) -> None:
+        solaris, = self.service(FakeArtTmdb(self.ART)).briefs([43911])
+        self.assertEqual(solaris["logo_url"], "/catalog/art/w500/ruLogo1234.png")
+
+    def test_art_file_serves_only_what_we_downloaded(self) -> None:
+        service = self.service(FakeArtTmdb(self.ART))
+        self.assertIsNone(service.art_file("w500", "ruLogo1234.png"))
+        service.briefs([43911])
+        self.assertIsNotNone(service.art_file("w500", "ruLogo1234.png"))
+        self.assertIsNone(service.art_file("original", "ruLogo1234.png"))
+        self.assertIsNone(service.art_file("w500", "../meta.json"))
+
+    def test_foreign_art_url_is_not_downloaded(self) -> None:
+        tmdb = FakeArtTmdb({"logo_url": "https://evil.example/w500/x12345678.png"})
+        solaris, = self.service(tmdb).briefs([43911])
+        self.assertEqual(solaris["logo_url"], "")
+        self.assertEqual(tmdb.downloads, [])
+
+    def test_art_is_cached_even_when_empty(self) -> None:
+        tmdb = FakeArtTmdb({})
+        service = self.service(tmdb)
+        service.briefs([43911])
+        service.briefs([43911])
+        self.assertEqual(len(tmdb.calls), 1)
+
+    def test_failure_is_not_cached_and_does_not_break_briefs(self) -> None:
+        tmdb = FakeArtTmdb(error=RuntimeError("TMDB down"))
+        service = self.service(tmdb)
+        solaris, = service.briefs([43911])
+        self.assertEqual(solaris["art_url"], "")
+        self.assertEqual(solaris["name"], "Солярис")
+        service.briefs([43911])
+        self.assertEqual(len(tmdb.calls), 2)
+
+    def test_without_tmdb_art_is_empty(self) -> None:
+        service, _ = catalog_service(similar_routes())
+        tenet, = service.briefs([1236063])
+        self.assertEqual(tenet["art_url"], "")

@@ -34,6 +34,14 @@ STATE_DIR = Path(os.getenv("SEARCH_API_STATE_DIR", "").strip() or ".")
 
 CACHE_TTL_SECONDS = 30 * 24 * 3600
 CACHE_PATH = Path(os.getenv("META_CACHE_PATH", "").strip() or STATE_DIR / "meta_cache.json")
+# Картинки TMDB, которые сервер раздаёт сам (`/catalog/art/...`): из России
+# image.tmdb.org напрямую не открывается (замер 24.10.2026: 15 с без ответа),
+# а адрес сервера телефон открывает и без VPN.
+ART_DIR = Path(os.getenv("ART_DIR", "").strip() or STATE_DIR / "art")
+ART_SIZES = ("w500", "w780")
+ART_NAME = re.compile(r"[A-Za-z0-9_-]{8,64}\.(?:png|jpg)")
+# Сколько файлов держим: логотип ~100 КБ, постер ~190 КБ — около 300 МБ.
+ART_FILES_LIMIT = 2000
 
 # Состав сезонов идущего сериала меняется каждую неделю: выходит серия, у
 # заглушки появляются дата и название. С 30-дневным сроком карточки сервер
@@ -828,7 +836,11 @@ def _items(payload: Any) -> list[dict[str, Any]]:
     return [item for item in items or [] if isinstance(item, dict)]
 
 
-def catalog_card(item: dict[str, Any], details: dict[str, Any] | None = None) -> dict[str, Any]:
+def catalog_card(
+    item: dict[str, Any],
+    details: dict[str, Any] | None = None,
+    art: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Расширенная карточка для ленты «Что смотреть».
 
     Первые десять полей — та же форма, что у `/catalog/popular` и полок
@@ -844,6 +856,8 @@ def catalog_card(item: dict[str, Any], details: dict[str, Any] | None = None) ->
     Args:
         item: Элемент списочного ответа (фильтр, подборка, «похожие»).
         details: Ответ v2.2/films/{id}; его непустые поля главнее.
+        art: Картинки TMDB (`TMDBStills.title_art`): логотип-название, если
+            у Кинопоиска его нет, и постер без надписей — `art_url`.
 
     Returns:
         Словарь карточки. `detailed` — пришла ли карточка фильма: без неё
@@ -879,7 +893,8 @@ def catalog_card(item: dict[str, Any], details: dict[str, Any] | None = None) ->
         "tagline": str(merged.get("shortDescription") or "").strip(),
         "overview": str(merged.get("description") or "").strip(),
         "backdrop_url": _https(str(merged.get("coverUrl") or "")),
-        "logo_url": _https(str(merged.get("logoUrl") or "")),
+        "logo_url": _https(str(merged.get("logoUrl") or "")) or (art or {}).get("logo_url", ""),
+        "art_url": (art or {}).get("art_url", ""),
         "duration_minutes": int(length) if isinstance(length, int) else 0,
         "detailed": bool(details),
     }
@@ -899,6 +914,13 @@ class TMDBStills:
     SERIES_URL = "https://api.themoviedb.org/3/tv/{tv_id}"
     SEASON_URL = "https://api.themoviedb.org/3/tv/{tv_id}/season/{season}"
     IMAGE_BASE = "https://image.tmdb.org/t/p/w780"
+    FIND_URL = "https://api.themoviedb.org/3/find/{imdb_id}"
+    IMAGES_URL = "https://api.themoviedb.org/3/{kind}/{tmdb_id}/images"
+    # Логотип в hero приложения — около 260×88 pt, то есть до 780 px по
+    # ширине на тройном экране; w500 для PNG с прозрачностью хватает.
+    LOGO_BASE = "https://image.tmdb.org/t/p/w500"
+    # Порядок языков логотипа: русское название, потом оригинальное.
+    LOGO_LANGUAGES = ("ru", "en", None)
 
     def __init__(self, api_key: str) -> None:
         self.http = requests.Session()
@@ -941,6 +963,65 @@ class TMDBStills:
                 result[number] = f"{self.IMAGE_BASE}{still}"
         return result
 
+    def title_art(self, imdb_id: str, is_series: bool) -> dict[str, str]:
+        """Логотип-название и постер без надписей — для слайда hero.
+
+        У Кинопоиска логотипа у свежих тайтлов нет вовсе (ловушка 25), а
+        «обложка» — квадратный арт. TMDB отдаёт и то и другое почти всегда:
+        живьём 24.10.2026 у шести тайтлов верха «Сейчас смотрят» русский
+        логотип был у всех шести, постер без текста — тоже.
+
+        Тайтл ищется по IMDb id (`/3/find`), а не по названию: нечёткий поиск
+        дал бы логотип чужого фильма. Логотипы в SVG пропускаются — iOS их не
+        рисует (живьём: 4 из 18 у «Игры престолов»).
+
+        Args:
+            imdb_id: `imdbId` карточки Кинопоиска, «tt…».
+            is_series: Ждём сериал — тогда из ответа `/find` берётся он.
+
+        Returns:
+            `logo_url` и `art_url`; чего нет — того ключа нет.
+        """
+        if not re.fullmatch(r"tt[0-9]{7,12}", imdb_id):
+            return {}
+        response = self.http.get(
+            self.FIND_URL.format(imdb_id=imdb_id),
+            params=self._params({"external_source": "imdb_id"}),
+            timeout=10,
+        )
+        response.raise_for_status()
+        found = response.json()
+        order = ("tv_results", "movie_results") if is_series else ("movie_results", "tv_results")
+        kind, tmdb_id = "", 0
+        for key in order:
+            results = found.get(key) or []
+            if results and results[0].get("id"):
+                kind, tmdb_id = ("tv" if key == "tv_results" else "movie"), int(results[0]["id"])
+                break
+        if not tmdb_id:
+            return {}
+        response = self.http.get(
+            self.IMAGES_URL.format(kind=kind, tmdb_id=tmdb_id),
+            params=self._params({"include_image_language": "ru,en,null"}),
+            timeout=10,
+        )
+        response.raise_for_status()
+        images = response.json()
+        art: dict[str, str] = {}
+        logo = _best_image(images.get("logos") or [], self.LOGO_LANGUAGES, skip_svg=True)
+        if logo:
+            art["logo_url"] = f"{self.LOGO_BASE}{logo}"
+        poster = _best_image(images.get("posters") or [], (None,), skip_svg=True)
+        if poster:
+            art["art_url"] = f"{self.IMAGE_BASE}{poster}"
+        return art
+
+    def download(self, url: str) -> bytes:
+        """Картинка TMDB целиком — её сервер кладёт к себе и раздаёт сам."""
+        response = self.http.get(url, timeout=15)
+        response.raise_for_status()
+        return response.content
+
     def season_dates(self, tv_id: int) -> dict[int, str]:
         """Сезоны сериала в TMDB и дата выхода каждого — одним запросом на сериал.
 
@@ -962,6 +1043,31 @@ class TMDBStills:
             if isinstance(number, int):
                 result[number] = str(season.get("air_date") or "").strip()
         return result
+
+
+def _best_image(images: list[Any], languages: tuple[str | None, ...], skip_svg: bool) -> str:
+    """Лучшая картинка TMDB: первый язык из списка, у которого она есть, а
+    внутри языка — по оценке и числу голосов.
+
+    Args:
+        images: `logos` или `posters` из `/images`.
+        languages: Порядок языков; `None` — картинка без текста.
+        skip_svg: Пропускать SVG — их не рисует iOS.
+
+    Returns:
+        `file_path` или пустая строка.
+    """
+    usable = [
+        image for image in images
+        if isinstance(image, dict) and str(image.get("file_path") or "").startswith("/")
+        and not (skip_svg and str(image["file_path"]).lower().endswith(".svg"))
+    ]
+    for language in languages:
+        same = [image for image in usable if image.get("iso_639_1") == language]
+        if same:
+            best = max(same, key=lambda image: (float(image.get("vote_average") or 0), int(image.get("vote_count") or 0)))
+            return str(best["file_path"])
+    return ""
 
 
 def resolve_tmdb_library_id(imdb_id: str, expected_type: str) -> tuple[int | None, str | None]:
@@ -1111,9 +1217,11 @@ class MetaService:
         tmdb: TMDBStills | None = None,
         cache: TTLCache | None = None,
         shelf_cache: TTLCache | None = None,
+        art_dir: Path | None = None,
     ) -> None:
         self.kinopoisk = kinopoisk
         self.tmdb = tmdb
+        self.art_dir = art_dir or ART_DIR
         self.cache = cache or TTLCache()
         self.shelf_cache = shelf_cache or TTLCache(SHELF_CACHE_PATH, SHELF_TTL_SECONDS)
         self._locks_guard = threading.Lock()
@@ -1732,7 +1840,92 @@ class MetaService:
             return []
         wanted = list(dict.fromkeys(film_id for film_id in film_ids if film_id > 0))[:MAX_BRIEF_IDS]
         details = self._films(wanted)
-        return [catalog_card(details[film_id], details[film_id]) for film_id in wanted if film_id in details]
+        art = self._title_art_batch({film_id: details[film_id] for film_id in wanted if film_id in details})
+        return [
+            catalog_card(details[film_id], details[film_id], art.get(film_id))
+            for film_id in wanted if film_id in details
+        ]
+
+    def _title_art_batch(self, details: dict[int, dict[str, Any]]) -> dict[int, dict[str, str]]:
+        """Картинки TMDB пачкой: кэш сразу, недостающие — параллельно.
+
+        Без TMDB — пусто, и карточки остаются с тем, что дал Кинопоиск.
+        """
+        if self.tmdb is None or not details:
+            return {}
+        found: dict[int, dict[str, str]] = {}
+        missing: list[int] = []
+        for film_id in details:
+            cached = self.cache.get(f"tmdb-art:{film_id}")
+            if cached is not None:
+                found[film_id] = cached
+            else:
+                missing.append(film_id)
+        if missing:
+            with ThreadPoolExecutor(max_workers=min(DETAIL_WORKERS, len(missing))) as pool:
+                futures = {pool.submit(self._title_art, film_id, details[film_id]): film_id for film_id in missing}
+                for future in as_completed(futures):
+                    found[futures[future]] = future.result()
+        return found
+
+    def _title_art(self, film_id: int, details: dict[str, Any]) -> dict[str, str]:
+        """Картинки одного тайтла с кэшем на 30 дней — и пустой ответ тоже:
+        у тайтла без IMDb id или без картинок в TMDB их не появится завтра.
+
+        Отказ сети не кэшируется: на следующей пачке спросим снова.
+        """
+        assert self.tmdb is not None
+        media_type = str(details.get("type") or "").upper()
+        is_series = bool(details.get("serial")) or media_type in {"TV_SERIES", "MINI_SERIES", "TV_SHOW"}
+        try:
+            found = self.tmdb.title_art(str(details.get("imdbId") or "").strip(), is_series)
+            art = {key: self._keep_art(url) for key, url in found.items()}
+        except Exception:
+            LOG.warning("TMDB не отдал картинки %s", film_id, exc_info=True)
+            return {}
+        self.cache.put(f"tmdb-art:{film_id}", art)
+        return art
+
+    def _keep_art(self, url: str) -> str:
+        """Скачать картинку TMDB к себе и вернуть путь, по которому её раздаёт
+        сервер: `/catalog/art/w500/<имя>.png`. Ссылку на image.tmdb.org телефону
+        отдавать нельзя — из России она не открывается.
+        """
+        assert self.tmdb is not None
+        match = re.fullmatch(r"https://image\.tmdb\.org/t/p/(w500|w780)/([A-Za-z0-9_-]{8,64}\.(?:png|jpg))", url)
+        if not match:
+            raise ValueError(f"чужой адрес картинки: {url}")
+        size, name = match[1], match[2]
+        target = self.art_dir / size / name
+        if not target.exists():
+            body = self.tmdb.download(url)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            partial = target.with_suffix(target.suffix + ".part")
+            partial.write_bytes(body)
+            partial.replace(target)
+            self._prune_art()
+        return f"/catalog/art/{size}/{name}"
+
+    def _prune_art(self) -> None:
+        """Сверх ART_FILES_LIMIT — убрать самые давние: их карточки давно
+        вышли из кэша, а вернувшийся тайтл скачает картинку заново."""
+        files = [path for path in self.art_dir.glob("w*/*") if path.suffix in {".png", ".jpg"}]
+        if len(files) <= ART_FILES_LIMIT:
+            return
+        files.sort(key=lambda path: path.stat().st_mtime)
+        for path in files[: len(files) - ART_FILES_LIMIT * 3 // 4]:
+            path.unlink(missing_ok=True)
+
+    def art_file(self, size: str, name: str) -> Path | None:
+        """Файл картинки, которую сервер скачал сам, — или ничего.
+
+        Раздаётся только то, что уже лежит на диске: по чужому имени сервер в
+        TMDB не ходит, и открытым прокси картинок он не становится.
+        """
+        if size not in ART_SIZES or not ART_NAME.fullmatch(name):
+            return None
+        path = self.art_dir / size / name
+        return path if path.is_file() else None
 
     def _films(self, film_ids: list[int]) -> dict[int, dict[str, Any]]:
         """Карточки фильмов пачкой: кэш сразу, недостающие — параллельно.
