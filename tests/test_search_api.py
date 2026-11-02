@@ -1206,3 +1206,48 @@ class MagnetRedirectTests(unittest.TestCase):
                 unittest.mock.patch.object(search_api, "HASH_CACHE", cache):
             value = search_api.release_info_hash("prowlarr:knaben:1", release)
         self.assertEqual(value, "38db15f22435c9da85a340d2a40e3a2427335f21")
+
+
+class DropOtherYearsTests(unittest.TestCase):
+    """Одноимённые фильмы других лет не вытесняют нужный (случай 02.11.2026)."""
+
+    def titles(self, names: list[str], year: int | None, queries: list[str]) -> list[str]:
+        releases = [make_release(title=name) for name in names]
+        return [item.title for item in search_api.drop_other_years(releases, year, queries)]
+
+    def test_resident_evil_2026_drops_2002_and_2016(self) -> None:
+        names = [
+            "Обитель зла: Последняя глава / Resident Evil: The Final Chapter (2016) BDRemux",
+            "Обитель зла / Resident Evil (Пол У. С. Андерсон) [2002, Великобритания] BDRip",
+            "Обитель зла / Resident Evil (Зак Креггер) [2026, Германия, США] WEB-DL 1080p",
+            "Resident Evil 2026 1080p WEB DL AAC x264",
+            "Resident.Evil.1080p.WEB-DL",
+        ]
+        kept = self.titles(names, 2026, ["Обитель зла 2026", "Обитель зла", "Resident Evil"])
+        self.assertEqual(kept, names[2:])
+
+    def test_odyssey_2026_drops_kubrick_but_keeps_2026_releases(self) -> None:
+        names = [
+            "2001 год: Космическая одиссея / 2001: A Space Odyssey (Стэнли Кубрик) [1968]",
+            "Одиссея / The Odyssey (Андрей Кончаловский) [1997, США]",
+            "Одиссея / The Odyssey (2026) WEB-DL [H.264/1080p]",
+            "The.Odyssey.2026.1080p.TELESYNC.HEVC",
+        ]
+        self.assertEqual(self.titles(names, 2026, ["Одиссея 2026", "Одиссея", "The Odyssey"]), names[2:])
+
+    def test_numbers_inside_the_name_are_not_years(self) -> None:
+        names = ["1917 (2019) BDRip 1080p", "1917 BDRip 1080p", "1917 (1957) старый фильм"]
+        self.assertEqual(self.titles(names, 2019, ["1917 2019", "1917"]), names[:2])
+        names = ["2012 (2009) BDRip", "2012.BDRip.1080p", "Другой фильм (2014) WEBRip"]
+        self.assertEqual(self.titles(names, 2009, ["2012 2009", "2012"]), names[:2])
+        # Ограничение: раздача, где единственный год совпадает с числом из названия,
+        # остаётся — отличить её нельзя; чужое название отсеет клиент по имени.
+        self.assertEqual(self.titles(["Армагеддон 2012 (2012)"], 2009, ["2012 2009", "2012"]), ["Армагеддон 2012 (2012)"])
+
+    def test_neighbouring_year_and_ranges_survive(self) -> None:
+        names = ["Фильм (2025) WEB-DL", "Фильм (2027) WEB-DL", "Фильм. Коллекция (1993-2026)", "Фильм (2020) BDRip"]
+        self.assertEqual(self.titles(names, 2026, ["Фильм 2026", "Фильм"]), names[:3])
+
+    def test_no_year_means_no_filter(self) -> None:
+        names = ["Фильм (2016)", "Фильм (2002)"]
+        self.assertEqual(self.titles(names, None, ["Фильм"]), names)

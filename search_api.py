@@ -904,6 +904,39 @@ def build_search_queries(
     return unique[:MAX_SEARCH_QUERIES]
 
 
+YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+
+
+def drop_other_years(
+    releases: list[bot.Release], target_year: int | None, queries: list[str]
+) -> list[bot.Release]:
+    """Отсекает раздачи одноимённых фильмов других лет.
+
+    По «Обитель зла» 2026 трекеры отдают и 2002, и 2016 — они занимали две
+    трети выдачи и вытесняли нужный фильм из 60 мест. Раздача отбрасывается,
+    если в её названии есть годы и ни один не ближе чем на год к нужному.
+    Числа из самого названия фильма («2001: Космическая одиссея», «1917»)
+    годами не считаются; раздачи без года остаются.
+
+    Args:
+        releases: Выдача источников.
+        target_year: Год фильма; None — не отсекать.
+        queries: Запросы поиска: годы в них — часть названия или нужный год.
+
+    Returns:
+        Раздачи без чужих лет, в прежнем порядке.
+    """
+    if not target_year:
+        return releases
+    name_years = {int(value) for query in queries for value in YEAR_RE.findall(query)} - {target_year}
+    kept: list[bot.Release] = []
+    for release in releases:
+        years = {int(value) for value in YEAR_RE.findall(release.title)} - name_years
+        if not years or any(abs(year - target_year) <= 1 for year in years):
+            kept.append(release)
+    return kept
+
+
 def aggregate_releases(
     providers: list[bot.SearchProvider], queries: list[str], deadline: float | None
 ) -> tuple[list[bot.Release], dict[str, str], bool]:
@@ -1260,6 +1293,13 @@ def tracker_search(
         releases, status, sources, partial = aggregate_releases(list(PROVIDERS), queries, deadline)
     if slow_search:
         releases = [with_known_hashes(stable_release_id(item), item) for item in releases]
+    if (kind or "").casefold() != "series":
+        card = catalog_title_card(kp_id) if kp_id and not year else None
+        card_year = card.meta.year[:4] if card is not None and card.meta.matched else ""
+        target_year = year or (int(card_year) if card_year.isdigit() else None)
+        if card is not None and (card.seasons or any(marker in card.meta.media_type for marker in ("TV", "SERIAL", "SERIES"))):
+            target_year = None
+        releases = drop_other_years(releases, target_year, queries)
     # Два прохода разнообразия — как у бота: сначала широкий срез кандидатов,
     # потом короткий список. Для limit <= 24 результат тот же, что прежде.
     candidates = bot.select_diverse_releases(releases, max(bot.MAX_SEARCH_CANDIDATES, wanted))
