@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import dataclasses
 import hashlib
 import html
@@ -20,13 +21,14 @@ import os
 import re
 import threading
 import time
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 # До Python 3.11 concurrent.futures.TimeoutError — отдельный класс, а не
 # встроенный TimeoutError. На сервере 3.10, и `except TimeoutError` там
 # дедлайн не ловил вовсе: вместо partial клиент получал 500.
 from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -94,6 +96,17 @@ RELEASE_STORE_PATH = meta_service.STATE_DIR / "release_store.json"
 
 INFO_HASH_RE = re.compile(r"^[0-9a-f]{40}$")
 
+# Фоновый расчёт хэшей медленных трекеров (RuTracker, Kinozal через Byparr).
+# Страница — 20 секунд, браузер один, поэтому на запрос `/release/hashes` со
+# сроком 8 секунд хэш почти никогда не успевает. Очередь считает их заранее,
+# по одному, сразу после поиска.
+PREFETCH_PER_SEARCH = 10
+PREFETCH_QUEUE_SIZE = 40
+PREFETCH_BACKOFF_SECONDS = 60.0
+PREFETCH_BACKOFF_MAX_SECONDS = 3600.0
+# Трекеры, чей стабильный id — «провайдер:номер темы»
+TOPIC_ID_PROVIDERS = (bot.NnmClient.key, bot.RutrackerClient.key, bot.KinozalClient.key)
+
 
 def stable_release_id(release: bot.Release) -> str:
     """Постоянный идентификатор релиза вида «провайдер:тема».
@@ -107,10 +120,10 @@ def stable_release_id(release: bot.Release) -> str:
     Returns:
         Строку без пробелов, пригодную как сегмент пути URL.
     """
-    if release.provider == bot.NnmClient.key:
+    if release.provider in TOPIC_ID_PROVIDERS:
         topic = re.sub(r"\D", "", release.topic_id)
         if topic:
-            return f"{bot.NnmClient.key}:{topic}"
+            return f"{release.provider}:{topic}"
     if release.provider == bot.ProwlarrClient.key:
         # `id` в выдаче Prowlarr считается от guid и между версиями меняется.
         # Стабилен адрес темы: commentUrl -> infoUrl -> guid, он же source_url.
@@ -199,7 +212,14 @@ def build_providers() -> list[bot.SearchProvider]:
                 prowlarr_url, prowlarr_key, bot.env_int_tuple("PROWLARR_INDEXER_IDS")
             )
         )
+    # RuTracker и Kinozal — только с кукой входа и через Byparr
+    providers.extend(bot.build_byparr_providers())
     return providers
+
+
+def is_slow_provider(provider: Any) -> bool:
+    """Источник читается через Byparr: один запрос на поиск, хэш — фоном."""
+    return bool(getattr(provider, "slow", False))
 
 
 def build_catalog() -> bot.KinopoiskCatalog | None:
@@ -283,14 +303,17 @@ def restore_release(release_id: str) -> bot.Release | None:
     """
     provider_key, _, rest = release_id.partition(":")
     provider = PROVIDER_BY_KEY.get(provider_key)
-    if provider is None or provider_key != bot.NnmClient.key or not rest.isdigit():
+    restore = RESTORERS.get(provider_key)
+    if provider is None or restore is None or not rest.isdigit():
         # У Prowlarr нет запроса «отдай релиз по guid»: его релизы
         # восстанавливаются только из дискового хранилища ReleaseCache
         return None
     try:
-        return restore_nnm_topic(provider, rest)
-    except Exception:
-        LOG.warning("Не получилось восстановить тему NNM %s", rest, exc_info=True)
+        return restore(provider, rest)
+    except Exception as exc:
+        # Без exc_info: у Byparr-трекеров текст ошибки уже вычищен, а
+        # трассировка ничего к нему не добавит
+        LOG.warning("Не получилось восстановить тему %s %s: %s", provider.name, rest, exc)
         return None
 
 
@@ -352,6 +375,108 @@ def _nnm_topic_title(page: str) -> str:
     return ""
 
 
+def restore_rutracker_topic(client: Any, topic_id: str) -> bot.Release | None:
+    """Собирает релиз RuTracker заново по номеру темы.
+
+    То же, что `restore_nnm_topic`: страница темы читается одна (через
+    Byparr, ~20 с) и даёт заголовок, размер и magnet, то есть `info_hash`.
+
+    Args:
+        client: `bot.RutrackerClient`.
+        topic_id: Номер темы (`viewtopic.php?t=`).
+
+    Returns:
+        Релиз или None, если на странице нет ни magnet, ни заголовка.
+    """
+    page = client.fetch(urljoin(bot.RUTRACKER_BASE, f"viewtopic.php?t={topic_id}"))
+    title = _tracker_page_title(page, r"\s*::\s*RuTracker\.org\s*$")
+    info_hash = bot.rutracker_topic_hash(page)
+    if not title and not info_hash:
+        return None
+    size = re.search(r'id="tor-size-humn"[^>]*title="(\d+)"', page)
+    size_bytes = int(size.group(1)) if size else 0
+    return bot.Release(
+        torrent_id=topic_id,
+        topic_id=topic_id,
+        title=title or f"RuTracker, тема {topic_id}",
+        category=client.name,
+        size_text=bot.human_size(size_bytes) if size_bytes else "",
+        size_bytes=size_bytes,
+        seeders=0,
+        leechers=0,
+        source_url=urljoin(bot.RUTRACKER_BASE, f"viewtopic.php?t={topic_id}"),
+        download_url=urljoin(bot.RUTRACKER_BASE, f"dl.php?t={topic_id}"),
+        score=0,
+        provider=client.key,
+        source_name=client.name,
+        info_hash=info_hash,
+        magnet_url=info_hash_magnet(info_hash, title) if info_hash else "",
+    )
+
+
+def restore_kinozal_details(client: Any, details_id: str) -> bot.Release | None:
+    """Собирает релиз Kinozal заново по номеру раздачи.
+
+    Карточка `details.php` даёт заголовок и вес; хэша на ней нет, его
+    приносит фоновая очередь со страницы `get_srv_details.php`.
+
+    Args:
+        client: `bot.KinozalClient`.
+        details_id: Номер раздачи (`details.php?id=`).
+
+    Returns:
+        Релиз или None, если на странице нет заголовка раздачи.
+    """
+    page = client.fetch(urljoin(bot.KINOZAL_BASE, f"details.php?id={details_id}"))
+    heading = re.search(
+        rf'<h1>\s*<a[^>]*details\.php\?id={details_id}"[^>]*>(.*?)</a>', page, re.S | re.I
+    )
+    title = bot.strip_tags(heading.group(1)) if heading else _tracker_page_title(page, r"\s*::\s*Кинозал\.\w+\s*$")
+    if not title:
+        return None
+    weight = re.search(r"Вес<span[^>]*>([^<(]+)", page)
+    size_text = weight.group(1).strip() if weight else ""
+    return bot.Release(
+        torrent_id=details_id,
+        topic_id=details_id,
+        title=title,
+        category=client.name,
+        size_text=size_text,
+        size_bytes=bot.parse_ru_size(size_text),
+        seeders=0,
+        leechers=0,
+        source_url=urljoin(bot.KINOZAL_BASE, f"details.php?id={details_id}"),
+        download_url=urljoin(bot.KINOZAL_BASE, f"download.php?id={details_id}"),
+        score=0,
+        provider=client.key,
+        source_name=client.name,
+    )
+
+
+def _tracker_page_title(page: str, suffix_re: str) -> str:
+    """Заголовок темы: `h1.maintitle`, иначе `<title>` без имени сайта."""
+    for pattern in (r'<h1 class="maintitle"[^>]*>(.*?)</h1>', r"<title>(.*?)</title>"):
+        found = re.search(pattern, page, re.S | re.I)
+        if found:
+            text = re.sub(suffix_re, "", bot.strip_tags(found.group(1))).strip()
+            if text:
+                return text
+    return ""
+
+
+def info_hash_magnet(info_hash: str, title: str) -> str:
+    """Magnet по хэшу: так раздачу Byparr-трекера добавляют в TorBox."""
+    magnet = f"magnet:?xt=urn:btih:{info_hash}"
+    return f"{magnet}&dn={quote(title)}" if title else magnet
+
+
+RESTORERS: dict[str, Callable[[Any, str], bot.Release | None]] = {
+    bot.NnmClient.key: restore_nnm_topic,
+    bot.RutrackerClient.key: restore_rutracker_topic,
+    bot.KinozalClient.key: restore_kinozal_details,
+}
+
+
 def normalized_info_hash(value: str) -> str:
     """Приводит хэш к сорока символам нижнего регистра, как ждёт TorBox.
 
@@ -401,7 +526,9 @@ def hash_cache_key(release_id: str, release: bot.Release) -> str:
     return f"hash:{release_id}:{file_id if file_id.isdigit() else _digest(file_id)}"
 
 
-def release_info_hash(release_id: str, release: bot.Release) -> str | None:
+def release_info_hash(
+    release_id: str, release: bot.Release, allow_slow: bool = True
+) -> str | None:
     """Считает info_hash релиза, скачивая `.torrent`, и кэширует результат.
 
     NNM-Club не отдаёт в выдаче ни magnet, ни хэш, а без хэша приложение не
@@ -412,9 +539,15 @@ def release_info_hash(release_id: str, release: bot.Release) -> str | None:
     Хэш, который релиз принёс сам — от индексера или в magnet, — главнее
     кэша: он из той же выдачи, что и файл. Кэш нужен только закачке.
 
+    У RuTracker и Kinozal `.torrent` через Byparr не скачать: хэш берётся
+    со страницы трекера (`resolve_info_hash`), и это 20 секунд браузера.
+    Поэтому их хэш считает только фоновая очередь, а запрос клиента с
+    `allow_slow=False` довольствуется кэшем.
+
     Args:
         release_id: Стабильный идентификатор релиза.
         release: Релиз, для которого нужен хэш.
+        allow_slow: Можно ли идти за хэшем к медленному трекеру.
 
     Returns:
         hex40 в нижнем регистре или None, если источник хэш не отдал.
@@ -437,8 +570,13 @@ def release_info_hash(release_id: str, release: bot.Release) -> str | None:
     provider = PROVIDER_BY_KEY.get(release.provider)
     if provider is None:
         return None
-    payload = provider.download_torrent(release)
-    value = bot.torrent_fingerprint(payload).casefold()
+    if is_slow_provider(provider):
+        if not allow_slow:
+            return None
+        value = normalized_info_hash(provider.resolve_info_hash(release))
+    else:
+        payload = provider.download_torrent(release)
+        value = bot.torrent_fingerprint(payload).casefold()
     if not INFO_HASH_RE.match(value):
         return None
     if cache_key:
@@ -452,6 +590,11 @@ def collect_info_hashes(ids: list[str], deadline: float) -> dict[str, str | None
     Отказ одного релиза не мешает остальным: у него в ответе будет None.
     Неудачи не кэшируются — иначе разовая ошибка трекера держалась бы сутки.
 
+    Релизы RuTracker и Kinozal не считаются здесь же: готовый хэш берётся
+    из кэша сразу, остальные встают в начало фоновой очереди, и запрос ждёт
+    её до своего срока. Так один и тот же хэш не считается дважды, а Byparr
+    не получает пачку параллельных запросов, которые всё равно выстроит в ряд.
+
     Args:
         ids: Стабильные идентификаторы релизов.
         deadline: Общий срок на всю пачку, в секундах.
@@ -459,15 +602,24 @@ def collect_info_hashes(ids: list[str], deadline: float) -> dict[str, str | None
     Returns:
         Словарь «идентификатор → hex40 или None».
     """
+    started = time.monotonic()
     result: dict[str, str | None] = {release_id: None for release_id in ids}
     pool = ThreadPoolExecutor(max_workers=max(1, HASH_WORKERS), thread_name_prefix="hash")
     futures: dict[Future[str | None], str] = {}
+    slow: list[tuple[str, bot.Release]] = []
     for release_id in ids:
-        release = CACHE.get(release_id) or restore_release(release_id)
+        release = CACHE.get(release_id) or slow_release_stub(release_id) or restore_release(release_id)
         if release is None:
             LOG.info("Релиз %s не найден, хэш не считаю", release_id)
             continue
+        if is_slow_provider(PROVIDER_BY_KEY.get(release.provider)):
+            result[release_id] = release_info_hash(release_id, release, allow_slow=False)
+            if result[release_id] is None:
+                slow.append((release_id, release))
+            continue
         futures[pool.submit(release_info_hash, release_id, release)] = release_id
+    if slow:
+        PREFETCHER.enqueue(slow)
     try:
         for future in as_completed(futures, timeout=max(1.0, deadline)):
             release_id = futures[future]
@@ -480,7 +632,220 @@ def collect_info_hashes(ids: list[str], deadline: float) -> dict[str, str | None
     finally:
         # Ждать отставших нельзя: срок общий, и ответ уходит сейчас
         pool.shutdown(wait=False, cancel_futures=True)
+    if slow:
+        remaining = deadline - (time.monotonic() - started)
+        if remaining > 0:
+            PREFETCHER.wait_for([release_id for release_id, _ in slow], remaining)
+        for release_id, release in slow:
+            result[release_id] = release_info_hash(release_id, release, allow_slow=False)
     return result
+
+
+def slow_release_stub(release_id: str) -> bot.Release | None:
+    """Релиз медленного трекера по одному id — без обращения к трекеру.
+
+    Хэшу RuTracker и Kinozal нужен только номер темы, а честное
+    восстановление (`restore_release`) — это ещё 20 секунд Byparr прямо в
+    запросе. Заглушка живёт только внутри расчёта хэша и никуда не сохраняется.
+
+    Args:
+        release_id: Идентификатор вида `rutracker:<тема>` или `kinozal:<id>`.
+
+    Returns:
+        Релиз-заглушку или None, если id не от медленного трекера.
+    """
+    provider_key, _, topic = release_id.partition(":")
+    provider = PROVIDER_BY_KEY.get(provider_key)
+    if not is_slow_provider(provider) or not topic.isdigit():
+        return None
+    base = bot.RUTRACKER_BASE if provider_key == bot.RutrackerClient.key else bot.KINOZAL_BASE
+    page = f"viewtopic.php?t={topic}" if provider_key == bot.RutrackerClient.key else f"details.php?id={topic}"
+    return bot.Release(
+        torrent_id=topic, topic_id=topic, title="", category=provider.name, size_text="",
+        size_bytes=0, seeders=0, leechers=0, source_url=urljoin(base, page), download_url="",
+        score=0, provider=provider_key, source_name=provider.name,
+    )
+
+
+def with_known_hashes(release_id: str, release: bot.Release) -> bot.Release:
+    """Подставляет медленному релизу хэш и magnet, если они уже посчитаны.
+
+    Выдача RuTracker и Kinozal приходит без хэша, а `.torrent` у них не
+    скачать. С хэшем из кэша (его считает фоновая очередь) повторный поиск
+    сразу отдаёт и `info_hash`, и magnet — по нему раздачу и добавляют.
+
+    Args:
+        release_id: Стабильный идентификатор релиза.
+        release: Релиз из выдачи.
+
+    Returns:
+        Тот же релиз, с хэшем и magnet, если они известны.
+    """
+    if release.info_hash or not is_slow_provider(PROVIDER_BY_KEY.get(release.provider)):
+        return release
+    cache_key = hash_cache_key(release_id, release)
+    cached = HASH_CACHE.get(cache_key) if cache_key else None
+    if not isinstance(cached, str) or not INFO_HASH_RE.match(cached):
+        return release
+    return dataclasses.replace(
+        release, info_hash=cached, magnet_url=info_hash_magnet(cached, release.title)
+    )
+
+
+class HashPrefetcher:
+    """Фоновая очередь хэшей медленных трекеров: один поток, по одному релизу.
+
+    Очередь ограничена и без повторов. Свежий поиск и явный запрос хэшей
+    встают в начало: клиенту нужнее то, что он смотрит сейчас, а хвост
+    старых поисков отбрасывается при переполнении. Релиз, хэш которого не
+    дался, какое-то время не принимается снова: пауза удваивается с каждой
+    неудачей, от минуты до часа. Пока идёт поиск, очередь не берёт новую
+    задачу, чтобы не занимать Byparr перед запросом пользователя.
+    """
+
+    def __init__(
+        self,
+        resolve: Callable[[str, bot.Release], str | None],
+        known: Callable[[str, bot.Release], bool],
+        max_queue: int = PREFETCH_QUEUE_SIZE,
+        backoff_seconds: float = PREFETCH_BACKOFF_SECONDS,
+        backoff_max_seconds: float = PREFETCH_BACKOFF_MAX_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+        autostart: bool = True,
+    ) -> None:
+        self._resolve = resolve
+        self._known = known
+        self._max_queue = max(1, max_queue)
+        self._backoff = backoff_seconds
+        self._backoff_max = backoff_max_seconds
+        self._clock = clock
+        self._autostart = autostart
+        self._cond = threading.Condition()
+        self._queue: dict[str, bot.Release] = {}
+        self._current: str | None = None
+        self._failures: dict[str, tuple[int, float]] = {}
+        self._foreground = 0
+        self._thread: threading.Thread | None = None
+
+    def enqueue(self, items: Iterable[tuple[str, bot.Release]]) -> list[str]:
+        """Ставит релизы в начало очереди в данном порядке.
+
+        Args:
+            items: Пары «стабильный id, релиз» в порядке важности.
+
+        Returns:
+            Идентификаторы, которые попали в очередь (новые и поднятые).
+        """
+        unknown = [(release_id, release) for release_id, release in items if not self._known(release_id, release)]
+        now = self._clock()
+        with self._cond:
+            fresh: dict[str, bot.Release] = {}
+            for release_id, release in unknown:
+                failure = self._failures.get(release_id)
+                if release_id in fresh or release_id == self._current or (failure and now < failure[1]):
+                    continue
+                fresh[release_id] = release
+            if not fresh:
+                return []
+            rest = {key: value for key, value in self._queue.items() if key not in fresh}
+            merged = {**fresh, **rest}
+            self._queue = dict(list(merged.items())[: self._max_queue])
+            accepted = [release_id for release_id in fresh if release_id in self._queue]
+            self._cond.notify_all()
+        if self._autostart:
+            self._ensure_worker()
+        return accepted
+
+    def pending(self) -> list[str]:
+        """Идентификаторы в очереди, по порядку; для журнала и тестов."""
+        with self._cond:
+            return list(self._queue)
+
+    @contextlib.contextmanager
+    def foreground(self) -> Iterator[None]:
+        """На время поиска очередь не начинает новых запросов к Byparr."""
+        with self._cond:
+            self._foreground += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._foreground -= 1
+                self._cond.notify_all()
+
+    def wait_for(self, release_ids: Iterable[str], timeout: float) -> bool:
+        """Ждёт, пока эти релизы не уйдут из очереди, но не дольше срока.
+
+        Args:
+            release_ids: Кого ждём.
+            timeout: Секунды.
+
+        Returns:
+            True, если все обработаны (удачно или нет) к сроку.
+        """
+        wanted = set(release_ids)
+        with self._cond:
+            return self._cond.wait_for(
+                lambda: not (wanted & self._queue.keys()) and self._current not in wanted,
+                timeout=max(0.0, timeout),
+            )
+
+    def run_once(self) -> bool:
+        """Обрабатывает первый релиз очереди в текущем потоке.
+
+        Returns:
+            False, если очередь пуста.
+        """
+        with self._cond:
+            if not self._queue:
+                return False
+            release_id = next(iter(self._queue))
+            release = self._queue.pop(release_id)
+            self._current = release_id
+        value: str | None = None
+        try:
+            value = self._resolve(release_id, release)
+        except Exception as exc:
+            # Текст ошибки Byparr-трекера уже без кук, трассировка не нужна
+            LOG.warning("Фоновый хэш %s не получен: %s", release_id, exc)
+        with self._cond:
+            if value:
+                self._failures.pop(release_id, None)
+            else:
+                count = self._failures.get(release_id, (0, 0.0))[0] + 1
+                pause = min(self._backoff * 2 ** (count - 1), self._backoff_max)
+                self._failures[release_id] = (count, self._clock() + pause)
+                if len(self._failures) > 1000:
+                    self._failures.pop(next(iter(self._failures)))
+            self._current = None
+            self._cond.notify_all()
+        return True
+
+    def _ensure_worker(self) -> None:
+        with self._cond:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(target=self._work, name="hash-prefetch", daemon=True)
+            self._thread.start()
+
+    def _work(self) -> None:
+        while True:
+            with self._cond:
+                self._cond.wait_for(lambda: bool(self._queue) and self._foreground == 0)
+            try:
+                self.run_once()
+            except Exception:
+                LOG.exception("Фоновая очередь хэшей споткнулась")
+
+
+def prefetch_resolve(release_id: str, release: bot.Release) -> str | None:
+    """Хэш для фоновой очереди: можно идти к медленному трекеру."""
+    return release_info_hash(release_id, release, allow_slow=True)
+
+
+def prefetch_known(release_id: str, release: bot.Release) -> bool:
+    """Хэш уже есть — у релиза или в кэше хэшей."""
+    return release_info_hash(release_id, release, allow_slow=False) is not None
 
 
 def build_search_queries(
@@ -561,7 +926,9 @@ def aggregate_releases(
     )
     tasks: dict[Future[list[bot.Release]], tuple[bot.SearchProvider, str]] = {}
     for provider in providers:
-        for query in queries:
+        # Byparr-трекер — 20 секунд на страницу и один браузер на всех:
+        # ему только первый, самый точный запрос
+        for query in queries[:1] if is_slow_provider(provider) else queries:
             tasks[pool.submit(provider.search, query)] = (provider, query)
             pending[provider.name] += 1
     partial = False
@@ -757,6 +1124,7 @@ CATALOG = build_catalog()
 HASH_CACHE = meta_service.TTLCache(HASH_CACHE_PATH, HASH_TTL_SECONDS)
 RELEASE_STORE = meta_service.TTLCache(RELEASE_STORE_PATH, RELEASE_STORE_TTL_SECONDS)
 CACHE = ReleaseCache(store=RELEASE_STORE)
+PREFETCHER = HashPrefetcher(prefetch_resolve, prefetch_known)
 
 app = FastAPI(title="TorBox One Search API", version=API_VERSION)
 
@@ -881,13 +1249,25 @@ def tracker_search(
         raise HTTPException(status_code=400, detail="Запрос слишком короткий")
     wanted = min(max(limit, 1), MAX_SEARCH_LIMIT)
 
-    releases, status, sources, partial = aggregate_releases(list(PROVIDERS), queries, deadline)
+    slow_search = any(is_slow_provider(provider) for provider in PROVIDERS)
+    with PREFETCHER.foreground() if slow_search else contextlib.nullcontext():
+        releases, status, sources, partial = aggregate_releases(list(PROVIDERS), queries, deadline)
+    if slow_search:
+        releases = [with_known_hashes(stable_release_id(item), item) for item in releases]
     # Два прохода разнообразия — как у бота: сначала широкий срез кандидатов,
     # потом короткий список. Для limit <= 24 результат тот же, что прежде.
     candidates = bot.select_diverse_releases(releases, max(bot.MAX_SEARCH_CANDIDATES, wanted))
     top = bot.select_diverse_releases(candidates, wanted)
     stored = CACHE.put_all(top)
     LOG.info("Поиск %s: %d релизов, статус %s", queries, len(stored), status)
+    if slow_search:
+        # Хэши RuTracker и Kinozal — заранее, в порядке ранга
+        slow_items = [
+            (release_id, release) for release_id, release in stored
+            if is_slow_provider(PROVIDER_BY_KEY.get(release.provider))
+            and not prefetch_known(release_id, release)
+        ]
+        PREFETCHER.enqueue(slow_items[:PREFETCH_PER_SEARCH])
     return SearchResult(
         status=status,
         partial=partial,

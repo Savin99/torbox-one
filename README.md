@@ -121,6 +121,26 @@ PROWLARR_INDEXER_IDS=
 
 После изменения `.env` перезапусти бота. В выдаче будет указан конкретный трекер, а сверху — количество ответов от каждого поискового клиента.
 
+## RuTracker и Kinozal напрямую через Byparr
+
+Оба трекера стоят за Cloudflare и не пускают HTTP-клиент без браузера, даже с `cf_clearance`. Сервер поиска (`search_api.py`) читает их страницы через [Byparr](https://github.com/ThePhaseless/Byparr) — совместимый с FlareSolverr сервис с настоящим браузером. Byparr умеет только GET и тратит на страницу 17–20 секунд, браузер у него один, поэтому:
+
+- на один поиск — ровно один запрос к каждому трекеру, только по первому запросу из `build_search_queries`;
+- страницы тем на поиске не читаются; `info_hash` считается фоновой очередью после поиска (до 10 раздач на поиск, по одной) и отдаётся `/release/hashes` из кэша хэшей;
+- `.torrent` через Byparr не скачать: раздачу добавляют magnet-ссылкой по `info_hash`, `/release/{id}/torrent` для них отвечает `502`.
+
+Вход — только кукой из браузера, формы логина нет. Трекер включается, когда задана его кука:
+
+```dotenv
+BYPARR_URL=http://127.0.0.1:8192
+RUTRACKER_COOKIE=bb_session=replace_me
+RUTRACKER_ENABLED=true
+KINOZAL_COOKIE=uid=replace_me; pass=replace_me
+KINOZAL_ENABLED=true
+```
+
+`RUTRACKER_COOKIE` уходит для домена `.rutracker.org`, `KINOZAL_COOKIE` — для `.kinozal.me`. Это секреты: в журнал, текст ошибок и `repr` они не попадают. `RUTRACKER_ENABLED=false` / `KINOZAL_ENABLED=false` выключают трекер, не стирая куку. Telegram-бот (`main()` в `torbox_tg_bot.py`) эти трекеры не подключает: он добавляет раздачу по magnet или `.torrent` из выдачи, а у них в выдаче нет ни того, ни другого.
+
 ## Локальный запуск
 
 ```bash

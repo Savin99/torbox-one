@@ -19,6 +19,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread, Timer, get_ident, local
 from typing import Any, Protocol
@@ -1163,6 +1164,451 @@ class ProwlarrClient:
         except Exception as exc:
             raise RuntimeError(f"Prowlarr did not return a valid .torrent file: {exc}") from exc
         return response.content
+
+
+# --- RuTracker и Kinozal через Byparr ----------------------------------------
+#
+# Оба трекера стоят за Cloudflare и не пускают HTTP-клиент без браузера, даже с
+# cf_clearance. Страницы читает Byparr — совместимый с FlareSolverr сервис с
+# настоящим браузером. Он умеет только GET, тратит на страницу 17–20 с и
+# держит один браузер на всех, поэтому:
+#   - на один поиск пользователя — ровно один запрос к каждому трекеру;
+#   - страницы тем во время поиска не читаются, хэш считается потом и лениво;
+#   - вход на сайт — только кукой из env, формы логина нет.
+
+BYPARR_DEFAULT_URL = "http://127.0.0.1:8192"
+BYPARR_MAX_TIMEOUT_MS = 120_000
+RUTRACKER_BASE = "https://rutracker.org/forum/"
+KINOZAL_BASE = "https://kinozal.me/"
+# Кинозал пишет время по Москве; в published_at оно уходит в UTC, как у Prowlarr
+MOSCOW_TZ = timezone(timedelta(hours=3))
+# Выдача медленного трекера живёт недолго в памяти: опоздавший к сроку ответ
+# пригодится повторному поиску, а Byparr не тратит на него ещё 20 секунд
+SLOW_SEARCH_TTL_SECONDS = 15 * 60
+SLOW_SEARCH_MAX_ENTRIES = 64
+SECRET_PLACEHOLDER = "<вырезано>"
+SESSION_COOKIE_RE = re.compile(r"\b(bb_session|bb_[a-z_]+|uid|pass|sid|cf_clearance)=(?!<)[^;\s,\"'&]+", re.I)
+
+
+class ByparrError(RuntimeError):
+    """Byparr не дал страницу: сервис лёг, трекер ответил ошибкой или не тем."""
+
+
+def parse_cookie_header(raw: str, domain: str) -> list[dict[str, str]]:
+    """Разбирает строку куки из env в список для Byparr.
+
+    Args:
+        raw: Строка вида `uid=...; pass=...`, как в заголовке Cookie.
+        domain: Домен, для которого куки отправляются (`.rutracker.org`).
+
+    Returns:
+        Куки в форме `{"name", "value", "domain", "path"}`; пустые пары
+        и пары без имени отбрасываются.
+    """
+    cookies: list[dict[str, str]] = []
+    for part in raw.split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name.strip() and value.strip():
+            cookies.append({"name": name.strip(), "value": value.strip(), "domain": domain, "path": "/"})
+    return cookies
+
+
+class ByparrClient:
+    """GET-запросы к сайтам за Cloudflare через Byparr (FlareSolverr API).
+
+    Повторов нет намеренно: каждая попытка — это ещё 20 секунд браузера,
+    который один на всех.
+    """
+
+    def __init__(self, base_url: str = BYPARR_DEFAULT_URL, http: Any = None) -> None:
+        self.base_url = (base_url or BYPARR_DEFAULT_URL).rstrip("/")
+        self.http = http if http is not None else requests.Session()
+
+    def __repr__(self) -> str:
+        return f"ByparrClient({self.base_url!r})"
+
+    def get(self, url: str, cookies: list[dict[str, str]]) -> str:
+        """Отдаёт HTML страницы, которую открыл браузер Byparr.
+
+        Args:
+            url: Адрес страницы трекера.
+            cookies: Куки входа; в текст ошибок они не попадают.
+
+        Returns:
+            HTML страницы после выполнения скриптов.
+
+        Raises:
+            ByparrError: Byparr недоступен, ответил ошибкой или трекер
+                вернул не 200.
+        """
+        payload = {"cmd": "request.get", "url": url, "maxTimeout": BYPARR_MAX_TIMEOUT_MS, "cookies": cookies}
+        host = urlparse(url).hostname or "трекер"
+        try:
+            response = self.http.post(
+                f"{self.base_url}/v1", json=payload, timeout=BYPARR_MAX_TIMEOUT_MS / 1000 + 15
+            )
+        except requests.RequestException as exc:
+            # Цепочку исключений обрываем: в ней нечего искать, а рисковать
+            # телом запроса с куками в трассировке незачем
+            raise ByparrError(f"Byparr не ответил ({type(exc).__name__}) на запрос к {host}") from None
+        if response.status_code >= 400:
+            raise ByparrError(
+                f"Byparr вернул HTTP {response.status_code} на запрос к {host}: "
+                f"{self._scrub(self._message(response), cookies)}"
+            )
+        try:
+            data = response.json()
+        except ValueError:
+            raise ByparrError(f"Byparr вернул не JSON на запрос к {host}") from None
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            message = data.get("message", "") if isinstance(data, dict) else ""
+            raise ByparrError(f"Byparr не открыл {host}: {self._scrub(str(message), cookies)}")
+        solution = data.get("solution") if isinstance(data.get("solution"), dict) else {}
+        status = int(solution.get("status") or 0)
+        if status != 200:
+            raise ByparrError(f"{host} ответил HTTP {status}")
+        page = solution.get("response")
+        if not isinstance(page, str) or not page:
+            raise ByparrError(f"{host} вернул пустую страницу")
+        return page
+
+    @staticmethod
+    def _message(response: Any) -> str:
+        try:
+            data = response.json()
+        except ValueError:
+            return ""
+        return str(data.get("message", "")) if isinstance(data, dict) else ""
+
+    @staticmethod
+    def _scrub(text: str, cookies: list[dict[str, str]]) -> str:
+        """Вырезает куки, если Byparr вдруг повторил их в тексте ошибки.
+
+        Сначала значения своих кук, потом всё, что похоже на куку входа
+        любого из трекеров или Cloudflare: процесс держит куки обоих сайтов.
+        """
+        for cookie in cookies:
+            if cookie.get("value"):
+                text = text.replace(cookie["value"], SECRET_PLACEHOLDER)
+        text = SESSION_COOKIE_RE.sub(rf"\1={SECRET_PLACEHOLDER}", text)
+        return text[:200]
+
+
+def strip_tags(fragment: str) -> str:
+    """Текст HTML-фрагмента в одну строку, без тегов и сущностей."""
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", fragment))).strip()
+
+
+def parse_ru_size(size_text: str) -> int:
+    """Размер в байтах из «68.45 ГБ», «657 МБ» или «396.4 MB»."""
+    translated = size_text.upper()
+    for russian, latin in (("ТБ", "TB"), ("ГБ", "GB"), ("МБ", "MB"), ("КБ", "KB")):
+        translated = translated.replace(russian, latin)
+    return parse_size(translated)
+
+
+def tracker_topic_summary(page: str) -> str:
+    """Перевод, видео и аудио из описания темы RuTracker или Kinozal.
+
+    Отдельно от разбора NNM-Club: здесь метки вида `<b>Перевод</b>:` после
+    вырезания тегов дают «Перевод :», и пробел перед двоеточием убирается.
+    """
+    text = re.sub(r"\s+:", ":", strip_tags(page))
+    keys = ("Перевод:", "Озвучивание:", "Качество:", "Качество видео:", "Видео:", "Аудио:", "Аудио 1:")
+    stops = r"Перевод:|Озвучивание:|Качество:|Качество видео:|Видео:|Аудио:|Аудио \d+:|Субтитры:|Формат:|Размер:|Продолжительность:|Режиссер:|В ролях:|Описание:"
+    fragments: list[str] = []
+    for key in keys:
+        match = re.search(re.escape(key) + r"\s*(.{1,220}?)(?=\s+(?:" + stops + r")|$)", text, re.I)
+        if match and match.group(1).strip():
+            fragments.append(f"{key} {match.group(1).strip()}")
+    return "\n".join(fragments[:6]) or "Подробное описание у источника не распознано."
+
+
+class ByparrTrackerClient:
+    """Общее у трекеров, которые читаются через Byparr.
+
+    `slow = True` говорит серверу поиска: один запрос на поиск и хэш только
+    фоном (`search_api.HashPrefetcher`). Куки хранятся в закрытом поле и не
+    попадают ни в repr, ни в текст ошибок.
+    """
+
+    key = ""
+    name = ""
+    cookie_domain = ""
+    slow = True
+
+    def __init__(self, cookie: str, byparr: ByparrClient) -> None:
+        self._cookies = parse_cookie_header(cookie, self.cookie_domain)
+        if not self._cookies:
+            raise RuntimeError(f"{self.name}: кука входа пустая или не разбирается")
+        self.byparr = byparr
+        self._recent: dict[str, tuple[float, list[Release]]] = {}
+        self._recent_lock = Lock()
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(key={self.key!r}, cookies=<скрыты>)"
+
+    def fetch(self, url: str) -> str:
+        """Страница трекера через Byparr с куками входа."""
+        return self.byparr.get(url, self._cookies)
+
+    def search_url(self, query: str) -> str:
+        raise NotImplementedError
+
+    def parse_search(self, page: str) -> list[Release]:
+        raise NotImplementedError
+
+    def search(self, query: str) -> list[Release]:
+        """Один запрос к трекеру; свежий повтор того же запроса берётся из памяти."""
+        cache_key = query.strip().casefold()
+        now = time.monotonic()
+        with self._recent_lock:
+            entry = self._recent.get(cache_key)
+            if entry is not None and now - entry[0] <= SLOW_SEARCH_TTL_SECONDS:
+                return list(entry[1])
+        releases = self.parse_search(self.fetch(self.search_url(query)))
+        with self._recent_lock:
+            self._recent[cache_key] = (time.monotonic(), releases)
+            expired = [key for key, (stamp, _) in self._recent.items() if now - stamp > SLOW_SEARCH_TTL_SECONDS]
+            for key in expired:
+                del self._recent[key]
+            while len(self._recent) > SLOW_SEARCH_MAX_ENTRIES:
+                del self._recent[next(iter(self._recent))]
+        return list(releases)
+
+    def topic_summary(self, release: Release) -> str:
+        return tracker_topic_summary(self.fetch(release.source_url))
+
+    def resolve_info_hash(self, release: Release) -> str:
+        """hex40 раздачи со страницы трекера; пустая строка, если его там нет."""
+        raise NotImplementedError
+
+    def download_torrent(self, release: Release) -> bytes:
+        # Byparr отдаёт только текст страницы, а .torrent трекер отдаёт лишь
+        # браузеру. Раздачу добавляют magnet-ссылкой по info_hash.
+        raise RuntimeError(f"{self.name} отдаёт .torrent только браузеру — добавь раздачу по magnet из info_hash")
+
+
+def cp1251_query(query: str) -> str:
+    """Запрос для адреса в cp1251: так кодируют поиск сами RuTracker и Kinozal."""
+    return quote_plus(query, encoding="cp1251", errors="ignore")
+
+
+def utc_iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def is_logged_out_rutracker(page: str) -> bool:
+    return "login_username" in page and "data-topic_id" not in page
+
+
+class RutrackerClient(ByparrTrackerClient):
+    key = "rutracker"
+    name = "RuTracker"
+    cookie_domain = ".rutracker.org"
+
+    def search_url(self, query: str) -> str:
+        # o=10&s=2 — по числу сидов, по убыванию: в первую страницу (50 тем)
+        # попадает живое, а не свежезалитое
+        return f"{RUTRACKER_BASE}tracker.php?nm={cp1251_query(query)}&o=10&s=2"
+
+    def parse_search(self, page: str) -> list[Release]:
+        if is_logged_out_rutracker(page):
+            raise RuntimeError("RuTracker: вход не выполнен, обнови RUTRACKER_COOKIE")
+        return parse_rutracker_search(page)
+
+    def resolve_info_hash(self, release: Release) -> str:
+        page = self.fetch(urljoin(RUTRACKER_BASE, f"viewtopic.php?t={release.topic_id}"))
+        if is_logged_out_rutracker(page) and "magnet:" not in page:
+            raise RuntimeError("RuTracker: вход не выполнен, обнови RUTRACKER_COOKIE")
+        return rutracker_topic_hash(page)
+
+
+def parse_rutracker_search(page: str) -> list[Release]:
+    """Разбирает `tracker.php`: строки таблицы с `data-topic_id`.
+
+    Args:
+        page: HTML выдачи поиска.
+
+    Returns:
+        Релизы по убыванию ранга, без хэша — его даёт только страница темы.
+    """
+    releases: list[Release] = []
+    seen: set[str] = set()
+    for topic_id, row in re.findall(r"<tr\b[^>]*\bdata-topic_id=\"(\d+)\"[^>]*>(.*?)</tr>", page, re.S | re.I):
+        if topic_id in seen:
+            continue
+        title_match = re.search(r"<a\b[^>]*\btLink\b[^>]*>(.*?)</a>", row, re.S | re.I)
+        if not title_match:
+            continue
+        title = strip_tags(title_match.group(1))
+        if not title:
+            continue
+        seen.add(topic_id)
+        category_match = re.search(r'class="f-name"[^>]*>\s*<a\b[^>]*>(.*?)</a>', row, re.S | re.I)
+        category = strip_tags(category_match.group(1)) if category_match else "RuTracker"
+        size_match = re.search(r'class="[^"]*\btor-size\b[^"]*"[^>]*data-ts_text="(\d+)"', row, re.I)
+        size_bytes = int(size_match.group(1)) if size_match else 0
+        size_text_match = re.search(r'class="[^"]*\btr-dl\b[^"]*"[^>]*>(.*?)</a>', row, re.S | re.I)
+        size_text = strip_tags(size_text_match.group(1)).replace("↓", "").strip() if size_text_match else ""
+        if not size_text:
+            size_text = human_size(size_bytes) if size_bytes else "размер не указан"
+        seed_match = re.search(r'<b class="seedmed">\s*(\d+)\s*</b>', row, re.I)
+        leech_match = re.search(r'class="[^"]*\bleechmed\b[^"]*"[^>]*>\s*(?:<b>)?\s*(\d+)', row, re.I)
+        seeders = int(seed_match.group(1)) if seed_match else 0
+        leechers = int(leech_match.group(1)) if leech_match else 0
+        # Последняя ячейка — время регистрации .torrent (unix). Онгоинг
+        # перерегистрируется в той же теме, и вместе с ним меняется хэш
+        added_match = re.search(r'data-ts_text="(\d{9,11})"[^>]*>\s*<p>', row, re.I)
+        added = int(added_match.group(1)) if added_match else 0
+        releases.append(Release(
+            torrent_id=f"{topic_id}-{added}" if added else topic_id,
+            topic_id=topic_id,
+            title=title,
+            category=category,
+            size_text=size_text,
+            size_bytes=size_bytes,
+            seeders=seeders,
+            leechers=leechers,
+            source_url=urljoin(RUTRACKER_BASE, f"viewtopic.php?t={topic_id}"),
+            download_url=urljoin(RUTRACKER_BASE, f"dl.php?t={topic_id}"),
+            score=score_release(title, seeders, leechers),
+            provider=RutrackerClient.key,
+            source_name=RutrackerClient.name,
+            published_at=utc_iso(datetime.fromtimestamp(added, timezone.utc)) if added else "",
+        ))
+    return sorted(releases, key=lambda item: item.score, reverse=True)[:MAX_PROVIDER_RESULTS]
+
+
+def rutracker_topic_hash(page: str) -> str:
+    """hex40 из magnet-ссылки на странице темы RuTracker."""
+    magnet = re.search(r"magnet:\?[^\s\"'<>]+", page, re.I)
+    if not magnet:
+        return ""
+    value = normalize_info_hash(magnet_info_hash(html.unescape(magnet.group(0))))
+    return value if re.fullmatch(r"[0-9a-f]{40}", value) else ""
+
+
+class KinozalClient(ByparrTrackerClient):
+    key = "kinozal"
+    name = "Kinozal"
+    cookie_domain = ".kinozal.me"
+
+    def search_url(self, query: str) -> str:
+        # t=1 — по сидам: у Кинозала порядок по умолчанию — по дате заливки
+        return f"{KINOZAL_BASE}browse.php?s={cp1251_query(query)}&t=1"
+
+    def parse_search(self, page: str) -> list[Release]:
+        return parse_kinozal_search(page)
+
+    def resolve_info_hash(self, release: Release) -> str:
+        page = self.fetch(urljoin(KINOZAL_BASE, f"get_srv_details.php?id={release.topic_id}&action=2"))
+        return kinozal_info_hash(page)
+
+
+def parse_kinozal_date(raw: str, now: datetime | None = None) -> str:
+    """«05.04.2025 в 16:33», «сегодня в 10:00» по Москве -> ISO-8601 в UTC."""
+    text = raw.strip().casefold()
+    clock = re.search(r"(\d{1,2}):(\d{2})", text)
+    if not clock:
+        return ""
+    hour, minute = int(clock.group(1)), int(clock.group(2))
+    date = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", text)
+    try:
+        if date:
+            moment = datetime(int(date.group(3)), int(date.group(2)), int(date.group(1)), hour, minute, tzinfo=MOSCOW_TZ)
+        elif "сегодня" in text or "вчера" in text:
+            today = (now or datetime.now(MOSCOW_TZ)).astimezone(MOSCOW_TZ)
+            moment = today.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if "вчера" in text:
+                moment -= timedelta(days=1)
+        else:
+            return ""
+    except ValueError:
+        return ""
+    return utc_iso(moment)
+
+
+def parse_kinozal_search(page: str) -> list[Release]:
+    """Разбирает `browse.php`: строки с `/details.php?id=<id>" class="r<N>"`.
+
+    Ссылка на свой профиль (`/userdetails.php?id=`) и ссылки на раздающих
+    тоже содержат `details.php?id=`; результатом считается только ссылка
+    ровно на `/details.php` с классом `rN`.
+
+    Args:
+        page: HTML выдачи поиска.
+
+    Returns:
+        Релизы по убыванию ранга, без хэша — его даёт `get_srv_details.php`.
+    """
+    releases: list[Release] = []
+    seen: set[str] = set()
+    for row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", page, re.S | re.I):
+        link = re.search(
+            r'<a\s+href="(?:https?:)?(?://kinozal\.me)?/details\.php\?id=(\d+)"\s+class="r\d+"[^>]*>(.*?)</a>',
+            row, re.S | re.I,
+        )
+        if not link:
+            continue
+        release_id, title = link.group(1), strip_tags(link.group(2))
+        if release_id in seen or not title:
+            continue
+        seen.add(release_id)
+        cells = [strip_tags(cell) for cell in re.findall(r'<td class="s">(.*?)</td>', row, re.S | re.I)]
+        # Ячейки class="s": комментарии, размер, дата заливки
+        size_text = next((cell for cell in cells if re.search(r"\d\s*[КМГТ]Б|\d\s*[KMGT]B", cell, re.I)), "")
+        date_text = next((cell for cell in cells if re.search(r"\d:\d{2}", cell)), "")
+        seed_match = re.search(r'<td class="sl_s">\s*(\d+)', row, re.I)
+        peer_match = re.search(r'<td class="sl_p">\s*(\d+)', row, re.I)
+        seeders = int(seed_match.group(1)) if seed_match else 0
+        leechers = int(peer_match.group(1)) if peer_match else 0
+        category_match = re.search(r"/pic/cat/(\d+)\.gif", row)
+        published = parse_kinozal_date(date_text) if date_text else ""
+        # Дата в выдаче — время последнего обновления .torrent: с ней новый
+        # файл в той же раздаче получает свой ключ кэша хэша
+        stamp = re.sub(r"\D", "", published)
+        releases.append(Release(
+            torrent_id=f"{release_id}-{stamp}" if stamp else release_id,
+            topic_id=release_id,
+            title=title,
+            category=f"Kinozal, раздел {category_match.group(1)}" if category_match else "Kinozal",
+            size_text=size_text or "размер не указан",
+            size_bytes=parse_ru_size(size_text),
+            seeders=seeders,
+            leechers=leechers,
+            source_url=urljoin(KINOZAL_BASE, f"details.php?id={release_id}"),
+            download_url=urljoin(KINOZAL_BASE, f"download.php?id={release_id}"),
+            score=score_release(title, seeders, leechers),
+            provider=KinozalClient.key,
+            source_name=KinozalClient.name,
+            published_at=published,
+        ))
+    return sorted(releases, key=lambda item: item.score, reverse=True)[:MAX_PROVIDER_RESULTS]
+
+
+def kinozal_info_hash(page: str) -> str:
+    """hex40 из «Инфо хеш: …» на странице `get_srv_details.php?action=2`."""
+    match = re.search(r"Инфо\s+хеш:\s*([0-9A-Fa-f]{40})", html.unescape(page))
+    return match.group(1).casefold() if match else ""
+
+
+def build_byparr_providers() -> list[SearchProvider]:
+    """RuTracker и Kinozal из env: каждый — только при заданной куке.
+
+    `RUTRACKER_ENABLED` / `KINOZAL_ENABLED` (по умолчанию true) выключают
+    трекер, не стирая куку; `BYPARR_URL` — адрес Byparr.
+    """
+    byparr = ByparrClient(os.getenv("BYPARR_URL", "").strip() or BYPARR_DEFAULT_URL)
+    providers: list[SearchProvider] = []
+    for client_class, cookie_env, flag_env in (
+        (RutrackerClient, "RUTRACKER_COOKIE", "RUTRACKER_ENABLED"),
+        (KinozalClient, "KINOZAL_COOKIE", "KINOZAL_ENABLED"),
+    ):
+        cookie = os.getenv(cookie_env, "").strip()
+        if cookie and env_bool(flag_env, True):
+            providers.append(client_class(cookie, byparr))
+    return providers
 
 
 class SearchAggregator:
