@@ -269,7 +269,10 @@ def release_payload(release_id: str, release: bot.Release) -> dict[str, Any]:
         "leechers": release.leechers,
         "source_name": release.source_name,
         "category": release.category,
-        "magnet_url": release.magnet_url,
+        # Хэш известен, а magnet нет (Knaben через Prowlarr отдаёт ссылку-редирект на magnet):
+        # magnet из хэша — иначе клиент пойдёт за .torrent, которого у источника нет.
+        "magnet_url": release.magnet_url or (info_hash_magnet(release.info_hash, release.title)
+                                             if release.provider == bot.ProwlarrClient.key and INFO_HASH_RE.match(release.info_hash or "") else ""),
         "info_hash": release.info_hash,
         "quality_summary": bot.video_quality_summary(release),
         "voiceover_summary": bot.voiceover_summary(release),
@@ -575,8 +578,11 @@ def release_info_hash(
             return None
         value = normalized_info_hash(provider.resolve_info_hash(release))
     else:
-        payload = provider.download_torrent(release)
-        value = bot.torrent_fingerprint(payload).casefold()
+        try:
+            payload = provider.download_torrent(release)
+            value = bot.torrent_fingerprint(payload).casefold()
+        except bot.MagnetRedirect as redirect:
+            value = bot.magnet_info_hash(redirect.magnet).casefold()
     if not INFO_HASH_RE.match(value):
         return None
     if cache_key:
@@ -1576,8 +1582,13 @@ def release_torrent(release_id: str) -> Response:
         )
     try:
         payload = provider.download_torrent(release)
-    except Exception as exc:
+    except bot.MagnetRedirect:
         raise HTTPException(
-            status_code=502, detail=f"Не получилось скачать .torrent: {exc}"
+            status_code=502, detail="У этой раздачи нет .torrent, только magnet. Обновите поиск и выберите её снова."
+        ) from None
+    except Exception as exc:
+        LOG.warning("Не получилось скачать .torrent %s: %s", release_id, type(exc).__name__)
+        raise HTTPException(
+            status_code=502, detail="Не получилось скачать .torrent у источника. Выберите другую раздачу."
         ) from exc
     return Response(content=payload, media_type="application/x-bittorrent")

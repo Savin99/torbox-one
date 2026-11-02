@@ -13,6 +13,7 @@ import threading
 import time
 import types
 import unittest
+import unittest.mock
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -1161,3 +1162,47 @@ class LogRedactionTests(unittest.TestCase):
     def test_ordinary_lines_are_untouched(self) -> None:
         line = self.format_record("Поиск ['Дюна 2021']: 8 релизов")
         self.assertIn("Поиск ['Дюна 2021']: 8 релизов", line)
+
+
+class MagnetFromHashTests(unittest.TestCase):
+    """Хэш известен, magnet нет (Knaben через Prowlarr) — клиент получает magnet из хэша."""
+
+    def test_payload_builds_magnet_from_known_hash(self) -> None:
+        release = make_release(provider="prowlarr", info_hash="38db15f22435c9da85a340d2a40e3a2427335f21", magnet_url="")
+        payload = search_api.release_payload("prowlarr:knaben:1", release)
+        self.assertTrue(payload["magnet_url"].startswith("magnet:?xt=urn:btih:38db15f22435c9da85a340d2a40e3a2427335f21"))
+
+    def test_payload_keeps_source_magnet_and_skips_bad_hash(self) -> None:
+        own = make_release(magnet_url="magnet:?xt=urn:btih:" + "b" * 40 + "&tr=udp://x")
+        self.assertEqual(search_api.release_payload("nnm:1", own)["magnet_url"], own.magnet_url)
+        # У NNM есть настоящий .torrent: прежний ответ без magnet сохраняется (совместимость TorBox One).
+        self.assertEqual(search_api.release_payload("nnm:4", make_release())["magnet_url"], "")
+        self.assertEqual(search_api.release_payload("p:2", make_release(provider="prowlarr", info_hash="", magnet_url=""))["magnet_url"], "")
+        self.assertEqual(search_api.release_payload("p:3", make_release(provider="prowlarr", info_hash="not-a-hash", magnet_url=""))["magnet_url"], "")
+
+
+class MagnetRedirectTests(unittest.TestCase):
+    """Ссылка «.torrent» Prowlarr, которая редиректит на magnet, — не падение, а magnet."""
+
+    MAGNET = "magnet:?xt=urn:btih:38DB15F22435C9DA85A340D2A40E3A2427335F21&dn=Resident%20Evil"
+
+    def _client(self) -> bot.ProwlarrClient:
+        client = bot.ProwlarrClient("http://127.0.0.1:9696", "api-key")
+        redirect = unittest.mock.Mock(is_redirect=True, headers={"Location": self.MAGNET}, url="http://127.0.0.1:9696/1/download")
+        client.http = unittest.mock.Mock(get=unittest.mock.Mock(return_value=redirect))
+        return client
+
+    def test_download_raises_magnet_redirect(self) -> None:
+        release = make_release(provider="prowlarr", download_url="http://127.0.0.1:9696/1/download?link=x", info_hash="")
+        with self.assertRaises(bot.MagnetRedirect) as caught:
+            self._client().download_torrent(release)
+        self.assertEqual(caught.exception.magnet, self.MAGNET)
+
+    def test_hash_comes_from_redirect_magnet(self) -> None:
+        client = self._client()
+        release = make_release(provider="prowlarr", download_url="http://127.0.0.1:9696/1/download?link=x", info_hash="")
+        cache = unittest.mock.Mock(get=unittest.mock.Mock(return_value=None))
+        with unittest.mock.patch.dict(search_api.PROVIDER_BY_KEY, {"prowlarr": client}), \
+                unittest.mock.patch.object(search_api, "HASH_CACHE", cache):
+            value = search_api.release_info_hash("prowlarr:knaben:1", release)
+        self.assertEqual(value, "38db15f22435c9da85a340d2a40e3a2427335f21")

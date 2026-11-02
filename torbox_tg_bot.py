@@ -1032,6 +1032,14 @@ class NnmClient:
         return response.content
 
 
+class MagnetRedirect(RuntimeError):
+    """Ссылка на «.torrent» оказалась редиректом на magnet (так отдаёт Knaben через Prowlarr)."""
+
+    def __init__(self, magnet: str) -> None:
+        super().__init__("download URL redirects to a magnet link")
+        self.magnet = magnet
+
+
 class ProwlarrClient:
     """One connector for all torrent indexers configured in Prowlarr."""
 
@@ -1150,10 +1158,21 @@ class ProwlarrClient:
         if urlparse(url).scheme not in {"http", "https"}:
             raise RuntimeError("Prowlarr returned an unsupported download URL")
         if same_origin:
-            response = self.http.get(url, timeout=40)
+            response = self.http.get(url, timeout=40, allow_redirects=False)
         else:
             # Never leak the Prowlarr API key to a tracker-owned URL.
-            response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=40)
+            response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=40, allow_redirects=False)
+        # Редирект: на magnet — не файл, отдаём его вызывающему; на http — идём вручную без ключа.
+        hops = 0
+        while response.is_redirect and hops < 5:
+            location = response.headers.get("Location", "")
+            if is_magnet_url(location):
+                raise MagnetRedirect(location)
+            location = urljoin(response.url, location)
+            if urlparse(location).scheme not in {"http", "https"}:
+                raise RuntimeError("Prowlarr returned an unsupported download URL")
+            response = requests.get(location, headers={"User-Agent": USER_AGENT}, timeout=40, allow_redirects=False)
+            hops += 1
         response.raise_for_status()
         if len(response.content) > MAX_TORRENT_BYTES:
             raise RuntimeError("Torrent file is unexpectedly large")
