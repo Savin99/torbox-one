@@ -6,7 +6,7 @@ struct DownloadsGrid: View {
     let torrents: [TBTorrent]
     let onOpen: (TBTorrent) -> Void
     let onDelete: (TBTorrent) -> Void
-    let onPlay: (TBTorrent) -> Void
+    let onDownload: (TBTorrent) -> Void
 
     @Environment(\.dynamicTypeSize) private var typeSize
 
@@ -58,9 +58,6 @@ struct DownloadsGrid: View {
                             .padding(5)
                     }
                 }
-                .overlay(alignment: .topLeading) {
-                    watchMark(torrent)
-                }
                 Text(meta?.title.isEmpty == false ? meta!.title : (torrent.name ?? "Без названия"))
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(Theme.textPrimary)
@@ -77,11 +74,11 @@ struct DownloadsGrid: View {
             await appState.meta.load(name: torrent.name, client: appState.searchClient)
         }
         .contextMenu {
-            if status.isFinished, PlayerQueueFactory.suggestedFile(torrent: torrent, appState: appState) != nil {
+            if status.isFinished, !DownloadSelection.videoFiles(of: torrent).isEmpty {
                 Button {
-                    onPlay(torrent)
+                    onDownload(torrent)
                 } label: {
-                    Label("Смотреть", systemImage: "play.fill")
+                    Label("Выбрать для скачивания", systemImage: "arrow.down.to.line")
                 }
             }
             Button {
@@ -100,37 +97,6 @@ struct DownloadsGrid: View {
             [meta?.title ?? torrent.name ?? "", status.label].filter { !$0.isEmpty }.joined(separator: ", ")
         )
         .accessibilityAddTraits(.isButton)
-    }
-
-    /// Галочка «всё просмотрено» или полоса продолжения — как в Infuse.
-    @ViewBuilder
-    private func watchMark(_ torrent: TBTorrent) -> some View {
-        let videos = PlayerQueueFactory.videoFiles(of: torrent)
-        let progress = appState.playback.progress(torrent: torrent, files: videos)
-        if progress.total > 0, progress.watched == progress.total {
-            Image(systemName: "checkmark")
-                .font(.caption2.weight(.heavy))
-                .foregroundStyle(.white)
-                .padding(5)
-                .background(Circle().fill(Theme.accent))
-                .padding(5)
-        } else if let entry = progress.resumable {
-            Text("\(Int(entry.fraction * 100))%")
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(Capsule().fill(.black.opacity(0.6)))
-                .padding(5)
-        } else if progress.watched > 0 {
-            Text("\(progress.watched)/\(progress.total)")
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(Capsule().fill(.black.opacity(0.6)))
-                .padding(5)
-        }
     }
 
     private func subtitle(meta: TitleMeta?, torrent: TBTorrent) -> String {

@@ -27,6 +27,14 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
+			<string>com.ilyaqa.torboxone.infuse</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>torboxone</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleURLName</key>
 			<string>com.ilyaqa.torboxone.magnet</string>
 			<key>CFBundleURLSchemes</key>
 			<array>

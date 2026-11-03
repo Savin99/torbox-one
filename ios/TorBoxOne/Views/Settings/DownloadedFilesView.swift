@@ -35,7 +35,7 @@ struct DownloadedFilesView: View {
                             EmptyState(
                                 icon: "arrow.down.to.line",
                                 title: "Ничего не скачано",
-                                message: "Включи «Качать при просмотре» или выбери «Скачать в телефон» в меню файла.",
+                                message: "Новые видео сохраняются через «Скачать в Infuse». Здесь остаются файлы, скачанные в TorBox One раньше.",
                                 tint: Theme.info
                             )
                         } else {
@@ -55,7 +55,7 @@ struct DownloadedFilesView: View {
                 .padding(.bottom, Theme.tabBarInset)
             }
         }
-        .navigationTitle("Память телефона")
+        .navigationTitle("Файлы TorBox One")
         .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog(
             "Удалить все скачанные файлы с телефона?",
@@ -118,6 +118,13 @@ struct DownloadedFilesView: View {
                 Chip.size(item.totalBytes)
             }
             Spacer(minLength: 0)
+            if let local = appState.downloads.localURL(key: item.key) {
+                ShareLink(item: local) {
+                    Image(systemName: "square.and.arrow.up")
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel("Передать \(item.fileName) в Infuse")
+            }
             Button {
                 Haptics.warning()
                 appState.downloads.deleteLocal(key: item.key)

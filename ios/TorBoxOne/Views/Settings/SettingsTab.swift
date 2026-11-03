@@ -13,9 +13,6 @@ struct SettingsTab: View {
     @State private var confirmForgetKey = false
     @State private var confirmClearMeta = false
 
-    #if DEBUG
-    @State private var debugQueue: PlayerQueue?
-    #endif
 
     var body: some View {
         NavigationStack {
@@ -41,11 +38,6 @@ struct SettingsTab: View {
                 .scrollDismissesKeyboard(.interactively)
             }
             .navigationTitle("Настройки")
-            #if DEBUG
-            .fullScreenCover(item: $debugQueue) { queue in
-                PlayerScreen(queue: queue)
-            }
-            #endif
             .confirmationDialog(
                 "Очистить кэш метаданных? Постеры и описания загрузятся заново.",
                 isPresented: $confirmClearMeta,
@@ -261,48 +253,33 @@ struct SettingsTab: View {
     // MARK: - Просмотр
 
     private var watchCard: some View {
-        @Bindable var state = appState
-        return SettingsCard(
-            title: "Просмотр",
-            icon: "play.rectangle.fill",
+        SettingsCard(
+            title: "Локальный просмотр",
+            icon: "iphone",
             tint: Theme.info,
-            footer: "Как в Telegram: включил серию — она сохраняется в память телефона и потом открывается мгновенно и без интернета."
+            footer: "TorBox One передаёт выбранные файлы на скачивание. Просмотр и продолжение с места остановки — в Infuse."
         ) {
-            Toggle(isOn: $state.downloadWhileWatching) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Качать при просмотре")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(Theme.textPrimary)
-                    Text("Серия останется на телефоне")
-                        .font(.caption)
-                        .foregroundStyle(Theme.textSecondary)
-                }
-            }
-            .tint(Theme.accent)
-            .frame(minHeight: Theme.hit)
-
-            Divider().overlay(Theme.hairline.opacity(0.08))
-
-            NavigationLink {
-                DownloadedFilesView()
-            } label: {
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Память телефона")
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(Theme.textPrimary)
-                        Text("Занято \(Format.bytes(appState.downloads.totalBytesUsed)) · свободно \(Format.bytes(DownloadManager.freeBytes))")
-                            .font(.caption)
-                            .foregroundStyle(Theme.textSecondary)
+            InfuseLibraryCard()
+            Text("1. Добавь раздачу и дождись её готовности в TorBox.\n2. Открой раздачу и скачай фильм, сезон или выбранные серии в Infuse.\n3. Дождись окончания загрузки в Infuse и смотри без интернета.\n4. Удали просмотренный сезон в Infuse, затем скачай следующий здесь.")
+                .font(.footnote).foregroundStyle(Theme.textSecondary)
+            if !appState.downloads.items.isEmpty {
+                Divider()
+                NavigationLink {
+                    DownloadedFilesView()
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Файлы TorBox One")
+                            Text("\(Format.bytes(appState.downloads.totalBytesUsed)) · можно передать в Infuse")
+                                .font(.caption).foregroundStyle(Theme.textSecondary)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
                     }
-                    Spacer(minLength: 0)
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(Theme.textTertiary)
+                    .frame(minHeight: Theme.hit)
                 }
-                .frame(minHeight: Theme.hit)
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
     }
 
@@ -329,7 +306,7 @@ struct SettingsTab: View {
             Divider().overlay(Theme.hairline.opacity(0.08))
 
             HStack {
-                Text("Кадры из плеера")
+                Text("Сохранённые кадры")
                     .font(.subheadline)
                     .foregroundStyle(Theme.textSecondary)
                 Spacer()
@@ -364,43 +341,17 @@ struct SettingsTab: View {
             title: "Infuse",
             icon: "play.circle",
             tint: Theme.instant,
-            footer: "Кнопка «Infuse» в раздаче работает и без этой настройки."
+            footer: "Чтобы сразу освободить память после удаления сезона, очисти «Недавно удалённые» в приложении «Файлы»."
         ) {
-            DisclosureGroup("Библиотека TorBox по WebDAV") {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Один раз добавь TorBox в Infuse — всё скачанное будет появляться там само:")
-                    Text("1. Infuse → Настройки → Добавить источник → WebDAV")
-                    copyRow(label: "2. Адрес", value: "https://webdav.torbox.app")
-                    copyRow(label: "3. Логин", value: "torbox")
-                    Text("4. Пароль — твой API-ключ TorBox")
-                    Text("5. Выключи Auto Scan, Pre-Cache Details, Pre-Cache Artwork и Smart Folders")
-                }
+            Label(appState.infuse.isInstalled ? "Infuse установлен" : "Установи Infuse для просмотра",
+                  systemImage: appState.infuse.isInstalled ? "checkmark.circle.fill" : "arrow.down.app")
+                .foregroundStyle(appState.infuse.isInstalled ? Theme.accent : Theme.textSecondary)
+            Link("Infuse \(InfuseProtocol.minimumVersion) или новее · App Store", destination: InfuseLinks.appStore)
                 .font(.footnote)
-                .foregroundStyle(Theme.textSecondary)
-                .padding(.top, 6)
-            }
-            .font(.subheadline.weight(.medium))
-            .tint(Theme.textPrimary)
-        }
-    }
-
-    private func copyRow(label: String, value: String) -> some View {
-        HStack(spacing: 8) {
-            Text(label)
-            Text(value)
-                .font(.footnote.weight(.semibold).monospaced())
-                .foregroundStyle(Theme.textPrimary)
-                .textSelection(.enabled)
-            Spacer(minLength: 0)
-            Button {
-                UIPasteboard.general.string = value
-                appState.toasts.info("Скопировано")
-            } label: {
-                Image(systemName: "doc.on.doc")
-                    .foregroundStyle(Theme.accent)
-            }
-            .buttonStyle(.borderless)
-            .accessibilityLabel("Скопировать \(label)")
+            Text("В Infuse включи «Продолжать воспроизведение» для памяти позиции и «Непрерывное воспроизведение» для серий подряд. Язык озвучки и субтитров также выбирается там.")
+                .font(.footnote).foregroundStyle(Theme.textSecondary)
+            Link("Как удалить скачанные серии", destination: URL(string: "https://support.firecore.com/hc/en-us/articles/215090957-Creating-Folders-and-Deleting-Videos")!)
+                .font(.footnote)
         }
     }
 
@@ -463,38 +414,6 @@ struct SettingsTab: View {
     #if DEBUG
     private var debugCard: some View {
         SettingsCard(title: "Отладка", icon: "ladybug", tint: Theme.danger, footer: nil) {
-            Button("Плеер: MKV с несколькими дорожками") {
-                debugQueue = PlayerQueue(single: PlayerTrackItem.local(
-                    id: "debug-mkv",
-                    title: "matroska test5.mkv",
-                    subtitle: "Тестовый файл",
-                    url: URL(string: "https://github.com/ietf-wg-cellar/matroska-test-files/raw/master/test_files/test5.mkv")!
-                ))
-            }
-            .font(.subheadline)
-            .frame(minHeight: Theme.hit)
-            Divider().overlay(Theme.hairline.opacity(0.08))
-            Button("Плеер: очередь из двух коротких MP4") {
-                debugQueue = PlayerQueue(items: [
-                    PlayerTrackItem.local(
-                        id: "debug-mp4-1",
-                        title: "Big Buck Bunny S1E1",
-                        subtitle: "Очередь-тест",
-                        episodeLabel: "S1 · E1",
-                        url: URL(string: "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_1MB.mp4")!
-                    ),
-                    PlayerTrackItem.local(
-                        id: "debug-mp4-2",
-                        title: "Big Buck Bunny S1E2",
-                        subtitle: "Очередь-тест",
-                        episodeLabel: "S1 · E2",
-                        url: URL(string: "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4")!
-                    ),
-                ])
-            }
-            .font(.subheadline)
-            .frame(minHeight: Theme.hit)
-            Divider().overlay(Theme.hairline.opacity(0.08))
             NavigationLink {
                 TrackerResultsView(query: "Демо-результаты", preloaded: .demo)
             } label: {
