@@ -1172,6 +1172,12 @@ class MagnetFromHashTests(unittest.TestCase):
         payload = search_api.release_payload("prowlarr:knaben:1", release)
         self.assertTrue(payload["magnet_url"].startswith("magnet:?xt=urn:btih:38db15f22435c9da85a340d2a40e3a2427335f21"))
 
+    def test_payload_builds_magnet_from_uppercase_hash(self) -> None:
+        # Prowlarr отдаёт infoHash Knaben заглавными (живой ответ 03.11.2026)
+        release = make_release(provider="prowlarr", info_hash="0D07E4F103E30DA703C41CE6ACCAF5CEEE3E5D7E", magnet_url="")
+        payload = search_api.release_payload("prowlarr:knaben:2", release)
+        self.assertTrue(payload["magnet_url"].startswith("magnet:?xt=urn:btih:0d07e4f103e30da703c41ce6accaf5ceee3e5d7e"))
+
     def test_payload_keeps_source_magnet_and_skips_bad_hash(self) -> None:
         own = make_release(magnet_url="magnet:?xt=urn:btih:" + "b" * 40 + "&tr=udp://x")
         self.assertEqual(search_api.release_payload("nnm:1", own)["magnet_url"], own.magnet_url)

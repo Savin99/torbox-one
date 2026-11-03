@@ -260,6 +260,8 @@ def release_payload(release_id: str, release: bot.Release) -> dict[str, Any]:
     scope = meta_service.parse_release_scope(release.title)
     video = meta_service.parse_video_spec(release.title, release.details_text)
     voiceover = meta_service.parse_voiceover_spec(release.title, release.details_text)
+    # Prowlarr отдаёт infoHash Knaben заглавными, а magnet TorBox ждёт в нижнем регистре
+    prowlarr_hash = normalized_info_hash(release.info_hash or "") if release.provider == bot.ProwlarrClient.key else ""
     return {
         "id": release_id,
         "title": release.title,
@@ -271,8 +273,7 @@ def release_payload(release_id: str, release: bot.Release) -> dict[str, Any]:
         "category": release.category,
         # Хэш известен, а magnet нет (Knaben через Prowlarr отдаёт ссылку-редирект на magnet):
         # magnet из хэша — иначе клиент пойдёт за .torrent, которого у источника нет.
-        "magnet_url": release.magnet_url or (info_hash_magnet(release.info_hash, release.title)
-                                             if release.provider == bot.ProwlarrClient.key and INFO_HASH_RE.match(release.info_hash or "") else ""),
+        "magnet_url": release.magnet_url or (info_hash_magnet(prowlarr_hash, release.title) if prowlarr_hash else ""),
         "info_hash": release.info_hash,
         "quality_summary": bot.video_quality_summary(release),
         "voiceover_summary": bot.voiceover_summary(release),
