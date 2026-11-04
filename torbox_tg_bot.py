@@ -1189,9 +1189,13 @@ class ProwlarrClient:
 #
 # Оба трекера стоят за Cloudflare и не пускают HTTP-клиент без браузера, даже с
 # cf_clearance. Страницы читает Byparr — совместимый с FlareSolverr сервис с
-# настоящим браузером. Он умеет только GET, тратит на страницу 17–20 с и
-# держит один браузер на всех, поэтому:
+# настоящим браузером. Он умеет только GET и держит один браузер на всех, а
+# браузер на каждый запрос новый и без кук. Проверка Cloudflare с нуля — ~17 с
+# на страницу, с пропуском `cf_clearance` из прошлого ответа — ~6 с (замер
+# 04.11.2026, docs/search-api.md). Поэтому:
 #   - на один поиск пользователя — ровно один запрос к каждому трекеру;
+#   - тот же запрос, пока первый у Byparr, ждёт его ответа, а не идёт вторым;
+#   - пропуск Cloudflare помнится и уходит со следующим запросом к сайту;
 #   - страницы тем во время поиска не читаются, хэш считается потом и лениво;
 #   - вход на сайт — только кукой из env, формы логина нет.
 
@@ -1207,6 +1211,12 @@ SLOW_SEARCH_TTL_SECONDS = 15 * 60
 SLOW_SEARCH_MAX_ENTRIES = 64
 SECRET_PLACEHOLDER = "<вырезано>"
 SESSION_COOKIE_RE = re.compile(r"\b(bb_session|bb_[a-z_]+|uid|pass|sid|cf_clearance)=(?!<)[^;\s,\"'&]+", re.I)
+# Пропуск Cloudflare выдан браузеру Byparr — его адресу и User-Agent, поэтому
+# годится только для Byparr. Сессионный (без срока) держим не дольше получаса,
+# а пропуск, которому осталось меньше минуты, уже не отправляем.
+CF_CLEARANCE_COOKIE = "cf_clearance"
+CF_CLEARANCE_SESSION_TTL_SECONDS = 30 * 60
+CF_CLEARANCE_MARGIN_SECONDS = 60
 
 
 class ByparrError(RuntimeError):
@@ -1232,16 +1242,30 @@ def parse_cookie_header(raw: str, domain: str) -> list[dict[str, str]]:
     return cookies
 
 
+def cookie_domain_matches(host: str, domain: str) -> bool:
+    """Уходит ли кука домена `domain` (`.kinozal.me`) на адрес `host`."""
+    bare = domain.lstrip(".").casefold()
+    host = host.casefold()
+    return bool(bare) and (host == bare or host.endswith("." + bare))
+
+
 class ByparrClient:
     """GET-запросы к сайтам за Cloudflare через Byparr (FlareSolverr API).
 
-    Повторов нет намеренно: каждая попытка — это ещё 20 секунд браузера,
-    который один на всех.
+    Повторов нет намеренно: каждая попытка — это ещё одна страница браузера,
+    который один на всех. Пропуск Cloudflare из ответа клиент помнит в памяти
+    и отправляет со следующим запросом к тому же сайту.
     """
 
-    def __init__(self, base_url: str = BYPARR_DEFAULT_URL, http: Any = None) -> None:
+    def __init__(
+        self, base_url: str = BYPARR_DEFAULT_URL, http: Any = None, clock: Callable[[], float] = time.time
+    ) -> None:
         self.base_url = (base_url or BYPARR_DEFAULT_URL).rstrip("/")
         self.http = http if http is not None else requests.Session()
+        self._clock = clock
+        # Домен куки -> (кука для Byparr, когда истекает по `clock`)
+        self._clearance: dict[str, tuple[dict[str, str], float]] = {}
+        self._clearance_lock = Lock()
 
     def __repr__(self) -> str:
         return f"ByparrClient({self.base_url!r})"
@@ -1260,8 +1284,12 @@ class ByparrClient:
             ByparrError: Byparr недоступен, ответил ошибкой или трекер
                 вернул не 200.
         """
-        payload = {"cmd": "request.get", "url": url, "maxTimeout": BYPARR_MAX_TIMEOUT_MS, "cookies": cookies}
         host = urlparse(url).hostname or "трекер"
+        clearance = self._clearance_for(host)
+        if clearance:
+            # Свежий пропуск от самого Byparr важнее чужого из env
+            cookies = [cookie for cookie in cookies if cookie.get("name") != CF_CLEARANCE_COOKIE] + clearance
+        payload = {"cmd": "request.get", "url": url, "maxTimeout": BYPARR_MAX_TIMEOUT_MS, "cookies": cookies}
         try:
             response = self.http.post(
                 f"{self.base_url}/v1", json=payload, timeout=BYPARR_MAX_TIMEOUT_MS / 1000 + 15
@@ -1283,6 +1311,7 @@ class ByparrClient:
             message = data.get("message", "") if isinstance(data, dict) else ""
             raise ByparrError(f"Byparr не открыл {host}: {self._scrub(str(message), cookies)}")
         solution = data.get("solution") if isinstance(data.get("solution"), dict) else {}
+        self._remember_clearance(solution.get("cookies"))
         status = int(solution.get("status") or 0)
         if status != 200:
             raise ByparrError(f"{host} ответил HTTP {status}")
@@ -1290,6 +1319,46 @@ class ByparrClient:
         if not isinstance(page, str) or not page:
             raise ByparrError(f"{host} вернул пустую страницу")
         return page
+
+    def _clearance_for(self, host: str) -> list[dict[str, str]]:
+        """Пропуск Cloudflare для адреса, если он есть и ещё действует."""
+        now = self._clock()
+        with self._clearance_lock:
+            for domain, (cookie, expires_at) in list(self._clearance.items()):
+                if expires_at - CF_CLEARANCE_MARGIN_SECONDS <= now:
+                    del self._clearance[domain]
+                elif cookie_domain_matches(host, domain):
+                    return [dict(cookie)]
+        return []
+
+    def _remember_clearance(self, cookies: Any) -> None:
+        """Запоминает `cf_clearance` из ответа Byparr — новый или продлённый."""
+        if not isinstance(cookies, list):
+            return
+        now = self._clock()
+        for cookie in cookies:
+            if not isinstance(cookie, dict) or cookie.get("name") != CF_CLEARANCE_COOKIE:
+                continue
+            value = str(cookie.get("value") or "")
+            domain = str(cookie.get("domain") or "")
+            if not value or not domain:
+                continue
+            expires = cookie.get("expires")
+            # Срок у Playwright — секунды Unix, у сессионной куки -1
+            if isinstance(expires, (int, float)) and expires > 0:
+                expires_at = float(expires)
+            else:
+                expires_at = now + CF_CLEARANCE_SESSION_TTL_SECONDS
+            path = str(cookie.get("path") or "/")
+            stored = {"name": CF_CLEARANCE_COOKIE, "value": value, "domain": domain, "path": path}
+            with self._clearance_lock:
+                is_new = domain not in self._clearance
+                self._clearance[domain] = (stored, expires_at)
+            if is_new:
+                LOG.info(
+                    "Byparr: пропуск Cloudflare для %s получен, действует %d мин",
+                    domain.lstrip("."), max(0, int(expires_at - now) // 60),
+                )
 
     @staticmethod
     def _message(response: Any) -> str:
@@ -1343,6 +1412,34 @@ def tracker_topic_summary(page: str) -> str:
     return "\n".join(fragments[:6]) or "Подробное описание у источника не распознано."
 
 
+class PendingSearch:
+    """Поиск медленного трекера, который уже ушёл в Byparr: ответ — на всех ждущих."""
+
+    def __init__(self) -> None:
+        self._done = Event()
+        self._releases: list[Release] = []
+        self._error: BaseException | None = None
+
+    def finish(self, releases: list[Release]) -> None:
+        self._releases = releases
+        self._done.set()
+
+    def fail(self, error: BaseException) -> None:
+        self._error = error
+        self._done.set()
+
+    def wait(self) -> list[Release]:
+        """Ждёт ответа первого запроса; его отказ — и отказ ждущего.
+
+        Без своего срока: запрос к Byparr ограничен тайм-аутом HTTP, а срок
+        поиска стережёт `aggregate_releases`.
+        """
+        self._done.wait()
+        if self._error is not None:
+            raise self._error
+        return list(self._releases)
+
+
 class ByparrTrackerClient:
     """Общее у трекеров, которые читаются через Byparr.
 
@@ -1362,6 +1459,7 @@ class ByparrTrackerClient:
             raise RuntimeError(f"{self.name}: кука входа пустая или не разбирается")
         self.byparr = byparr
         self._recent: dict[str, tuple[float, list[Release]]] = {}
+        self._pending: dict[str, PendingSearch] = {}
         self._recent_lock = Lock()
 
     def __repr__(self) -> str:
@@ -1378,21 +1476,42 @@ class ByparrTrackerClient:
         raise NotImplementedError
 
     def search(self, query: str) -> list[Release]:
-        """Один запрос к трекеру; свежий повтор того же запроса берётся из памяти."""
+        """Один запрос к трекеру на всех, кто ищет то же самое.
+
+        Свежий повтор берётся из памяти. Повтор, пришедший, пока первый запрос
+        ещё у Byparr, ждёт его ответа: ТВ ищет в два прохода (4 и 45 с), и
+        второй проход вставал в очередь Byparr следом за первым — четыре
+        страницы на тайтл вместо двух, и второму не хватало срока.
+        """
         cache_key = query.strip().casefold()
         now = time.monotonic()
         with self._recent_lock:
             entry = self._recent.get(cache_key)
             if entry is not None and now - entry[0] <= SLOW_SEARCH_TTL_SECONDS:
                 return list(entry[1])
-        releases = self.parse_search(self.fetch(self.search_url(query)))
+            pending = self._pending.get(cache_key)
+            leader = pending is None
+            if pending is None:
+                pending = self._pending[cache_key] = PendingSearch()
+        if not leader:
+            return pending.wait()
+        try:
+            releases = self.parse_search(self.fetch(self.search_url(query)))
+        except BaseException as exc:
+            # Отказ не запоминается: следующий поиск пойдёт к трекеру заново
+            with self._recent_lock:
+                del self._pending[cache_key]
+            pending.fail(exc)
+            raise
         with self._recent_lock:
+            del self._pending[cache_key]
             self._recent[cache_key] = (time.monotonic(), releases)
             expired = [key for key, (stamp, _) in self._recent.items() if now - stamp > SLOW_SEARCH_TTL_SECONDS]
             for key in expired:
                 del self._recent[key]
             while len(self._recent) > SLOW_SEARCH_MAX_ENTRIES:
                 del self._recent[next(iter(self._recent))]
+        pending.finish(releases)
         return list(releases)
 
     def topic_summary(self, release: Release) -> str:

@@ -97,9 +97,9 @@ RELEASE_STORE_PATH = meta_service.STATE_DIR / "release_store.json"
 INFO_HASH_RE = re.compile(r"^[0-9a-f]{40}$")
 
 # Фоновый расчёт хэшей медленных трекеров (RuTracker, Kinozal через Byparr).
-# Страница — 20 секунд, браузер один, поэтому на запрос `/release/hashes` со
-# сроком 8 секунд хэш почти никогда не успевает. Очередь считает их заранее,
-# по одному, сразу после поиска.
+# Страница — 6–17 секунд (с пропуском Cloudflare и без), браузер один, поэтому
+# на запрос `/release/hashes` со сроком 8 секунд успевает от силы один хэш.
+# Очередь считает их заранее, по одному, сразу после поиска.
 PREFETCH_PER_SEARCH = 10
 PREFETCH_QUEUE_SIZE = 40
 PREFETCH_BACKOFF_SECONDS = 60.0
@@ -383,7 +383,7 @@ def restore_rutracker_topic(client: Any, topic_id: str) -> bot.Release | None:
     """Собирает релиз RuTracker заново по номеру темы.
 
     То же, что `restore_nnm_topic`: страница темы читается одна (через
-    Byparr, ~20 с) и даёт заголовок, размер и magnet, то есть `info_hash`.
+    Byparr, 6–17 с) и даёт заголовок, размер и magnet, то есть `info_hash`.
 
     Args:
         client: `bot.RutrackerClient`.
@@ -544,7 +544,7 @@ def release_info_hash(
     кэша: он из той же выдачи, что и файл. Кэш нужен только закачке.
 
     У RuTracker и Kinozal `.torrent` через Byparr не скачать: хэш берётся
-    со страницы трекера (`resolve_info_hash`), и это 20 секунд браузера.
+    со страницы трекера (`resolve_info_hash`), и это 6–17 секунд браузера.
     Поэтому их хэш считает только фоновая очередь, а запрос клиента с
     `allow_slow=False` довольствуется кэшем.
 
@@ -652,7 +652,7 @@ def slow_release_stub(release_id: str) -> bot.Release | None:
     """Релиз медленного трекера по одному id — без обращения к трекеру.
 
     Хэшу RuTracker и Kinozal нужен только номер темы, а честное
-    восстановление (`restore_release`) — это ещё 20 секунд Byparr прямо в
+    восстановление (`restore_release`) — это ещё страница Byparr прямо в
     запросе. Заглушка живёт только внутри расчёта хэша и никуда не сохраняется.
 
     Args:
@@ -966,7 +966,7 @@ def aggregate_releases(
     )
     tasks: dict[Future[list[bot.Release]], tuple[bot.SearchProvider, str]] = {}
     for provider in providers:
-        # Byparr-трекер — 20 секунд на страницу и один браузер на всех:
+        # Byparr-трекер — 6–17 секунд на страницу и один браузер на всех:
         # ему только первый, самый точный запрос
         for query in queries[:1] if is_slow_provider(provider) else queries:
             tasks[pool.submit(provider.search, query)] = (provider, query)

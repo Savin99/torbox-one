@@ -51,17 +51,33 @@ class FakeHttpResponse:
 
 
 class FakeByparrHttp:
-    """Подмена HTTP-сессии ByparrClient: страница по адресу или заданный отказ."""
+    """Подмена HTTP-сессии ByparrClient: страница по адресу или заданный отказ.
 
-    def __init__(self, pages: dict[str, str] | None = None, failure: Any = None) -> None:
+    `cookies` — куки ответа по куску адреса, как их отдаёт браузер Byparr;
+    `gate` держит каждый запрос, пока его не откроют.
+    """
+
+    def __init__(
+        self,
+        pages: dict[str, str] | None = None,
+        failure: Any = None,
+        cookies: dict[str, list[dict[str, Any]]] | None = None,
+        gate: threading.Event | None = None,
+    ) -> None:
         self.pages = pages or {}
         self.failure = failure
+        self.cookies = cookies or {}
+        self.gate = gate
         self.calls: list[dict[str, Any]] = []
         self.lock = threading.Lock()
+        self.entered = threading.Event()
 
     def post(self, url: str, json: dict[str, Any], timeout: float) -> FakeHttpResponse:
         with self.lock:
             self.calls.append({"endpoint": url, **json})
+        self.entered.set()
+        if self.gate is not None:
+            self.gate.wait(5)
         if isinstance(self.failure, Exception):
             raise self.failure
         if isinstance(self.failure, FakeHttpResponse):
@@ -69,14 +85,17 @@ class FakeByparrHttp:
         page = next((text for marker, text in self.pages.items() if marker in json["url"]), None)
         if page is None:
             return FakeHttpResponse(200, {"status": "ok", "solution": {"status": 404, "response": ""}})
+        cookies = next((jar for marker, jar in self.cookies.items() if marker in json["url"]), [])
         return FakeHttpResponse(200, {
             "status": "ok",
-            "solution": {"status": 200, "response": page, "cookies": [], "userAgent": "Mozilla/5.0"},
+            "solution": {"status": 200, "response": page, "cookies": list(cookies), "userAgent": "Mozilla/5.0"},
         })
 
 
-def byparr_with(pages: dict[str, str] | None = None, failure: Any = None) -> tuple[bot.ByparrClient, FakeByparrHttp]:
-    http = FakeByparrHttp(pages, failure)
+def byparr_with(
+    pages: dict[str, str] | None = None, failure: Any = None, gate: threading.Event | None = None
+) -> tuple[bot.ByparrClient, FakeByparrHttp]:
+    http = FakeByparrHttp(pages, failure, gate=gate)
     return bot.ByparrClient("http://byparr.test:8192", http=http), http
 
 
@@ -90,8 +109,10 @@ def tracker_pages() -> dict[str, str]:
     }
 
 
-def clients(pages: dict[str, str] | None = None, failure: Any = None) -> tuple[bot.RutrackerClient, bot.KinozalClient, FakeByparrHttp]:
-    byparr, http = byparr_with(tracker_pages() if pages is None else pages, failure)
+def clients(
+    pages: dict[str, str] | None = None, failure: Any = None, gate: threading.Event | None = None
+) -> tuple[bot.RutrackerClient, bot.KinozalClient, FakeByparrHttp]:
+    byparr, http = byparr_with(tracker_pages() if pages is None else pages, failure, gate)
     return bot.RutrackerClient(RUTRACKER_COOKIE, byparr), bot.KinozalClient(KINOZAL_COOKIE, byparr), http
 
 
@@ -549,6 +570,203 @@ class HashPrefetcherTests(unittest.TestCase):
         item = next(row for row in result.results if row.id == release_id)
         self.assertEqual(item.info_hash, "d" * 40)
         self.assertTrue(item.magnet_url.startswith("magnet:?xt=urn:btih:" + "d" * 40))
+
+
+CLEARANCE = "SEKRETCLEARANCE4242"
+
+
+def clearance_cookie(expires: float, value: str = CLEARANCE, domain: str = ".rutracker.org") -> dict[str, Any]:
+    """`cf_clearance` в той форме, в какой его отдаёт браузер Byparr."""
+    return {
+        "name": "cf_clearance", "value": value, "domain": domain, "path": "/",
+        "expires": expires, "httpOnly": True, "secure": True, "sameSite": "None",
+    }
+
+
+class CloudflareClearanceTests(unittest.TestCase):
+    """Пропуск Cloudflare из ответа Byparr уходит со следующим запросом к тому же сайту.
+
+    Без него браузер Byparr, новый на каждый запрос, проходит проверку
+    заново: ~17 с на страницу вместо ~6 (замер 04.11.2026).
+    """
+
+    def setUp(self) -> None:
+        self.clock = FakeClock()
+        self.http = FakeByparrHttp(tracker_pages())
+        self.byparr = bot.ByparrClient("http://byparr.test:8192", http=self.http, clock=self.clock)
+        self.rutracker = bot.RutrackerClient(RUTRACKER_COOKIE, self.byparr)
+        self.kinozal = bot.KinozalClient(KINOZAL_COOKIE, self.byparr)
+
+    def sent(self, call: int) -> dict[str, str]:
+        return {cookie["name"]: cookie["value"] for cookie in self.http.calls[call]["cookies"]}
+
+    def answer_with(self, *cookies: dict[str, Any]) -> None:
+        self.http.cookies = {"rutracker.org": list(cookies)}
+
+    def test_clearance_goes_back_only_to_its_own_site(self) -> None:
+        self.answer_with(clearance_cookie(self.clock.now + 3600))
+        self.rutracker.search("Интерстеллар 2014")
+        self.rutracker.search("Дюна 2021")
+        self.kinozal.search("Дюна 2021")
+        self.assertEqual(self.sent(0), {"bb_session": "0-SEKRETRUTRACKER0000"})
+        self.assertEqual(self.sent(1), {"bb_session": "0-SEKRETRUTRACKER0000", "cf_clearance": CLEARANCE})
+        self.assertEqual(self.http.calls[1]["cookies"][-1]["domain"], ".rutracker.org")
+        self.assertEqual(self.sent(2), {"uid": "SEKRETUID777", "pass": "SEKRETPASS999"})
+
+    def test_topic_pages_reuse_the_search_clearance(self) -> None:
+        self.answer_with(clearance_cookie(self.clock.now + 3600))
+        [release, *_] = self.rutracker.search("Интерстеллар 2014")
+        self.rutracker.resolve_info_hash(release)
+        self.assertEqual(self.sent(1).get("cf_clearance"), CLEARANCE)
+
+    def test_clearance_stops_a_minute_before_it_expires(self) -> None:
+        self.answer_with(clearance_cookie(self.clock.now + 600))
+        self.rutracker.search("Интерстеллар 2014")
+        self.answer_with()
+        self.clock.now += 600 - bot.CF_CLEARANCE_MARGIN_SECONDS - 1
+        self.rutracker.search("Дюна 2021")
+        self.clock.now += 1
+        self.rutracker.search("Аватар 2009")
+        self.assertIn("cf_clearance", self.sent(1))
+        self.assertNotIn("cf_clearance", self.sent(2))
+
+    def test_session_clearance_is_kept_for_half_an_hour(self) -> None:
+        self.answer_with(clearance_cookie(-1))
+        self.rutracker.search("Интерстеллар 2014")
+        self.answer_with()
+        self.clock.now += bot.CF_CLEARANCE_SESSION_TTL_SECONDS - bot.CF_CLEARANCE_MARGIN_SECONDS - 1
+        self.rutracker.search("Дюна 2021")
+        self.clock.now += 1
+        self.rutracker.search("Аватар 2009")
+        self.assertIn("cf_clearance", self.sent(1))
+        self.assertNotIn("cf_clearance", self.sent(2))
+
+    def test_reissued_clearance_replaces_the_old_one(self) -> None:
+        self.answer_with(clearance_cookie(self.clock.now + 3600, value="SEKRETCLEARANCEOLD"))
+        self.rutracker.search("Интерстеллар 2014")
+        self.answer_with(clearance_cookie(self.clock.now + 3600, value="SEKRETCLEARANCENEW"))
+        self.rutracker.search("Дюна 2021")
+        self.rutracker.search("Аватар 2009")
+        self.assertEqual(self.sent(1)["cf_clearance"], "SEKRETCLEARANCEOLD")
+        self.assertEqual(self.sent(2)["cf_clearance"], "SEKRETCLEARANCENEW")
+
+    def test_own_clearance_wins_over_one_pasted_into_env(self) -> None:
+        rutracker = bot.RutrackerClient(RUTRACKER_COOKIE + "; cf_clearance=SEKRETFROMBROWSER", self.byparr)
+        self.answer_with(clearance_cookie(self.clock.now + 3600))
+        rutracker.search("Интерстеллар 2014")
+        rutracker.search("Дюна 2021")
+        self.assertEqual(self.sent(0)["cf_clearance"], "SEKRETFROMBROWSER")
+        names = [cookie["name"] for cookie in self.http.calls[1]["cookies"]]
+        self.assertEqual(names.count("cf_clearance"), 1)
+        self.assertEqual(self.sent(1)["cf_clearance"], CLEARANCE)
+
+    def test_clearance_is_not_in_errors_or_the_log(self) -> None:
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(search_api.RedactingFormatter(search_api.LOG_FORMAT))
+        logger = logging.getLogger("torbox_tg_bot")
+        logger.addHandler(handler)
+        previous_level = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            self.answer_with(clearance_cookie(self.clock.now + 3600))
+            self.rutracker.search("Интерстеллар 2014")
+            self.http.failure = FakeHttpResponse(500, {"status": "error", "message": f"echo {CLEARANCE}"})
+            with self.assertRaises(bot.ByparrError) as ctx:
+                self.rutracker.search("Дюна 2021")
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous_level)
+        self.assertIn("пропуск Cloudflare для rutracker.org получен, действует 60 мин", stream.getvalue())
+        self.assertNotIn(CLEARANCE, stream.getvalue())
+        self.assertNotIn(CLEARANCE, str(ctx.exception))
+        self.assertNotIn(CLEARANCE, repr(self.byparr))
+
+
+class SharedSearchTests(unittest.TestCase):
+    """Тот же поиск, пока первый у Byparr, ждёт его ответа, а не идёт вторым."""
+
+    def run_in_background(self, target: Any) -> threading.Thread:
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        return thread
+
+    @contextlib.contextmanager
+    def waiter_spy(self) -> Iterator[threading.Event]:
+        """Событие «второй поиск встал ждать первый»."""
+        waiting = threading.Event()
+        original_wait = bot.PendingSearch.wait
+
+        def spy_wait(pending: bot.PendingSearch) -> list[bot.Release]:
+            waiting.set()
+            return original_wait(pending)
+
+        with mock.patch.object(bot.PendingSearch, "wait", spy_wait):
+            yield waiting
+
+    def run_two_searches(self, http: FakeByparrHttp, gate: threading.Event, first: Any, second: Any) -> None:
+        """Второй поиск уходит, пока первый держит Byparr; потом Byparr отвечает."""
+        with self.waiter_spy() as waiting:
+            threads = [self.run_in_background(first)]
+            self.assertTrue(http.entered.wait(5))
+            threads.append(self.run_in_background(second))
+            self.assertTrue(waiting.wait(5), "второй поиск ждёт первый")
+            self.assertEqual(len(http.calls), 1)
+            gate.set()
+            for thread in threads:
+                thread.join(5)
+
+    def test_repeat_during_a_running_request_waits_for_it(self) -> None:
+        gate = threading.Event()
+        rutracker, _, http = clients(gate=gate)
+        results: list[list[bot.Release]] = []
+        self.run_two_searches(
+            http, gate,
+            lambda: results.append(rutracker.search("Интерстеллар 2014")),
+            lambda: results.append(rutracker.search("интерстеллар 2014 ")),
+        )
+        self.assertEqual(len(http.calls), 1)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(results[0])
+        self.assertEqual(results[0], results[1])
+
+    def test_failure_reaches_the_waiter_and_is_not_remembered(self) -> None:
+        gate = threading.Event()
+        crashed = FakeHttpResponse(500, {"status": "error", "message": "browser crashed"})
+        rutracker, _, http = clients(gate=gate, failure=crashed)
+        errors: list[BaseException] = []
+
+        def search() -> None:
+            try:
+                rutracker.search("Интерстеллар 2014")
+            except bot.ByparrError as exc:
+                errors.append(exc)
+
+        self.run_two_searches(http, gate, search, search)
+        self.assertEqual(len(errors), 2)
+        self.assertEqual(len(http.calls), 1)
+        http.failure = None
+        self.assertTrue(rutracker.search("Интерстеллар 2014"), "после отказа — новый запрос, а не память")
+        self.assertEqual(len(http.calls), 2)
+
+    def test_two_pass_search_costs_one_page_per_tracker(self) -> None:
+        """Проходы ТВ на 4 и 45 с: второй забирает ответы первого, не спрашивая Byparr снова."""
+        gate = threading.Event()
+        rutracker, kinozal, http = clients(gate=gate)
+        queries = ["Интерстеллар 2014", "Интерстеллар", "Interstellar"]
+        _, status, _, partial = search_api.aggregate_releases([rutracker, kinozal], queries, 0.05)
+        self.assertTrue(partial)
+        self.assertEqual(status, {"RuTracker": "таймаут", "Kinozal": "таймаут"})
+        opener = threading.Timer(0.2, gate.set)
+        opener.start()
+        releases, status, _, partial = search_api.aggregate_releases([rutracker, kinozal], queries, 5)
+        opener.join()
+        self.assertFalse(partial)
+        self.assertEqual(len(http.calls), 2, "по странице на трекер на оба прохода")
+        self.assertEqual(set(status), {"RuTracker", "Kinozal"})
+        self.assertNotIn("таймаут", status.values())
+        self.assertTrue(any(release.provider == "rutracker" for release in releases))
+        self.assertTrue(any(release.provider == "kinozal" for release in releases))
 
 
 if __name__ == "__main__":
