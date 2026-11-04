@@ -1223,6 +1223,14 @@ class ByparrError(RuntimeError):
     """Byparr не дал страницу: сервис лёг, трекер ответил ошибкой или не тем."""
 
 
+class ByparrUnavailable(ByparrError):
+    """Не ответил сам Byparr: туннель оборван, сервис лёг или не дождался страницы.
+
+    Страница тут ни при чём, и следующая, скорее всего, не откроется тоже:
+    фоновая очередь хэшей такую ошибку пережидает, а не списывает раздачу.
+    """
+
+
 def parse_cookie_header(raw: str, domain: str) -> list[dict[str, str]]:
     """Разбирает строку куки из env в список для Byparr.
 
@@ -1297,16 +1305,19 @@ class ByparrClient:
         except requests.RequestException as exc:
             # Цепочку исключений обрываем: в ней нечего искать, а рисковать
             # телом запроса с куками в трассировке незачем
-            raise ByparrError(f"Byparr не ответил ({type(exc).__name__}) на запрос к {host}") from None
+            raise ByparrUnavailable(f"Byparr не ответил ({type(exc).__name__}) на запрос к {host}") from None
         if response.status_code >= 400:
-            raise ByparrError(
+            # 408 — Byparr не дождался страницы или проверки Cloudflare, 5xx —
+            # упал сам; 4xx прочие — ошибка в нашем запросе
+            failure = ByparrUnavailable if response.status_code == 408 or response.status_code >= 500 else ByparrError
+            raise failure(
                 f"Byparr вернул HTTP {response.status_code} на запрос к {host}: "
                 f"{self._scrub(self._message(response), cookies)}"
             )
         try:
             data = response.json()
         except ValueError:
-            raise ByparrError(f"Byparr вернул не JSON на запрос к {host}") from None
+            raise ByparrUnavailable(f"Byparr вернул не JSON на запрос к {host}") from None
         if not isinstance(data, dict) or data.get("status") != "ok":
             message = data.get("message", "") if isinstance(data, dict) else ""
             raise ByparrError(f"Byparr не открыл {host}: {self._scrub(str(message), cookies)}")

@@ -104,6 +104,9 @@ PREFETCH_PER_SEARCH = 10
 PREFETCH_QUEUE_SIZE = 40
 PREFETCH_BACKOFF_SECONDS = 60.0
 PREFETCH_BACKOFF_MAX_SECONDS = 3600.0
+# Byparr недоступен целиком (туннель, перезапуск): очередь ждёт, удваивая паузу
+PREFETCH_OUTAGE_PAUSE_SECONDS = 5.0
+PREFETCH_OUTAGE_PAUSE_MAX_SECONDS = 300.0
 # Трекеры, чей стабильный id — «провайдер:номер темы»
 TOPIC_ID_PROVIDERS = (bot.NnmClient.key, bot.RutrackerClient.key, bot.KinozalClient.key)
 
@@ -708,6 +711,11 @@ class HashPrefetcher:
     дался, какое-то время не принимается снова: пауза удваивается с каждой
     неудачей, от минуты до часа. Пока идёт поиск, очередь не берёт новую
     задачу, чтобы не занимать Byparr перед запросом пользователя.
+
+    Если не ответил сам Byparr (`bot.ByparrUnavailable`), раздача тут ни при
+    чём: она возвращается в начало очереди, а очередь ждёт — от 5 секунд до
+    5 минут, удваивая паузу. Иначе за три секунды перезапуска Byparr очередь
+    списывала все сорок раздач подряд, и каждая выпадала на минуту.
     """
 
     def __init__(
@@ -719,6 +727,8 @@ class HashPrefetcher:
         backoff_max_seconds: float = PREFETCH_BACKOFF_MAX_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         autostart: bool = True,
+        outage_pause_seconds: float = PREFETCH_OUTAGE_PAUSE_SECONDS,
+        outage_pause_max_seconds: float = PREFETCH_OUTAGE_PAUSE_MAX_SECONDS,
     ) -> None:
         self._resolve = resolve
         self._known = known
@@ -727,11 +737,15 @@ class HashPrefetcher:
         self._backoff_max = backoff_max_seconds
         self._clock = clock
         self._autostart = autostart
+        self._outage_pause = outage_pause_seconds
+        self._outage_pause_max = outage_pause_max_seconds
         self._cond = threading.Condition()
         self._queue: dict[str, bot.Release] = {}
         self._current: str | None = None
         self._failures: dict[str, tuple[int, float]] = {}
         self._foreground = 0
+        self._outages = 0
+        self._paused_until = 0.0
         self._thread: threading.Thread | None = None
 
     def enqueue(self, items: Iterable[tuple[str, bot.Release]]) -> list[str]:
@@ -767,6 +781,11 @@ class HashPrefetcher:
         """Идентификаторы в очереди, по порядку; для журнала и тестов."""
         with self._cond:
             return list(self._queue)
+
+    def paused_for(self) -> float:
+        """Сколько секунд очередь ещё ждёт Byparr; 0 — не ждёт."""
+        with self._cond:
+            return max(0.0, self._paused_until - self._clock())
 
     @contextlib.contextmanager
     def foreground(self) -> Iterator[None]:
@@ -812,10 +831,14 @@ class HashPrefetcher:
         value: str | None = None
         try:
             value = self._resolve(release_id, release)
+        except bot.ByparrUnavailable as exc:
+            self._wait_for_byparr(release_id, release, exc)
+            return True
         except Exception as exc:
             # Текст ошибки Byparr-трекера уже без кук, трассировка не нужна
             LOG.warning("Фоновый хэш %s не получен: %s", release_id, exc)
         with self._cond:
+            self._outages = 0
             if value:
                 self._failures.pop(release_id, None)
             else:
@@ -828,6 +851,19 @@ class HashPrefetcher:
             self._cond.notify_all()
         return True
 
+    def _wait_for_byparr(self, release_id: str, release: bot.Release, exc: Exception) -> None:
+        """Byparr не ответил: раздачу — обратно в начало, очереди — паузу."""
+        with self._cond:
+            self._outages += 1
+            pause = min(self._outage_pause * 2 ** (self._outages - 1), self._outage_pause_max)
+            self._paused_until = self._clock() + pause
+            if release_id not in self._queue:
+                merged = {release_id: release, **self._queue}
+                self._queue = dict(list(merged.items())[: self._max_queue])
+            self._current = None
+            self._cond.notify_all()
+        LOG.warning("Фоновые хэши ждут Byparr %.0f с: %s", pause, exc)
+
     def _ensure_worker(self) -> None:
         with self._cond:
             if self._thread is not None and self._thread.is_alive():
@@ -839,6 +875,12 @@ class HashPrefetcher:
         while True:
             with self._cond:
                 self._cond.wait_for(lambda: bool(self._queue) and self._foreground == 0)
+                pause = self._paused_until - self._clock()
+                if pause > 0:
+                    # Ждём Byparr; новая задача или конец поиска будят раньше,
+                    # и пауза просто пересчитывается
+                    self._cond.wait(timeout=pause)
+                    continue
             try:
                 self.run_once()
             except Exception:

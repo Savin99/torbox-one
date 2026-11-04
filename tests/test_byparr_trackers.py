@@ -14,6 +14,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
@@ -560,6 +561,81 @@ class HashPrefetcherTests(unittest.TestCase):
             self.assertFalse(resolved.wait(0.3), "пока идёт поиск, Byparr не занимаем")
         self.assertTrue(prefetcher.wait_for([items[0][0]], 5))
         self.assertTrue(resolved.is_set())
+
+    def test_byparr_outage_pauses_the_queue_and_keeps_the_release(self) -> None:
+        clock = FakeClock()
+        items = slow_items(3)
+        calls: list[str] = []
+        down = True
+
+        def resolve(release_id: str, release: bot.Release) -> str | None:
+            calls.append(release_id)
+            if down:
+                raise bot.ByparrUnavailable("Byparr не ответил (ConnectionError) на запрос к rutracker.org")
+            return "c" * 40
+
+        prefetcher = self.make(resolve=resolve, clock=clock, outage_pause_seconds=5, outage_pause_max_seconds=60)
+        prefetcher.enqueue(items)
+        self.assertTrue(prefetcher.run_once())
+        self.assertEqual(calls, [items[0][0]], "за отказ Byparr — одна попытка, а не вся очередь")
+        self.assertEqual(prefetcher.pending(), [release_id for release_id, _ in items], "раздача вернулась первой")
+        self.assertEqual(prefetcher.enqueue(items[:1]), [items[0][0]], "раздачу не списали и не отложили на минуту")
+        self.assertEqual(prefetcher.paused_for(), 5)
+        clock.now += 5
+        prefetcher.run_once()
+        self.assertEqual(prefetcher.paused_for(), 10, "пока Byparr молчит, пауза удваивается")
+        clock.now += 10
+        down = False
+        prefetcher.run_once()
+        self.assertEqual(prefetcher.pending(), [release_id for release_id, _ in items[1:]])
+        self.assertEqual(prefetcher.paused_for(), 0)
+        down = True
+        prefetcher.run_once()
+        self.assertEqual(prefetcher.paused_for(), 5, "Byparr ответил — пауза снова с начала")
+
+    def test_only_byparrs_own_failures_pause_the_queue(self) -> None:
+        unavailable = [
+            requests.ConnectionError("refused"),
+            requests.ReadTimeout("read timed out"),
+            FakeHttpResponse(500, {"status": "error", "message": "Bad file descriptor"}),
+            FakeHttpResponse(408, {"detail": "Timed out while loading the page or solving the challenge"}),
+            FakeHttpResponse(200, ValueError("not json")),
+        ]
+        page_failures = [
+            FakeHttpResponse(422, {"detail": "validation"}),
+            FakeHttpResponse(200, {"status": "error", "message": "tracker said no"}),
+        ]
+        for failure in unavailable:
+            rutracker, _, _ = clients(failure=failure)
+            with self.subTest(failure=failure), self.assertRaises(bot.ByparrUnavailable):
+                rutracker.search("Интерстеллар 2014")
+        for failure in page_failures:
+            rutracker, _, _ = clients(failure=failure)
+            with self.subTest(failure=failure), self.assertRaises(bot.ByparrError) as ctx:
+                rutracker.search("Интерстеллар 2014")
+            self.assertNotIsInstance(ctx.exception, bot.ByparrUnavailable)
+        missing_topic, _, _ = clients(pages={})
+        with self.assertRaises(bot.ByparrError) as ctx:
+            missing_topic.search("Интерстеллар 2014")
+        self.assertNotIsInstance(ctx.exception, bot.ByparrUnavailable, "404 трекера — про страницу, не про Byparr")
+
+    def test_worker_waits_out_an_outage_instead_of_draining_the_queue(self) -> None:
+        moments: list[float] = []
+
+        def resolve(release_id: str, release: bot.Release) -> str | None:
+            moments.append(time.monotonic())
+            if len(moments) == 1:
+                raise bot.ByparrUnavailable("Byparr вернул HTTP 500 на запрос к kinozal.me")
+            return "d" * 40
+
+        prefetcher = search_api.HashPrefetcher(
+            resolve, lambda *_: False, outage_pause_seconds=0.2, outage_pause_max_seconds=1
+        )
+        items = slow_items(3)
+        prefetcher.enqueue(items)
+        self.assertTrue(prefetcher.wait_for([release_id for release_id, _ in items], 5))
+        self.assertEqual(len(moments), 4, "одна попытка во время отказа и по одной на раздачу после")
+        self.assertGreaterEqual(moments[1] - moments[0], 0.2)
 
     def test_known_hash_makes_search_result_carry_hash_and_magnet(self) -> None:
         rutracker, kinozal, _ = clients()
