@@ -1203,6 +1203,10 @@ BYPARR_DEFAULT_URL = "http://127.0.0.1:8192"
 BYPARR_MAX_TIMEOUT_MS = 120_000
 RUTRACKER_BASE = "https://rutracker.org/forum/"
 KINOZAL_BASE = "https://kinozal.me/"
+# «Увы, вы Зритель. Вам доступно к просмотру всего 100 раздач в сутки.» — так
+# Кинозал отвечает на страницу хэша, когда дневной лимит звания исчерпан
+KINOZAL_QUOTA_RE = re.compile(r"доступно к просмотру всего\s+\d+\s+раздач", re.I)
+KINOZAL_QUOTA_PAUSE_SECONDS = 3600.0
 # Кинозал пишет время по Москве; в published_at оно уходит в UTC, как у Prowlarr
 MOSCOW_TZ = timezone(timedelta(hours=3))
 # Выдача медленного трекера живёт недолго в памяти: опоздавший к сроку ответ
@@ -1642,6 +1646,8 @@ class KinozalClient(ByparrTrackerClient):
     key = "kinozal"
     name = "Kinozal"
     cookie_domain = ".kinozal.me"
+    clock: Callable[[], float] = staticmethod(time.monotonic)
+    _quota_until = 0.0
 
     def search_url(self, query: str) -> str:
         # t=1 — по сидам: у Кинозала порядок по умолчанию — по дате заливки
@@ -1651,7 +1657,20 @@ class KinozalClient(ByparrTrackerClient):
         return parse_kinozal_search(page)
 
     def resolve_info_hash(self, release: Release) -> str:
+        """hex40 со страницы `get_srv_details.php?action=2`.
+
+        Званию «Зритель» Кинозал показывает не больше 100 раздач в сутки;
+        дальше вместо хэша — строка о лимите. Тогда час хэши Kinozal не
+        запрашиваются: каждая попытка — страница Byparr впустую, а он один
+        на всех.
+        """
+        if self.clock() < self._quota_until:
+            return ""
         page = self.fetch(urljoin(KINOZAL_BASE, f"get_srv_details.php?id={release.topic_id}&action=2"))
+        if KINOZAL_QUOTA_RE.search(page):
+            self._quota_until = self.clock() + KINOZAL_QUOTA_PAUSE_SECONDS
+            LOG.warning("Kinozal: суточный лимит просмотра раздач исчерпан, хэши Kinozal — через час")
+            return ""
         return kinozal_info_hash(page)
 
 

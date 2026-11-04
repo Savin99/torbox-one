@@ -648,6 +648,37 @@ class HashPrefetcherTests(unittest.TestCase):
         self.assertTrue(item.magnet_url.startswith("magnet:?xt=urn:btih:" + "d" * 40))
 
 
+KINOZAL_QUOTA_PAGE = "<head></head><body>Увы, вы Зритель. Вам доступно к просмотру всего 100 раздач в сутки.</body>"
+
+
+class KinozalQuotaTests(unittest.TestCase):
+    """Званию «Зритель» Кинозал показывает 100 раздач в сутки: дальше хэшей нет."""
+
+    def test_quota_page_pauses_kinozal_hashes_for_an_hour(self) -> None:
+        pages = {**tracker_pages(), "kinozal.me/get_srv_details.php": KINOZAL_QUOTA_PAGE}
+        _, kinozal, http = clients(pages=pages)
+        clock = FakeClock()
+        kinozal.clock = clock
+        [release, *_] = kinozal.search("Интерстеллар 2014")
+        with self.assertLogs("torbox_tg_bot", level="WARNING") as logs:
+            self.assertEqual(kinozal.resolve_info_hash(release), "")
+        self.assertIn("лимит", "\n".join(logs.output))
+        calls = len(http.calls)
+        clock.now += bot.KINOZAL_QUOTA_PAUSE_SECONDS - 1
+        self.assertEqual(kinozal.resolve_info_hash(release), "")
+        self.assertEqual(len(http.calls), calls, "пока лимит, страницу хэша Byparr не открывает")
+        http.pages["kinozal.me/get_srv_details.php"] = fixture("kinozal-hash.html")
+        clock.now += 1
+        self.assertEqual(kinozal.resolve_info_hash(release), KINOZAL_HASH)
+        self.assertEqual(len(http.calls), calls + 1)
+
+    def test_rutracker_hashes_do_not_wait_for_kinozal(self) -> None:
+        pages = {**tracker_pages(), "kinozal.me/get_srv_details.php": KINOZAL_QUOTA_PAGE}
+        rutracker, kinozal, _ = clients(pages=pages)
+        kinozal.resolve_info_hash(kinozal.search("Интерстеллар 2014")[0])
+        self.assertEqual(rutracker.resolve_info_hash(rutracker.search("Интерстеллар 2014")[0]), RUTRACKER_TOPIC_HASH)
+
+
 CLEARANCE = "SEKRETCLEARANCE4242"
 
 
