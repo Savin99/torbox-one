@@ -147,6 +147,21 @@ def build(args):
     return archive
 
 
+def publish_to_shelf(source, args):
+    """Полка IPA на старом Маке: `ipa-shelf publish` (IPAShelf/shelf/README.md).
+
+    Папка iCloud — только если её указали явно (--cloud или IPA_SHELF_DIR) или ipa-shelf не установлен.
+    Правила те же, что у publish(): без отката и без подмены номера без --force.
+    """
+    import sys
+    shelf = shutil.which("ipa-shelf") or str(Path.home() / ".local/bin/ipa-shelf")
+    if "--cloud" in sys.argv or "IPA_SHELF_DIR" in os.environ or not Path(shelf).exists():
+        if not Path(shelf).exists():
+            print("ipa-shelf не установлен (IPAShelf/shelf/install.sh) — публикую в iCloud", flush=True)
+        return publish(source, args.cloud, args.force)
+    subprocess.run([shelf, "publish", str(source)] + (["--force"] if args.force else []), check=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root")
@@ -162,7 +177,7 @@ def main():
     try:
         source = args.publish_only if args.publish_only else build(args)
         if not args.no_cloud:
-            publish(source, args.cloud, args.force)
+            publish_to_shelf(source, args)
     except (OSError, ValueError, zipfile.BadZipFile, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Ошибка выпуска: {error}\n")
 
