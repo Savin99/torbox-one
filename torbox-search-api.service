@@ -1,5 +1,5 @@
 [Unit]
-Description=TorBox One Search API (FastAPI)
+Description=TorBox One Search API
 After=network-online.target
 Wants=network-online.target
 
@@ -7,9 +7,9 @@ Wants=network-online.target
 Type=exec
 DynamicUser=yes
 StateDirectory=torbox-search-api
-EnvironmentFile=/etc/torbox-telegram-bot.env
-WorkingDirectory=/opt/torbox-telegram-bot
-ExecStart=/opt/torbox-telegram-bot/.venv/bin/uvicorn search_api:app --host 127.0.0.1 --port 8787
+EnvironmentFile=/etc/torbox-search-api.env
+WorkingDirectory=/opt/torbox-one
+ExecStart=/opt/torbox-one/.venv-search/bin/uvicorn search_api:app --host 127.0.0.1 --port 18787
 Restart=on-failure
 RestartSec=5
 

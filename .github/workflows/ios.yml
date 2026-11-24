@@ -1,0 +1,41 @@
+name: iOS
+on:
+  push:
+    branches: [main]
+    paths: ['ios/**', '.github/workflows/ios.yml']
+  pull_request:
+    paths: ['ios/**', '.github/workflows/ios.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          cd ios
+          xcodegen generate
+      - name: Build and test on iPhone Simulator
+        run: |
+          set -o pipefail
+          device_id=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for r,items in d["devices"].items() if "iOS-26" in r for x in items if x["name"].startswith("iPhone")))')
+          xcodebuild test -project ios/TorBoxOne.xcodeproj -scheme TorBoxOne \
+            -destination "platform=iOS Simulator,id=$device_id" \
+            -resultBundlePath ios/build/Tests.xcresult \
+            CODE_SIGNING_ALLOWED=NO | tee ios-build.log
+      - name: Save test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-results
+          path: |
+            ios/build/Tests.xcresult
+            ios-build.log
+          retention-days: 7

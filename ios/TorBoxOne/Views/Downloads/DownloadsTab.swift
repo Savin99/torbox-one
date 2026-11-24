@@ -6,7 +6,6 @@ struct DownloadsTab: View {
     @State private var pendingDelete: TBTorrent?
     /// Программный переход в раздачу из постерной сетки.
     @State private var openTorrentID: Int?
-    @State private var playerQueue: PlayerQueue?
     @State private var magnetSheet = false
     /// Вид библиотеки: строки или постеры. Запоминаем между запусками.
     @AppStorage("downloadsShowsPosters") private var showsPosters = false
@@ -21,7 +20,7 @@ struct DownloadsTab: View {
                     EmptyState(
                         icon: "key.horizontal",
                         title: "TorBox не подключён",
-                        message: "Библиотека, плеер и офлайн-файлы работают через твой аккаунт TorBox. Ключ вводится один раз.",
+                        message: "Подключи свой аккаунт TorBox для библиотеки и просмотра в Infuse. Ключ вводится один раз.",
                         actionTitle: "Подключить",
                         action: { appState.selectedTab = .settings },
                         tint: Theme.instant
@@ -43,9 +42,6 @@ struct DownloadsTab: View {
             .navigationDestination(for: NotificationsRoute.self) { _ in
                 NotificationsView(vm: vm)
             }
-        }
-        .fullScreenCover(item: $playerQueue) { queue in
-            PlayerScreen(queue: queue, thumbnails: appState.thumbnails)
         }
         .sheet(isPresented: $magnetSheet) {
             AddMagnetSheet(vm: vm)
@@ -193,9 +189,7 @@ struct DownloadsTab: View {
                 }
             }
 
-            ContinueWatchingCarousel(vm: vm) { queue in
-                playerQueue = queue
-            }
+            Section { InfuseLibraryCard().plainListRow() }
 
             if !vm.activeTorrents.isEmpty {
                 Section {
@@ -263,18 +257,14 @@ struct DownloadsTab: View {
                     InlineWarning(text: error)
                         .padding(.horizontal, Theme.gutter)
                 }
-                ContinueWatchingStrip(vm: vm) { queue in
-                    playerQueue = queue
-                }
+                InfuseLibraryCard().padding(.horizontal, Theme.gutter)
                 DownloadsGrid(
                     torrents: vm.filtered,
                     onOpen: { torrent in openTorrentID = torrent.id },
                     onDelete: { torrent in pendingDelete = torrent },
-                    onPlay: { torrent in
-                        if let file = PlayerQueueFactory.suggestedFile(torrent: torrent, appState: appState) {
-                            playerQueue = PlayerQueueFactory.queue(
-                                torrent: torrent, startAt: file, appState: appState
-                            )
+                    onDownload: { torrent in
+                        if !DownloadSelection.videoFiles(of: torrent).isEmpty {
+                            openTorrentID = torrent.id
                         }
                     }
                 )
@@ -316,12 +306,12 @@ struct DownloadsTab: View {
             }
         }
         .contextMenu {
-            if let file = PlayerQueueFactory.suggestedFile(torrent: torrent, appState: appState),
+            if !DownloadSelection.videoFiles(of: torrent).isEmpty,
                TorrentStatus(torrent: torrent).isFinished {
                 Button {
-                    playerQueue = PlayerQueueFactory.queue(torrent: torrent, startAt: file, appState: appState)
+                    openTorrentID = torrent.id
                 } label: {
-                    Label("Смотреть", systemImage: "play.fill")
+                    Label("Выбрать для скачивания", systemImage: "arrow.down.to.line")
                 }
             }
             Button(role: .destructive) {
@@ -336,12 +326,10 @@ struct DownloadsTab: View {
     private func leadingActions(client: TorBoxClient, torrent: TBTorrent) -> some View {
         let status = TorrentStatus(torrent: torrent)
         if status.isFinished,
-           let file = PlayerQueueFactory.suggestedFile(torrent: torrent, appState: appState) {
-            Button("Смотреть", systemImage: "play.fill") {
+           !DownloadSelection.videoFiles(of: torrent).isEmpty {
+            Button("Скачать", systemImage: "arrow.down.to.line") {
                 Haptics.press()
-                playerQueue = PlayerQueueFactory.queue(
-                    torrent: torrent, startAt: file, appState: appState
-                )
+                openTorrentID = torrent.id
             }
             .tint(Theme.accent)
         }

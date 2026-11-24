@@ -13,6 +13,7 @@ enum AppTab: Hashable {
 @Observable
 final class AppState {
     let playback = PlaybackStore()
+    let infuse = InfuseCoordinator()
     let downloads = DownloadManager()
     let toasts = ToastCenter()
     let meta = MetaStore()
@@ -26,10 +27,6 @@ final class AppState {
     /// Магнет, полученный извне (share sheet или magnet:-ссылка).
     var pendingMagnet: String?
 
-    var downloadWhileWatching: Bool {
-        didSet { UserDefaults.standard.set(downloadWhileWatching, forKey: "downloadWhileWatching") }
-    }
-
     /// Первый запуск закрыт — приветственный экран больше не показываем.
     var didOnboard: Bool {
         didSet { UserDefaults.standard.set(didOnboard, forKey: Self.onboardKey) }
@@ -39,7 +36,10 @@ final class AppState {
     private(set) var recentSearches: [String] = []
 
     var torBoxKey: String {
-        didSet { Keychain.set(torBoxKey, account: Self.torBoxKeyAccount) }
+        didSet {
+            Keychain.set(torBoxKey, account: Self.torBoxKeyAccount)
+            if oldValue != torBoxKey { infuse.accountChanged() }
+        }
     }
     var searchAPIURL: String {
         didSet { UserDefaults.standard.set(searchAPIURL, forKey: Self.searchURLKey) }
@@ -59,15 +59,14 @@ final class AppState {
         torBoxKey = Keychain.get(account: Self.torBoxKeyAccount) ?? ""
         searchAPIURL = UserDefaults.standard.string(forKey: Self.searchURLKey) ?? ""
         searchAPIToken = Keychain.get(account: Self.searchTokenAccount) ?? ""
-        downloadWhileWatching = UserDefaults.standard.object(forKey: "downloadWhileWatching") as? Bool ?? true
         didOnboard = UserDefaults.standard.bool(forKey: Self.onboardKey)
         recentSearches = UserDefaults.standard.stringArray(forKey: Self.recentKey) ?? []
     }
 
     var hasTorBoxKey: Bool { !torBoxKey.isEmpty }
     var hasSearchAPI: Bool { URL(string: searchAPIURL)?.host() != nil }
-    /// Всё настроено — приложение работает целиком.
-    var isFullyConfigured: Bool { hasTorBoxKey && hasSearchAPI }
+    /// Search, cloud downloads, and the local player are available.
+    var isFullyConfigured: Bool { hasTorBoxKey && hasSearchAPI && infuse.isInstalled }
 
     var torBoxClient: TorBoxClient? {
         hasTorBoxKey ? TorBoxClient(apiKey: torBoxKey) : nil

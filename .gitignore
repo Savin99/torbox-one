@@ -3,6 +3,9 @@
 state.json
 credentials.json
 meta_cache.json
+shelf_cache.json
+hash_cache.json
+release_store.json
 
 # Кэши и окружение
 *.tmp

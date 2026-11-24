@@ -3,19 +3,24 @@
 Имя раздачи («Игра Престолов / Game of Thrones (Сезон 4) [2014, BDRip]»)
 превращается в карточку Кинопоиска с постером, обложкой и списком серий.
 Кадры серий отдаёт TMDB, если задан `TMDB_API_KEY` — у Кинопоиска их нет.
+По датам сезонов из TMDB сервер отличает вышедший сезон от заглушки
+Кинопоиска (`unreleased_seasons`).
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -23,8 +28,97 @@ import torbox_tg_bot as bot
 
 LOG = logging.getLogger("meta_service")
 
+# Каталог рабочих файлов. На VPS сервис живёт под DynamicUser с ProtectSystem,
+# и рабочий каталог у него только для чтения — кэши кладутся в StateDirectory.
+STATE_DIR = Path(os.getenv("SEARCH_API_STATE_DIR", "").strip() or ".")
+
 CACHE_TTL_SECONDS = 30 * 24 * 3600
-CACHE_PATH = Path(os.getenv("META_CACHE_PATH", "meta_cache.json"))
+CACHE_PATH = Path(os.getenv("META_CACHE_PATH", "").strip() or STATE_DIR / "meta_cache.json")
+# Картинки TMDB, которые сервер раздаёт сам (`/catalog/art/...`): из России
+# image.tmdb.org напрямую не открывается (замер 24.10.2026: 15 с без ответа),
+# а адрес сервера телефон открывает и без VPN.
+ART_DIR = Path(os.getenv("ART_DIR", "").strip() or STATE_DIR / "art")
+ART_SIZES = ("w500", "w780")
+ART_NAME = re.compile(r"[A-Za-z0-9_-]{8,64}\.(?:png|jpg)")
+# Сколько файлов держим: логотип ~100 КБ, постер ~190 КБ — около 300 МБ.
+ART_FILES_LIMIT = 2000
+
+# Состав сезонов идущего сериала меняется каждую неделю: выходит серия, у
+# заглушки появляются дата и название. С 30-дневным сроком карточки сервер
+# месяц не видел бы ни новой строки, ни исправления Кинопоиска, а KinoApp
+# держит серии сутки и ждёт строку раз в неделю. Поэтому идущий последний
+# сезон (`season_is_airing`) перечитывается раз в сутки, завершённые — как
+# прежде, раз в 30 дней.
+SEASONS_AIRING_TTL_SECONDS = 24 * 3600
+# «Недавно вышла»: четыре недельных цикла после даты серии. Дальше сезон
+# считается завершённым, и его поправки подхватит обычный 30-дневный срок.
+SEASON_RECENT_DAYS = 28
+
+# Невышедший сезон (`unreleased_seasons`). Кинопоиск заводит сезон-заглушку
+# сразу после продления сериала: живьём 28.09.2026 у «Джентльменов» был
+# 3 сезон из восьми серий «Episode #3.N», дата только у первой — копия даты
+# 2 сезона. Одну серию с прошедшей датой правило поэтому терпит.
+UNRELEASED_MAX_PAST_EPISODES = 1
+# Даты сезонов из TMDB живут, как карточка, 30 дней, но запись, по которой
+# сезон не вышел, перепроверяется раз в сутки: иначе снимок, взятый до того,
+# как TMDB завёл новый сезон, прятал бы вышедшую первую серию до второй.
+UNRELEASED_RECHECK_SECONDS = 24 * 3600
+
+# Полки живут отдельным кэшем: топы и премьеры меняются за сутки, а карточка
+# фильма — нет. Один TTL на оба не подобрать, поэтому и файла два.
+SHELF_TTL_SECONDS = 12 * 3600
+SHELF_CACHE_PATH = Path(os.getenv("SHELF_CACHE_PATH", "").strip() or STATE_DIR / "shelf_cache.json")
+
+# Полки Главного — ровно то, что даёт API Кинопоиска. `top` без уточнения
+# считается топом фильмов: так называется полка в интерфейсе приложения.
+# Отдельного эндпоинта «топ фильмов» у API больше нет — v2.2/films/top убран
+# из документации, его заменили подборки.
+SHELF_COLLECTIONS = {
+    "popular": "TOP_POPULAR_ALL",
+    "popular_movies": "TOP_POPULAR_MOVIES",
+    "popular_series": "POPULAR_SERIES",
+    "top": "TOP_250_MOVIES",
+    "top_movies": "TOP_250_MOVIES",
+    "top_series": "TOP_250_TV_SHOWS",
+    "top_xxi": "TOP_100_GREATEST_MOVIES_XXI",
+    "closest_releases": "CLOSES_RELEASES",
+    "family": "FAMILY",
+    "comics": "COMICS_THEME",
+    "vampires": "VAMPIRE_THEME",
+    "zombies": "ZOMBIE_THEME",
+    "catastrophe": "CATASTROPHE_THEME",
+    "love": "LOVE_THEME",
+    "kids_animation": "KIDS_ANIMATION_THEME",
+    "programmers": "PROGRAMMERS_THEME",
+    "oscar_2021": "OSKAR_WINNERS_2021",
+}
+
+MONTH_NAMES = (
+    "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE",
+    "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+)
+
+# v2.2/films по документации отдаёт не больше 400 карточек (20 страниц по 20),
+# подборки — 50 страниц. Дальше каталог просто отвечает пустым списком.
+# Живьём 23.09.2026 фильтр отдавал меньше: `total: 100`, `totalPages: 5` на
+# каждом из десяти разных запросов, включая «все фильмы с оценкой от 7».
+MAX_FILTER_PAGE = 20
+MAX_COLLECTION_PAGE = 50
+
+# Подбор для «Что смотреть» в KinoApp (`MetaService.discover`). Значения —
+# перечисления фильтра v2.2/films из openapi.json Кинопоиска.
+DISCOVER_TYPES = ("ALL", "FILM", "TV_SERIES", "MINI_SERIES", "TV_SHOW")
+DISCOVER_ORDERS = ("NUM_VOTE", "RATING", "YEAR")
+# У «похожих» в ответе только id, названия и постер, и каждый дополняется
+# карточкой фильма — запросом из суточной квоты на холодном кэше. Потолок по
+# умолчанию держит цену одного вызова в 13 запросах.
+DEFAULT_SIMILAR_LIMIT = 12
+MAX_SIMILAR_LIMIT = 20
+# Карточек в одном `briefs`: лента просит их порциями по мере прокрутки.
+MAX_BRIEF_IDS = 20
+# Карточки фильмов пачкой идут параллельно. Лимит эндпоинта карточки — общий,
+# 25 запросов в секунду; четырёх потоков хватает с запасом.
+DETAIL_WORKERS = 4
 
 # Технический хвост в именах раздач: до него — название, после — мусор релиза.
 NOISE_WORDS = {
@@ -64,6 +158,9 @@ class TitleMeta:
     matched: bool
     source: str = ""
     source_id: int = 0
+    tmdb_id: int | None = None
+    tmdb_media_type: str | None = None
+    tmdb_lookup_version: int = 1
     title: str = ""
     original_title: str = ""
     year: str = ""
@@ -98,12 +195,47 @@ class PersonMeta:
 
 @dataclass
 class EpisodeMeta:
+    """Серия для приложения.
+
+    `released` — False у серий невышедшего сезона (`unreleased_seasons`).
+    None значит «вышел или судить не по чему»: в ответе поля тогда нет.
+    """
+
     season: int
     episode: int
     title: str = ""
     overview: str = ""
     air_date: str = ""
     still_url: str = ""
+    released: bool | None = None
+
+
+@dataclass
+class SeasonBrief:
+    """Сколько серий в сезоне: приложению этого хватает, чтобы нарисовать выбор.
+
+    `released` — False, если сезон ещё не вышел (`unreleased_seasons`); None —
+    вышел или судить не по чему.
+    """
+
+    season: int
+    episodes: int
+    released: bool | None = None
+
+
+@dataclass
+class TitleCard:
+    """Карточка по идентификатору каталога: TitleMeta плюс внешние id и сезоны.
+
+    Отдельный тип, а не поля в TitleMeta: состава сезонов `meta/match` не
+    знает, а форму его ответа уже разбирает выпущенное приложение. Своего
+    `tmdb_id` здесь нет намеренно — он приходит внутри `meta` вместе с
+    `tmdb_media_type`, и двух источников правды для него быть не должно.
+    """
+
+    meta: TitleMeta
+    imdb_id: str = ""
+    seasons: list[SeasonBrief] = field(default_factory=list)
 
 
 class TTLCache:
@@ -117,6 +249,21 @@ class TTLCache:
         self._load()
 
     def get(self, key: str) -> Any | None:
+        found = self.entry(key)
+        return None if found is None else found[1]
+
+    def entry(self, key: str) -> tuple[float, Any] | None:
+        """Значение вместе с моментом записи.
+
+        Для записей, чей срок зависит от содержимого: общий TTL кэша остаётся
+        верхней границей, а перечитать раньше решает вызывающий.
+
+        Args:
+            key: Ключ записи.
+
+        Returns:
+            Пару «момент записи по time.time(), значение» или None.
+        """
         with self._lock:
             entry = self._items.get(key)
             if entry is None:
@@ -125,7 +272,7 @@ class TTLCache:
             if time.time() - stamp > self._ttl:
                 del self._items[key]
                 return None
-            return value
+            return stamp, value
 
     def put(self, key: str, value: Any) -> None:
         with self._lock:
@@ -243,6 +390,233 @@ def _is_latin(text: str) -> bool:
     return latin >= len(letters) / 2
 
 
+@dataclass
+class ReleaseScope:
+    """Границы сезонов и серий, объявленные в имени раздачи.
+
+    Это разбор имени *раздачи*, а не имени файла: он отвечает на вопрос «что
+    лежит внутри», а не «какая это серия». Чего в имени нет — остаётся None:
+    на этих полях клиент строит ранжирование, и «не знаю» там честнее догадки.
+    """
+
+    season_from: int | None = None
+    season_to: int | None = None
+    episode_from: int | None = None
+    episode_to: int | None = None
+    episodes_declared: int | None = None
+
+
+# «Сезоны 1-8», «Season 1-5», «S01-S03». Диапазон проверяется раньше одиночного
+# шаблона из SEASON_PATTERNS: тот откусил бы от диапазона только левую границу.
+SEASON_RANGE_PATTERNS = (
+    r"[Сс]езон\w*\s*[:\-]?\s*(\d{1,2})\s*[-–—]\s*(\d{1,2})",
+    r"\bseasons?\s*(\d{1,2})\s*[-–—]\s*(\d{1,2})",
+    # «S01-S03», «S01-08» и «S1-8E1-73»: у последнего после правой границы
+    # сразу идёт маркер серий, поэтому здесь не \b, а «лишь бы не цифра»
+    r"\bS(\d{1,2})\s*[-–—]\s*S?(\d{1,2})(?!\d)",
+)
+
+# «серии 1-8 из 10», «(07 из 24)», «E01-E12», «Серия 5». Порядок важен:
+# без него «8 из 10» перебило бы «серии 1-8 из 10» и дало бы первую серию 8.
+EPISODE_PATTERNS = (
+    r"[Сс]ери[июяй]\w*\s*[:\-]?\s*(\d{1,3})\s*[-–—]\s*(\d{1,3})\s*(?:из|of)\s*(\d{1,3})",
+    r"(?<!\d)(\d{1,3})\s*[-–—]\s*(\d{1,3})\s*(?:из|of)\s*(\d{1,3})(?!\d)",
+    r"[Сс]ери[июяй]\w*\s*[:\-]?\s*(\d{1,3})\s*[-–—]\s*(\d{1,3})(?!\s*(?:из|of))",
+    # «S02E01-E12»: перед E стоит цифра сезона, поэтому не \b, а «не буква»
+    r"(?<![^\W\d_])[eEеЕ](\d{1,3})\s*[-–—]\s*[eEеЕ]?(\d{1,3})\b",
+    r"[Сс]ери[июяй]\w*\s*[:\-]?\s*(\d{1,3})\s*(?:из|of)\s*(\d{1,3})",
+    r"(?<!\d)(\d{1,3})\s*(?:из|of)\s*(\d{1,3})(?!\d)",
+    r"\bS\d{1,2}\s*[eEхx](\d{1,3})\b",
+    r"[Сс]ери[яи]\s*[:\-]?\s*(\d{1,3})\b",
+)
+
+
+def parse_release_scope(title: str) -> ReleaseScope:
+    """Разбирает имя раздачи на границы сезонов и серий.
+
+    Args:
+        title: Имя раздачи с трекера целиком, как его отдал источник.
+
+    Returns:
+        Найденные границы; поля, которых в имени нет, остаются None.
+    """
+    raw = title.strip()
+    season_from, season_to = _season_bounds(raw)
+    episode_from, episode_to, declared = _episode_bounds(raw)
+    return ReleaseScope(
+        season_from=season_from, season_to=season_to,
+        episode_from=episode_from, episode_to=episode_to, episodes_declared=declared,
+    )
+
+
+def _season_bounds(raw: str) -> tuple[int | None, int | None]:
+    for pattern in SEASON_RANGE_PATTERNS:
+        found = re.search(pattern, raw)
+        if found:
+            start, end = int(found.group(1)), int(found.group(2))
+            # «Сезон 3-1» — опечатка источника, такие границы не берём
+            if start <= end:
+                return start, end
+    single = _first_int(SEASON_PATTERNS, raw)
+    return (single, single) if single is not None else (None, None)
+
+
+def _episode_bounds(raw: str) -> tuple[int | None, int | None, int | None]:
+    for pattern in EPISODE_PATTERNS:
+        found = re.search(pattern, raw)
+        if not found:
+            continue
+        numbers = [int(value) for value in found.groups() if value is not None]
+        if len(numbers) == 3:
+            start, end, declared = numbers
+            if start <= end <= declared:
+                return start, end, declared
+        elif len(numbers) == 2:
+            first, second = numbers
+            # «07 из 24» — одна серия из объявленных 24, а не диапазон 7…24
+            if re.search(r"\bиз\b|\bof\b", found.group(0), re.I):
+                if first <= second:
+                    return first, first, second
+            elif first <= second:
+                return first, second, None
+        elif numbers:
+            return numbers[0], numbers[0], None
+    return None, None, None
+
+
+# Структурное качество: те же маркеры, что у video_quality_summary в боте, но
+# значениями, а не строкой для человека. Порядок — от точного к общему:
+# «BDRemux 1080p» это remux, хотя подходит и под bdrip, и под bluray.
+SOURCE_TYPE_PATTERNS = (
+    ("bdremux", r"\bbd[ .-]?remux\b"), ("remux", r"\bremux\b"),
+    ("bluray", r"\bblu[ .-]?ray\b|\bbdmv\b|\bbd(?:25|50)\b"),
+    ("bdrip", r"\bbd[ .-]?rip\b|\bbr[ .-]?rip\b"),
+    ("web-dl", r"\bweb[ .-]?dl\b"), ("webrip", r"\bweb[ .-]?rip\b"), ("web", r"\bweb\b"),
+    ("hdtv", r"\bhd[ .-]?tv(?:rip)?\b"), ("hdrip", r"\bhd[ .-]?rip\b"),
+    ("dvdrip", r"\bdvd[ .-]?rip\b"), ("dvd", r"\bdvd(?:5|9)?\b"),
+    ("satrip", r"\bsat[ .-]?rip\b"), ("ts", r"\bts\b|\btelesync\b"),
+    ("camrip", r"\bcam[ .-]?rip\b"),
+)
+
+VIDEO_CODEC_PATTERNS = (
+    ("av1", r"\bav1\b"),
+    ("h265", r"\bh[ .]?265\b|\bhevc\b|\bx265\b"),
+    ("h264", r"\bh[ .]?264\b|\bavc\b|\bx264\b"),
+    ("xvid", r"\bxvid\b"), ("divx", r"\bdivx\b"), ("mpeg2", r"\bmpeg[ .-]?2\b"),
+)
+
+HDR_PATTERNS = (
+    ("dolby_vision", r"\bdolby[ .-]?vision\b|\bdo?vi\b"),
+    ("hdr10plus", r"\bhdr10\+"), ("hdr10", r"\bhdr10\b"), ("hdr", r"\bhdr\b"),
+)
+
+KNOWN_RESOLUTIONS = (2160, 1440, 1080, 720, 576, 480, 360)
+
+
+@dataclass
+class VideoSpec:
+    """Разрешение, источник, кодек и HDR — значениями, а не одной строкой."""
+
+    resolution: int | None = None
+    source_type: str | None = None
+    video_codec: str | None = None
+    hdr: str | None = None
+
+
+def parse_video_spec(title: str, details: str = "") -> VideoSpec:
+    """Достаёт структурное качество из имени раздачи и описания темы.
+
+    Args:
+        title: Имя раздачи.
+        details: Текст темы с трекера, если он уже прочитан.
+
+    Returns:
+        Поля, которых в тексте нет, остаются None: «не указано» и «720p» —
+        разные ответы, и клиент обязан их различать.
+    """
+    text = f"{title}\n{details}"
+    return VideoSpec(
+        resolution=_resolution(text),
+        source_type=_first_label(SOURCE_TYPE_PATTERNS, text),
+        video_codec=_first_label(VIDEO_CODEC_PATTERNS, text),
+        hdr=_first_label(HDR_PATTERNS, text),
+    )
+
+
+def _resolution(text: str) -> int | None:
+    if re.search(r"\b4k\b|\buhd\b|\b2160[pi]\b", text, re.I):
+        return 2160
+    found = re.search(r"\b(\d{3,4})[pi]\b", text, re.I)
+    if found and int(found.group(1)) in KNOWN_RESOLUTIONS:
+        return int(found.group(1))
+    # «1920x1080» пишут в поле «Видео» темы, когда в имени разрешения нет
+    frame = re.search(r"\b\d{3,4}\s*[xх×]\s*(\d{3,4})\b", text, re.I)
+    if frame and int(frame.group(1)) in KNOWN_RESOLUTIONS:
+        return int(frame.group(1))
+    return None
+
+
+def _first_label(patterns: tuple[tuple[str, str], ...], text: str) -> str | None:
+    return next((label for label, pattern in patterns if re.search(pattern, text, re.I)), None)
+
+
+# Вид перевода отдельно от студии: клиенту нужно «есть ли дубляж», а строка
+# «Дубляж · LostFilm» отвечает на это только после разбора на его стороне.
+VOICEOVER_KIND_PATTERNS = (
+    ("dub", r"дублированн\w*|дубляж\w*|\bdub\b"),
+    ("multi", r"многоголос\w*|\bmvo\b"),
+    ("dual", r"двухголос\w*|\bdvo\b"),
+    ("single", r"одноголос\w*|\bavo\b"),
+    ("author", r"авторск\w*"),
+    ("professional", r"профессиональн\w*"),
+    ("licensed", r"лицензи\w*|\bitunes\b"),
+    ("subtitles", r"субтитр\w*|\bsub(?:s|title)?\b"),
+)
+
+VOICEOVER_STUDIO_PATTERNS = (
+    ("Кравец", r"\b(?:kravec|кравец)\b"), ("AlexFilm", r"\balexfilm\b"),
+    ("LostFilm", r"\blostfilm\b"), ("Amedia", r"\b(?:amedia|амедиа)\b"),
+    ("NewStudio", r"\bnewstudio\b"), ("HDRezka Studio", r"\bhdrezka(?:[ .-]?studio)?\b"),
+    ("Red Head Sound", r"\bred[ .-]?head[ .-]?sound\b"), ("Jaskier", r"\bjaskier\b"),
+    ("Кубик в Кубе", r"кубик\s+в\s+кубе"), ("TVShows", r"\btvshows\b"),
+    ("BaibaKo", r"\bbaibako\b"), ("ColdFilm", r"\bcoldfilm\b"), ("РенТВ", r"\bрентв\b"),
+)
+
+# «| D, P, A» в конце имени — компактная запись дорожек, её пишет половина
+# раздач вместо слов. Расшифровка та же, что у voiceover_summary в боте.
+TRACK_CODE_KINDS = {"D": "dub", "P": "professional", "A": "author"}
+
+
+@dataclass
+class VoiceoverSpec:
+    """Виды перевода и названные студии, найденные в имени раздачи."""
+
+    kinds: list[str] = field(default_factory=list)
+    studios: list[str] = field(default_factory=list)
+
+
+def parse_voiceover_spec(title: str, details: str = "") -> VoiceoverSpec:
+    """Достаёт структурную озвучку из имени раздачи и описания темы.
+
+    Args:
+        title: Имя раздачи.
+        details: Текст темы с трекера, если он уже прочитан.
+
+    Returns:
+        Списки видов перевода и студий; пустые значат «источник не указал».
+    """
+    text = f"{title}\n{details}"
+    kinds = [label for label, pattern in VOICEOVER_KIND_PATTERNS if re.search(pattern, text, re.I)]
+    coded = re.search(r"(?:\||\[)\s*((?:D|P|A)(?:\s*,\s*(?:D|P|A))+)", title, re.I)
+    if coded:
+        codes = {value.upper() for value in re.findall(r"[DPA]", coded.group(1), re.I)}
+        kinds.extend(TRACK_CODE_KINDS[code] for code in sorted(codes))
+    if re.search(r"\|\s*D(?:\s*[,|]|$)", title, re.I):
+        kinds.append("dub")
+    studios = [label for label, pattern in VOICEOVER_STUDIO_PATTERNS if re.search(pattern, text, re.I)]
+    return VoiceoverSpec(kinds=list(dict.fromkeys(kinds)), studios=studios)
+
+
 def normalize_title(text: str) -> list[str]:
     """Слова названия без пунктуации и регистра — для сравнения."""
     cleaned = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
@@ -313,58 +687,240 @@ def score_candidate(item: dict[str, Any], parsed: ParsedName, query: str) -> flo
     return score
 
 
+class CatalogLimitError(RuntimeError):
+    """Каталог отказал по лимиту: суточная квота (402) или запросы в секунду (429).
+
+    Отдельный тип, потому что лечится он не повтором запроса, а ожиданием, и
+    приложению об этом надо сказать словами, а не «каталог недоступен».
+    """
+
+
 class KinopoiskMeta:
-    """Кинопоиск как источник карточек и русских названий серий."""
+    """Кинопоиск как источник карточек, полок и русских названий серий."""
 
     SEARCH_URL = "https://kinopoiskapiunofficial.tech/api/v2.1/films/search-by-keyword"
     FILM_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/{film_id}"
     SEASONS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/{film_id}/seasons"
     STAFF_URL = "https://kinopoiskapiunofficial.tech/api/v1/staff"
+    COLLECTIONS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/collections"
+    FILMS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films"
+    PREMIERES_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/premieres"
+    FILTERS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/filters"
+    SIMILARS_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films/{film_id}/similars"
+    QUOTA_URL = "https://kinopoiskapiunofficial.tech/api/v1/api_keys/{api_key}"
 
     def __init__(self, api_key: str) -> None:
         self.http = requests.Session()
         bot.configure_read_retries(self.http)
+        self._api_key = api_key.strip()
         self.http.headers.update(
             {
-                "X-API-KEY": api_key.strip(),
+                "X-API-KEY": self._api_key,
                 "Accept": "application/json",
                 "User-Agent": bot.USER_AGENT,
             }
         )
 
-    def search(self, query: str) -> list[dict[str, Any]]:
-        response = self.http.get(self.SEARCH_URL, params={"keyword": query, "page": 1}, timeout=15)
+    def _get(self, url: str, params: dict[str, Any] | None = None, timeout: int = 15) -> Any:
+        """Один запрос к каталогу с разбором лимитов.
+
+        Args:
+            url: Полный адрес эндпоинта.
+            params: Параметры запроса.
+            timeout: Таймаут в секундах.
+
+        Returns:
+            Разобранный JSON ответа.
+
+        Raises:
+            CatalogLimitError: Суточная квота (402) или запросы в секунду (429).
+        """
+        response = self.http.get(url, params=params, timeout=timeout)
+        # 402 — кончилась суточная или общая квота, 429 — слишком часто.
+        # Документация лимитов: kinopoiskapiunofficial.tech/documentation/api/
+        if response.status_code == 402:
+            raise CatalogLimitError("Дневная квота Кинопоиска исчерпана")
+        if response.status_code == 429:
+            raise CatalogLimitError("Кинопоиск просит сбавить темп запросов")
         response.raise_for_status()
-        payload = response.json()
+        return response.json()
+
+    def search(self, query: str) -> list[dict[str, Any]]:
+        payload = self._get(self.SEARCH_URL, {"keyword": query, "page": 1})
         films = payload.get("films") if isinstance(payload, dict) else None
         return [item for item in films or [] if isinstance(item, dict)]
 
     def film(self, film_id: int) -> dict[str, Any]:
-        response = self.http.get(self.FILM_URL.format(film_id=film_id), timeout=15)
-        response.raise_for_status()
-        payload = response.json()
+        payload = self._get(self.FILM_URL.format(film_id=film_id))
         return payload if isinstance(payload, dict) else {}
 
     def staff(self, film_id: int) -> list[dict[str, Any]]:
-        response = self.http.get(self.STAFF_URL, params={"filmId": film_id}, timeout=20)
-        response.raise_for_status()
-        payload = response.json()
+        payload = self._get(self.STAFF_URL, {"filmId": film_id}, timeout=20)
         return [item for item in payload or [] if isinstance(item, dict)]
 
     def seasons(self, film_id: int) -> list[dict[str, Any]]:
-        response = self.http.get(self.SEASONS_URL.format(film_id=film_id), timeout=20)
-        response.raise_for_status()
-        payload = response.json()
+        payload = self._get(self.SEASONS_URL.format(film_id=film_id), timeout=20)
         items = payload.get("items") if isinstance(payload, dict) else None
         return [item for item in items or [] if isinstance(item, dict)]
 
+    def collection(self, collection_type: str, page: int = 1) -> list[dict[str, Any]]:
+        """Подборка Кинопоиска: топы, популярное, тематические списки.
+
+        Args:
+            collection_type: Константа из COLLECTION_TYPES.
+            page: Страница, 1…50; на странице не больше 20 карточек.
+
+        Returns:
+            Карточки подборки в том виде, в каком их отдал каталог.
+        """
+        payload = self._get(self.COLLECTIONS_URL, {"type": collection_type, "page": page})
+        return _items(payload)
+
+    def films(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Фильтр каталога: жанр, страна, годы, тип, сортировка.
+
+        Args:
+            params: Параметры v2.2/films. Жанр и страна — не больше одного
+                значения каждая: это ограничение самого API, не наше.
+
+        Returns:
+            Карточки выдачи фильтра.
+        """
+        payload = self._get(self.FILMS_URL, params)
+        return _items(payload)
+
+    def premieres(self, year: int, month: str) -> list[dict[str, Any]]:
+        """Премьеры месяца.
+
+        Args:
+            year: Год премьеры.
+            month: Месяц заглавными латиницей, JANUARY…DECEMBER.
+
+        Returns:
+            Карточки премьер; пагинации у этого эндпоинта нет.
+        """
+        payload = self._get(self.PREMIERES_URL, {"year": year, "month": month})
+        return _items(payload)
+
+    def filters(self) -> dict[str, Any]:
+        """Справочник жанров и стран: числовые id для фильтра v2.2/films."""
+        payload = self._get(self.FILTERS_URL)
+        return payload if isinstance(payload, dict) else {}
+
+    def similars(self, film_id: int) -> list[dict[str, Any]]:
+        """«Похожие» Кинопоиска.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+
+        Returns:
+            Элементы в порядке каталога. В элементе только `filmId`, названия,
+            постер и `relationType` — ни страны, ни жанров, ни оценки.
+        """
+        payload = self._get(self.SIMILARS_URL.format(film_id=film_id))
+        return _items(payload)
+
+    def quota(self) -> dict[str, Any]:
+        """Остаток квоты ключа — бесплатный способ узнать её до платных вызовов.
+
+        Ключ у этого эндпоинта идёт в путь: так устроен сам API. Адрес с ним
+        не логируется — в лог уходит только результат.
+        """
+        payload = self._get(self.QUOTA_URL.format(api_key=self._api_key))
+        return payload if isinstance(payload, dict) else {}
+
+
+def _items(payload: Any) -> list[dict[str, Any]]:
+    """Список `items` из ответа каталога; у всех списочных ответов он такой."""
+    items = payload.get("items") if isinstance(payload, dict) else None
+    return [item for item in items or [] if isinstance(item, dict)]
+
+
+def catalog_card(
+    item: dict[str, Any],
+    details: dict[str, Any] | None = None,
+    art: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Расширенная карточка для ленты «Что смотреть».
+
+    Первые десять полей — та же форма, что у `/catalog/popular` и полок
+    (`search_api.catalog_payload`): приложение разбирает их одним типом.
+    Дальше — то, чего в карточке полки нет: оценка IMDb, а когда известна
+    карточка фильма — число голосов, обложка, логотип и «о чём».
+
+    Ловушки ответов Кинопоиска здесь сглажены: `year` строкой в подборках и
+    числом в фильтре, `ratingImbd` с опечаткой в подборках, `filmId` вместо
+    `kinopoiskId` у «похожих». `year`, `rating` и `rating_imdb` — строки,
+    как у остальных карточек сервера.
+
+    Args:
+        item: Элемент списочного ответа (фильтр, подборка, «похожие»).
+        details: Ответ v2.2/films/{id}; его непустые поля главнее.
+        art: Картинки TMDB (`TMDBStills.title_art`): логотип-название, если
+            у Кинопоиска его нет, и постер без надписей — `art_url`.
+
+    Returns:
+        Словарь карточки. `detailed` — пришла ли карточка фильма: без неё
+        пустые `tagline` и `backdrop_url` значат «не спрашивали», а не «нет».
+    """
+    extra = {key: value for key, value in (details or {}).items() if value not in (None, "", [])}
+    merged = {**item, **extra}
+    name = str(merged.get("nameRu") or merged.get("nameEn") or merged.get("nameOriginal") or "Без названия").strip()
+    original_name = str(merged.get("nameEn") or merged.get("nameOriginal") or "").strip()
+    year = str(merged.get("year") or "").strip()
+    length = merged.get("filmLength")
+    return {
+        "catalog_id": int(merged.get("kinopoiskId") or merged.get("filmId") or 0),
+        "name": name,
+        "original_name": original_name if original_name.casefold() != name.casefold() else "",
+        "media_type": str(merged.get("type") or "UNKNOWN"),
+        "year": year,
+        "rating": _rating_text(merged.get("ratingKinopoisk")),
+        "countries": [
+            str(entry.get("country"))
+            for entry in merged.get("countries", []) or []
+            if isinstance(entry, dict) and entry.get("country")
+        ],
+        "genres": [
+            str(entry.get("genre"))
+            for entry in merged.get("genres", []) or []
+            if isinstance(entry, dict) and entry.get("genre")
+        ],
+        "poster_url": _https(str(merged.get("posterUrlPreview") or merged.get("posterUrl") or "")),
+        "search_query": " ".join(part for part in (name, year) if part).strip(),
+        "rating_imdb": _rating_text(merged.get("ratingImdb") or merged.get("ratingImbd")),
+        "votes": int(merged.get("ratingKinopoiskVoteCount") or 0),
+        "tagline": str(merged.get("shortDescription") or "").strip(),
+        "overview": str(merged.get("description") or "").strip(),
+        "backdrop_url": _https(str(merged.get("coverUrl") or "")),
+        "logo_url": _https(str(merged.get("logoUrl") or "")) or (art or {}).get("logo_url", ""),
+        "art_url": (art or {}).get("art_url", ""),
+        "duration_minutes": int(length) if isinstance(length, int) else 0,
+        "detailed": bool(details),
+    }
+
+
+def _rating_text(value: Any) -> str:
+    """Оценка строкой, как у остальных карточек сервера; нет оценки — пустая строка."""
+    if value in (None, "", 0):
+        return ""
+    return str(value).strip()
+
 
 class TMDBStills:
-    """Кадры серий: у Кинопоиска их нет, поэтому опционально берём из TMDB."""
+    """TMDB: кадры серий и даты сезонов — у Кинопоиска нет ни того, ни другого надёжно."""
 
     SEARCH_URL = "https://api.themoviedb.org/3/search/tv"
+    SERIES_URL = "https://api.themoviedb.org/3/tv/{tv_id}"
     SEASON_URL = "https://api.themoviedb.org/3/tv/{tv_id}/season/{season}"
     IMAGE_BASE = "https://image.tmdb.org/t/p/w780"
+    FIND_URL = "https://api.themoviedb.org/3/find/{imdb_id}"
+    IMAGES_URL = "https://api.themoviedb.org/3/{kind}/{tmdb_id}/images"
+    # Логотип в hero приложения — около 260×88 pt, то есть до 780 px по
+    # ширине на тройном экране; w500 для PNG с прозрачностью хватает.
+    LOGO_BASE = "https://image.tmdb.org/t/p/w500"
+    # Порядок языков логотипа: русское название, потом оригинальное.
+    LOGO_LANGUAGES = ("ru", "en", None)
 
     def __init__(self, api_key: str) -> None:
         self.http = requests.Session()
@@ -407,6 +963,250 @@ class TMDBStills:
                 result[number] = f"{self.IMAGE_BASE}{still}"
         return result
 
+    def title_art(self, imdb_id: str, is_series: bool) -> dict[str, str]:
+        """Логотип-название и постер без надписей — для слайда hero.
+
+        У Кинопоиска логотипа у свежих тайтлов нет вовсе (ловушка 25), а
+        «обложка» — квадратный арт. TMDB отдаёт и то и другое почти всегда:
+        живьём 24.10.2026 у шести тайтлов верха «Сейчас смотрят» русский
+        логотип был у всех шести, постер без текста — тоже.
+
+        Тайтл ищется по IMDb id (`/3/find`), а не по названию: нечёткий поиск
+        дал бы логотип чужого фильма. Логотипы в SVG пропускаются — iOS их не
+        рисует (живьём: 4 из 18 у «Игры престолов»).
+
+        Args:
+            imdb_id: `imdbId` карточки Кинопоиска, «tt…».
+            is_series: Ждём сериал — тогда из ответа `/find` берётся он.
+
+        Returns:
+            `logo_url` и `art_url`; чего нет — того ключа нет.
+        """
+        if not re.fullmatch(r"tt[0-9]{7,12}", imdb_id):
+            return {}
+        response = self.http.get(
+            self.FIND_URL.format(imdb_id=imdb_id),
+            params=self._params({"external_source": "imdb_id"}),
+            timeout=10,
+        )
+        response.raise_for_status()
+        found = response.json()
+        order = ("tv_results", "movie_results") if is_series else ("movie_results", "tv_results")
+        kind, tmdb_id = "", 0
+        for key in order:
+            results = found.get(key) or []
+            if results and results[0].get("id"):
+                kind, tmdb_id = ("tv" if key == "tv_results" else "movie"), int(results[0]["id"])
+                break
+        if not tmdb_id:
+            return {}
+        response = self.http.get(
+            self.IMAGES_URL.format(kind=kind, tmdb_id=tmdb_id),
+            params=self._params({"include_image_language": "ru,en,null"}),
+            timeout=10,
+        )
+        response.raise_for_status()
+        images = response.json()
+        art: dict[str, str] = {}
+        logo = _best_image(images.get("logos") or [], self.LOGO_LANGUAGES, skip_svg=True)
+        if logo:
+            art["logo_url"] = f"{self.LOGO_BASE}{logo}"
+        poster = _best_image(images.get("posters") or [], (None,), skip_svg=True)
+        if poster:
+            art["art_url"] = f"{self.IMAGE_BASE}{poster}"
+        return art
+
+    def download(self, url: str) -> bytes:
+        """Картинка TMDB целиком — её сервер кладёт к себе и раздаёт сам."""
+        response = self.http.get(url, timeout=15)
+        response.raise_for_status()
+        return response.content
+
+    def season_dates(self, tv_id: int) -> dict[int, str]:
+        """Сезоны сериала в TMDB и дата выхода каждого — одним запросом на сериал.
+
+        `/3/tv/{id}` отдаёт список `seasons` целиком: `season_number` и
+        `air_date` (дата первой серии; у объявленного сезона бывает null).
+
+        Args:
+            tv_id: Идентификатор сериала в TMDB.
+
+        Returns:
+            Номер сезона → `air_date` строкой «YYYY-MM-DD»; у сезона без даты —
+            пустая строка. Спецвыпуски TMDB лежат под номером 0.
+        """
+        response = self.http.get(self.SERIES_URL.format(tv_id=tv_id), params=self._params(), timeout=10)
+        response.raise_for_status()
+        result: dict[int, str] = {}
+        for season in response.json().get("seasons") or []:
+            number = season.get("season_number") if isinstance(season, dict) else None
+            if isinstance(number, int):
+                result[number] = str(season.get("air_date") or "").strip()
+        return result
+
+
+def _best_image(images: list[Any], languages: tuple[str | None, ...], skip_svg: bool) -> str:
+    """Лучшая картинка TMDB: первый язык из списка, у которого она есть, а
+    внутри языка — по оценке и числу голосов.
+
+    Args:
+        images: `logos` или `posters` из `/images`.
+        languages: Порядок языков; `None` — картинка без текста.
+        skip_svg: Пропускать SVG — их не рисует iOS.
+
+    Returns:
+        `file_path` или пустая строка.
+    """
+    usable = [
+        image for image in images
+        if isinstance(image, dict) and str(image.get("file_path") or "").startswith("/")
+        and not (skip_svg and str(image["file_path"]).lower().endswith(".svg"))
+    ]
+    for language in languages:
+        same = [image for image in usable if image.get("iso_639_1") == language]
+        if same:
+            best = max(same, key=lambda image: (float(image.get("vote_average") or 0), int(image.get("vote_count") or 0)))
+            return str(best["file_path"])
+    return ""
+
+
+def resolve_tmdb_library_id(imdb_id: str, expected_type: str) -> tuple[int | None, str | None]:
+    """Resolve an exact external ID using TMDB's official redirect, never a fuzzy title search.
+
+    No redirect is followed: only a validated TMDB movie/TV Location is accepted.
+    A missing match or temporary upstream failure leaves playback unavailable.
+    """
+    if not re.fullmatch(r"tt[0-9]{7,12}", imdb_id):
+        return None, None
+    try:
+        response = requests.head(
+            "https://www.themoviedb.org/redirect",
+            params={"external_source": "imdb_id", "external_id": imdb_id},
+            allow_redirects=False, timeout=8,
+        )
+        if response.status_code not in (301, 302, 303, 307, 308):
+            return None, None
+        location = urlparse(response.headers.get("Location", ""))
+        match = re.fullmatch(r"/(movie|tv)/([1-9][0-9]*)/?", location.path)
+        if (location.scheme != "https" or location.netloc != "www.themoviedb.org"
+                or location.query or location.fragment or not match
+                or match[1] != expected_type):
+            return None, None
+        return int(match[2]), match[1]
+    except requests.RequestException:
+        LOG.warning("TMDB external-ID lookup unavailable")
+        return None, None
+
+
+def season_is_airing(seasons: Any, today: datetime.date | None = None) -> bool:
+    """Идёт ли последний сезон: тогда его состав перечитывается раз в сутки.
+
+    Сезон идёт, если у него нет серий вовсе или есть серия без даты, с датой
+    в будущем, вышедшая за последние SEASON_RECENT_DAYS дней либо с
+    датой-заглушкой. Заглушка — 1 января у двух и больше серий сезона. Так
+    живьём 23.09.2026 выглядел 4 сезон «Теда Лассо» у самого Кинопоиска: у
+    всех десяти серий 2026-01-01 и имена «Episode #4.N», хотя по TMDB серии
+    выходят еженедельно с 4 августа. Одна серия 1 января бывает и настоящей
+    (новогодний выпуск), её заглушкой не считаем.
+
+    Args:
+        seasons: Элементы `items` ответа v2.2/films/{id}/seasons.
+        today: Сегодняшняя дата; по умолчанию — по часам сервера.
+
+    Returns:
+        True, если последний сезон ещё может измениться.
+    """
+    items = [item for item in seasons if isinstance(item, dict)] if isinstance(seasons, list) else []
+    if not items:
+        return False
+    last = max(items, key=lambda item: item.get("number") if isinstance(item.get("number"), int) else 0)
+    episodes = [item for item in last.get("episodes") or [] if isinstance(item, dict)]
+    if not episodes:
+        return True
+    dates = [_release_date(episode.get("releaseDate")) for episode in episodes]
+    recent = (today or datetime.date.today()) - datetime.timedelta(days=SEASON_RECENT_DAYS)
+    if any(date is None or date > recent for date in dates):
+        return True
+    new_year = [date for date in dates if date is not None and (date.month, date.day) == (1, 1)]
+    return any(new_year.count(date) >= 2 for date in set(new_year))
+
+
+def _release_date(value: Any) -> datetime.date | None:
+    """Дата серии из `releaseDate`; нет её или она не разбирается — None."""
+    try:
+        return datetime.date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return None
+
+
+def _seasons_fresh(stamp: float, seasons: Any) -> bool:
+    """Свежа ли запись сезонов: у идущего срок — сутки, у завершённого — общий TTL кэша."""
+    return not season_is_airing(seasons) or time.time() - stamp <= SEASONS_AIRING_TTL_SECONDS
+
+
+def unreleased_seasons(
+    seasons: Any, tmdb_dates: dict[int, str] | None, today: datetime.date | None = None
+) -> set[int]:
+    """Номера сезонов, которые ещё не вышли.
+
+    Сезон не вышел, если у сериала есть TMDB и TMDB этого сезона не знает или
+    ставит ему дату позже сегодняшней, а у Кинопоиска в этом сезоне не больше
+    одной серии с прошедшей датой. Сезон, который TMDB перечисляет без даты,
+    считается незнакомым: дата у TMDB появляется вместе с первой серией.
+
+    Кинопоиск — вторая половина правила, и она держит от ложных пометок: у
+    вышедшего сезона там серии с датами, как бы TMDB ни нумеровал сезоны
+    (аниме, российские сериалы). Одну серию правило терпит — заглушка
+    Кинопоиска копирует в неё дату прошлого сезона.
+
+    Args:
+        seasons: Элементы `items` ответа Кинопоиска v2.2/films/{id}/seasons.
+        tmdb_dates: Номер сезона в TMDB → `air_date` (`TMDBStills.season_dates`);
+            None — у сериала нет TMDB или он не ответил, и тогда судить не по
+            чему: все сезоны считаются вышедшими, как до правила.
+        today: Сегодняшняя дата; по умолчанию — по часам сервера.
+
+    Returns:
+        Номера невышедших сезонов по нумерации Кинопоиска.
+    """
+    if tmdb_dates is None:
+        return set()
+    day = today or datetime.date.today()
+    return _unconfirmed(_release_candidates(seasons, day), tmdb_dates, day)
+
+
+def _release_candidates(seasons: Any, today: datetime.date) -> set[int]:
+    """Сезоны, у которых на Кинопоиске не больше одной серии с прошедшей датой."""
+    items = [item for item in seasons if isinstance(item, dict)] if isinstance(seasons, list) else []
+    result: set[int] = set()
+    for item in items:
+        number = item.get("number")
+        if not isinstance(number, int) or number <= 0:
+            continue
+        episodes = [episode for episode in item.get("episodes") or [] if isinstance(episode, dict)]
+        dates = [_release_date(episode.get("releaseDate")) for episode in episodes]
+        if sum(1 for date in dates if date is not None and date <= today) <= UNRELEASED_MAX_PAST_EPISODES:
+            result.add(number)
+    return result
+
+
+def _unconfirmed(candidates: set[int], tmdb_dates: dict[int, str], today: datetime.date) -> set[int]:
+    """Кандидаты, выход которых TMDB не подтверждает: нет сезона, нет даты или она впереди."""
+    result: set[int] = set()
+    for number in candidates:
+        date = _release_date(tmdb_dates.get(number))
+        if date is None or date > today:
+            result.add(number)
+    return result
+
+
+def _tmdb_dates(record: Any) -> dict[int, str]:
+    """Даты сезонов из записи кэша `tmdb-seasons:`: номера сезонов там — строки JSON."""
+    seasons = record.get("seasons") if isinstance(record, dict) else None
+    if not isinstance(seasons, dict):
+        return {}
+    return {int(number): str(date or "") for number, date in seasons.items() if str(number).isdigit()}
+
 
 class MetaService:
     """Фасад: имя раздачи → карточка и серии, всё с кэшем."""
@@ -416,10 +1216,16 @@ class MetaService:
         kinopoisk: KinopoiskMeta | None,
         tmdb: TMDBStills | None = None,
         cache: TTLCache | None = None,
+        shelf_cache: TTLCache | None = None,
+        art_dir: Path | None = None,
     ) -> None:
         self.kinopoisk = kinopoisk
         self.tmdb = tmdb
+        self.art_dir = art_dir or ART_DIR
         self.cache = cache or TTLCache()
+        self.shelf_cache = shelf_cache or TTLCache(SHELF_CACHE_PATH, SHELF_TTL_SECONDS)
+        self._locks_guard = threading.Lock()
+        self._seasons_locks: dict[int, threading.Lock] = {}
 
     @property
     def available(self) -> bool:
@@ -428,7 +1234,7 @@ class MetaService:
     def match(self, name: str) -> TitleMeta:
         if self.kinopoisk is None:
             return TitleMeta.empty()
-        cache_key = f"match:{name.strip().casefold()}"
+        cache_key = f"match-tmdb-v1:{name.strip().casefold()}"
         cached = self.cache.get(cache_key)
         if cached is not None:
             return TitleMeta(**cached)
@@ -476,24 +1282,50 @@ class MetaService:
                 break
         return best
 
+    def _film(self, film_id: int) -> dict[str, Any]:
+        """Карточка фильма из каталога с кэшем.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+
+        Returns:
+            Ответ v2.2/films/{id} или пустой словарь, если каталог не ответил.
+        """
+        if not film_id or self.kinopoisk is None:
+            return {}
+        cache_key = f"film:{film_id}"
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            details = self.kinopoisk.film(film_id)
+        except CatalogLimitError:
+            raise
+        except Exception:
+            LOG.warning("Не получилось прочитать карточку %s", film_id, exc_info=True)
+            return {}
+        self.cache.put(cache_key, details)
+        return details
+
     def _build_meta(self, film_id: int, item: dict[str, Any], parsed: ParsedName) -> TitleMeta:
-        details: dict[str, Any] = {}
-        if film_id and self.kinopoisk is not None:
-            try:
-                details = self.kinopoisk.film(film_id)
-            except Exception:
-                LOG.warning("Не получилось прочитать карточку %s", film_id, exc_info=True)
+        # Через _film, а не напрямую: одна и та же карточка нужна и match,
+        # и title_card, и _tmdb_query, а суточная квота каталога — 500 запросов
+        details = self._film(film_id)
 
         media_type = str(details.get("type") or item.get("type") or "").upper()
         seasons_count = 0
         if details.get("serial") or "SERIAL" in media_type or "TV" in media_type:
             seasons_count = self._seasons_count(film_id)
 
+        expected_type = "tv" if details.get("serial") or media_type in {"TV_SERIES", "MINI_SERIES", "TV_SHOW"} else "movie"
+        tmdb_id, tmdb_media_type = resolve_tmdb_library_id(str(details.get("imdbId") or ""), expected_type)
         rating = details.get("ratingKinopoisk") or item.get("rating") or ""
         return TitleMeta(
             matched=True,
             source="kinopoisk",
             source_id=film_id,
+            tmdb_id=tmdb_id,
+            tmdb_media_type=tmdb_media_type,
             title=str(details.get("nameRu") or item.get("nameRu") or item.get("nameEn") or "").strip(),
             original_title=str(
                 details.get("nameOriginal") or item.get("nameEn") or item.get("nameOriginal") or ""
@@ -559,23 +1391,588 @@ class MetaService:
         return len(seasons)
 
     def _seasons(self, film_id: int) -> list[dict[str, Any]]:
+        """Сезоны и серии тайтла из каталога, с кэшем по состоянию сезона.
+
+        Завершённый сериал держится 30 дней, как карточка, идущий последний
+        сезон (`season_is_airing`) — сутки. Срок решается при чтении, по
+        содержимому, поэтому записи прежней версии, положенные на 30 дней,
+        перечитываются так же.
+
+        Перечитывает один поток: KinoApp спрашивает карточку и серии тайтла в
+        одну секунду, и без замка в каталог пошли бы оба. Не вышло перечитать
+        — квота, сеть — остаётся прежний ответ: устаревший состав сезонов
+        лучше карточки без сезонов.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+
+        Returns:
+            Элементы `items` ответа v2.2/films/{id}/seasons; у фильма пусто.
+        """
         if not film_id or self.kinopoisk is None:
             return []
         cache_key = f"seasons:{film_id}"
-        cached = self.cache.get(cache_key)
+        entry = self.cache.entry(cache_key)
+        if entry is not None and _seasons_fresh(*entry):
+            return entry[1]
+        with self._seasons_lock(film_id):
+            # Пока ждали замок, соседний запрос мог уже перечитать
+            entry = self.cache.entry(cache_key)
+            if entry is not None and _seasons_fresh(*entry):
+                return entry[1]
+            try:
+                seasons = self.kinopoisk.seasons(film_id)
+            except Exception:
+                if entry is None:
+                    LOG.warning("Не получилось прочитать сезоны %s", film_id, exc_info=True)
+                    return []
+                LOG.warning("Не получилось перечитать сезоны %s, отдаю прежние", film_id, exc_info=True)
+                return entry[1]
+            self.cache.put(cache_key, seasons)
+            return seasons
+
+    def _seasons_lock(self, film_id: int) -> threading.Lock:
+        """Замок на тайтл: состав его сезонов перечитывает один поток."""
+        with self._locks_guard:
+            return self._seasons_locks.setdefault(film_id, threading.Lock())
+
+    def title_card(self, film_id: int) -> TitleCard:
+        """Карточка тайтла по идентификатору каталога.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+
+        Returns:
+            TitleMeta (внутри уже есть tmdb_id и tmdb_media_type), imdb_id и
+            состав сезонов. Если каталог тайтла не знает, внутри лежит
+            TitleMeta.empty().
+
+        Raises:
+            CatalogLimitError: Квота каталога исчерпана.
+        """
+        if self.kinopoisk is None:
+            return TitleCard(meta=TitleMeta.empty())
+        details = self._film(film_id)
+        if not details:
+            return TitleCard(meta=TitleMeta.empty())
+        parsed = ParsedName(queries=[], year=None, season=None, is_series=None)
+        meta = self._build_meta(film_id, details, parsed)
+        self.remember_title(film_id, meta.original_title or meta.title, meta.year)
+        entries = self._seasons(film_id)
+        # Считается при каждом ответе из того, что уже в кэше, а не хранится
+        # в нём: пометка появляется и у карточек, положенных до правила
+        unreleased = self._unreleased_seasons(film_id, entries)
+        seasons = [
+            SeasonBrief(
+                season=int(entry.get("number") or 0),
+                episodes=len([item for item in entry.get("episodes", []) or [] if isinstance(item, dict)]),
+                released=False if entry.get("number") in unreleased else None,
+            )
+            for entry in entries
+        ]
+        return TitleCard(
+            meta=meta,
+            imdb_id=str(details.get("imdbId") or "").strip(),
+            seasons=[item for item in seasons if item.season],
+        )
+
+    def _unreleased_seasons(self, film_id: int, seasons: list[dict[str, Any]]) -> set[int]:
+        """Невышедшие сезоны тайтла (`unreleased_seasons`) — одинаково для карточки и серий.
+
+        Своих запросов к Кинопоиску у правила нет: состав сезонов уже
+        прочитан, карточка фильма лежит в кэше с того же открытия
+        (`_tmdb_exact_id`). TMDB спрашивается, только если у Кинопоиска есть
+        сезон-кандидат — с одной серией с прошедшей датой или вовсе без них.
+        У вышедших сериалов таких нет, и правило им ничего не стоит.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+            seasons: Состав сезонов тайтла из `_seasons`.
+
+        Returns:
+            Номера невышедших сезонов. Без ключа TMDB, без точного id сериала
+            в TMDB и при любом сбое — пусто: все сезоны вышли, как до правила.
+        """
+        if self.tmdb is None or not seasons:
+            return set()
+        today = datetime.date.today()
+        candidates = _release_candidates(seasons, today)
+        if not candidates:
+            return set()
+        try:
+            return unreleased_seasons(seasons, self._tmdb_season_dates(film_id, candidates, today), today)
+        except Exception:
+            LOG.warning("Не получилось проверить выход сезонов %s", film_id, exc_info=True)
+            return set()
+
+    def _tmdb_season_dates(
+        self, film_id: int, candidates: set[int], today: datetime.date
+    ) -> dict[int, str] | None:
+        """Даты сезонов тайтла из TMDB с кэшем `tmdb-seasons:{film_id}`.
+
+        Сериал в TMDB ищется только точно — по IMDb-идентификатору, как
+        `tmdb_id` карточки. Нечёткий поиск по названию, запасной путь кадров,
+        здесь не годится: чужой сериал с другим числом сезонов пометил бы
+        вышедший сезон невышедшим.
+
+        Запись живёт 30 дней, как карточка, пока подтверждает выход всех
+        кандидатов. Если хоть один по ней не вышел, её перечитывают раз в
+        сутки (UNRELEASED_RECHECK_SECONDS). Не вышло перечитать — прежняя
+        запись живёт ещё сутки: при лежащем TMDB каждый ответ иначе ждал бы
+        его таймаута заново.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+            candidates: Номера сезонов-кандидатов (`_release_candidates`).
+            today: Сегодняшняя дата.
+
+        Returns:
+            Номер сезона → `air_date`; None, если точного сериала в TMDB нет.
+        """
+        assert self.tmdb is not None
+        cache_key = f"tmdb-seasons:{film_id}"
+        entry = self.cache.entry(cache_key)
+        if entry is not None:
+            stamp, record = entry
+            dates = _tmdb_dates(record)
+            if time.time() - stamp <= UNRELEASED_RECHECK_SECONDS or not _unconfirmed(candidates, dates, today):
+                return dates
+        tmdb_id = self._tmdb_exact_id(film_id)
+        if not tmdb_id:
+            return _tmdb_dates(entry[1]) if entry is not None else None
+        try:
+            dates = self.tmdb.season_dates(tmdb_id)
+        except Exception:
+            if entry is None:
+                raise
+            LOG.warning("TMDB не отдал сезоны %s, беру прежние на сутки", tmdb_id, exc_info=True)
+            self.cache.put(cache_key, entry[1])
+            return _tmdb_dates(entry[1])
+        self.cache.put(cache_key, {"tmdb_id": tmdb_id, "seasons": {str(number): date for number, date in dates.items()}})
+        return dates
+
+    def _tmdb_exact_id(self, film_id: int) -> int:
+        """Сериал в TMDB по IMDb-идентификатору — редиректом TMDB, один раз на тайтл.
+
+        Общий для кадров серий и правила невышедших сезонов: без него каждый
+        спрашивал бы редирект сам. Найденный id живёт 30 дней, промах —
+        сутки (UNRELEASED_RECHECK_SECONDS): редирект отвечает «нет» и тогда,
+        когда TMDB просто не ответил, а различить это нечем.
+
+        Карточка фильма берётся через `_film`, то есть из кэша: страница
+        тайтла кладёт её туда первым же шагом. Запрос к Кинопоиску здесь
+        случится, только если карточки в кэше нет, — тот же, что и прежде
+        делали кадры серий. Без карточки промах не запоминается.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+
+        Returns:
+            Идентификатор сериала в TMDB или 0.
+        """
+        cache_key = f"tmdb-imdb:{film_id}"
+        entry = self.cache.entry(cache_key)
+        if entry is not None:
+            stamp, cached = entry
+            if cached or time.time() - stamp <= UNRELEASED_RECHECK_SECONDS:
+                return int(cached or 0)
+        details = self._film(film_id)
+        if not details:
+            return 0
+        tmdb_id, _ = resolve_tmdb_library_id(str(details.get("imdbId") or ""), "tv")
+        self.cache.put(cache_key, tmdb_id or 0)
+        return int(tmdb_id or 0)
+
+    def _tmdb_series_id(self, film_id: int) -> int:
+        """Идентификатор сериала в TMDB, под которым лежат кадры серий.
+
+        Сначала точный путь: по IMDb-идентификатору через редирект TMDB —
+        ключ для этого не нужен и промахнуться нельзя. Поиск по названию
+        остаётся запасным: он требует ключа и способен найти не тот сериал.
+
+        Args:
+            film_id: Идентификатор Кинопоиска.
+
+        Returns:
+            Идентификатор сериала в TMDB или 0, если его не удалось узнать.
+        """
+        cached = self.cache.get(f"tmdb:{film_id}")
+        if cached is not None:
+            return int(cached or 0)
+
+        tmdb_id = self._tmdb_exact_id(film_id)
+        if not tmdb_id and self.tmdb is not None:
+            query, year = self._tmdb_query(film_id)
+            if query:
+                try:
+                    tmdb_id = self.tmdb.find_series(query, year)
+                except Exception:
+                    LOG.warning("TMDB не ответил на «%s»", query, exc_info=True)
+                    return 0
+        self.cache.put(f"tmdb:{film_id}", tmdb_id or 0)
+        return int(tmdb_id or 0)
+
+    def shelf(self, kind: str, page: int = 1) -> list[bot.CatalogTitle]:
+        """Полка Главного экрана.
+
+        Args:
+            kind: Ключ полки: значение из SHELF_COLLECTIONS, `premieres`,
+                `genre/<название>` или `year/<год>`.
+            page: Страница выдачи, начиная с 1.
+
+        Returns:
+            Карточки полки в той же форме, что и `/catalog/popular`.
+
+        Raises:
+            ValueError: Полки с таким ключом у каталога нет.
+            CatalogLimitError: Квота каталога исчерпана.
+        """
+        if self.kinopoisk is None:
+            return []
+        cache_key = f"shelf:{kind.casefold()}:{page}"
+        cached = self.shelf_cache.get(cache_key)
+        if cached is None:
+            cached = self._load_shelf(kind, page)
+            self.shelf_cache.put(cache_key, cached)
+        # Тот же маппер, что у бота: карточка полки и карточка каталога
+        # обязаны быть одной формы, иначе приложение разбирает их дважды
+        return bot.KinopoiskCatalog._titles_from_items(cached)
+
+    def _load_shelf(self, kind: str, page: int) -> list[dict[str, Any]]:
+        assert self.kinopoisk is not None
+        key = kind.strip().strip("/").casefold()
+        if key in SHELF_COLLECTIONS:
+            return self.kinopoisk.collection(SHELF_COLLECTIONS[key], min(max(page, 1), MAX_COLLECTION_PAGE))
+        if key == "premieres":
+            today = datetime.date.today()
+            return self.kinopoisk.premieres(today.year, MONTH_NAMES[today.month - 1])
+        prefix, _, value = key.partition("/")
+        safe_page = min(max(page, 1), MAX_FILTER_PAGE)
+        if prefix == "genre" and value:
+            genre_id = self.genre_id(value)
+            if genre_id is None:
+                raise ValueError(f"Каталог не знает жанра «{value}»")
+            return self.kinopoisk.films({"genres": genre_id, "order": "RATING", "page": safe_page})
+        if prefix == "year" and value.isdigit():
+            year = int(value)
+            return self.kinopoisk.films(
+                {"yearFrom": year, "yearTo": year, "order": "RATING", "page": safe_page}
+            )
+        raise ValueError(f"Неизвестная полка «{kind}»")
+
+    def genres(self) -> list[dict[str, Any]]:
+        """Справочник жанров каталога: числовые id для фильтра по жанру."""
+        return self._directory("genres")
+
+    def countries(self) -> list[dict[str, Any]]:
+        """Справочник стран каталога: числовые id для фильтра по стране."""
+        return self._directory("countries")
+
+    def _directory(self, kind: str) -> list[dict[str, Any]]:
+        """Справочник `genres` или `countries` из v2.2/films/filters.
+
+        Оба приходят одним ответом и кэшируются разом: иначе второй
+        справочник стоил бы второго запроса из той же суточной квоты.
+        """
+        if self.kinopoisk is None:
+            return []
+        cached = self.cache.get(f"filters:{kind}")
         if cached is not None:
             return cached
         try:
-            seasons = self.kinopoisk.seasons(film_id)
+            payload = self.kinopoisk.filters()
+        except CatalogLimitError:
+            raise
         except Exception:
-            LOG.warning("Не получилось прочитать сезоны %s", film_id, exc_info=True)
+            LOG.warning("Не получилось прочитать справочник жанров и стран", exc_info=True)
             return []
-        self.cache.put(cache_key, seasons)
-        return seasons
+        wanted: list[dict[str, Any]] = []
+        for name, field_name in (("genres", "genre"), ("countries", "country")):
+            entries = [
+                {"id": int(entry["id"]), field_name: str(entry.get(field_name) or "")}
+                for entry in payload.get(name, []) or []
+                if isinstance(entry, dict) and str(entry.get("id") or "").isdigit() and entry.get(field_name)
+            ]
+            self.cache.put(f"filters:{name}", entries)
+            if name == kind:
+                wanted = entries
+        return wanted
+
+    def genre_id(self, name: str) -> int | None:
+        """Числовой id жанра по русскому названию; без него фильтр не работает."""
+        wanted = name.strip().casefold()
+        return next(
+            (entry["id"] for entry in self.genres() if str(entry["genre"]).casefold() == wanted),
+            None,
+        )
+
+    def country_id(self, name: str) -> int | None:
+        """Числовой id страны по русскому названию, как в карточке: «США», «Корея Южная»."""
+        wanted = name.strip().casefold()
+        return next(
+            (entry["id"] for entry in self.countries() if str(entry["country"]).casefold() == wanted),
+            None,
+        )
+
+    def discover(
+        self,
+        media_type: str = "ALL",
+        genre: str = "",
+        country: str = "",
+        year_from: int | None = None,
+        year_to: int | None = None,
+        rating_from: float | None = None,
+        order: str = "NUM_VOTE",
+        page: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Подбор по фильтру каталога — лента «Что смотреть» в KinoApp.
+
+        В отличие от полок жанра и года, по умолчанию идёт по числу голосов.
+        Сортировка по оценке без порога голосов поднимает наверх то, что
+        оценили двадцать человек: живьём 23.09.2026 первые двадцать фильмов
+        2025–2026 по оценке оказались короткометражками, «фильмами о фильме»
+        и спортивной документалкой. По голосам сверху — то, что смотрели.
+
+        Страна — главный рычаг: без неё верх новинок по голосам занят тем, за
+        что голосует аудитория Кинопоиска. Живьём все двадцать сериалов
+        2024–2026 на первой странице оказались российскими, а с `country=США`
+        первая страница — «Сёгун», «Фоллаут» и «Питт».
+
+        Args:
+            media_type: `ALL`, `FILM`, `TV_SERIES`, `MINI_SERIES` или `TV_SHOW`.
+            genre: Жанр по-русски, как в карточке; пусто — любой.
+            country: Страна по-русски, как в карточке; пусто — любая.
+            year_from: Нижняя граница года.
+            year_to: Верхняя граница года.
+            rating_from: Порог оценки Кинопоиска.
+            order: `NUM_VOTE`, `RATING` или `YEAR`.
+            page: Страница, с 1.
+
+        Returns:
+            Расширенные карточки (`catalog_card`) без полей карточки фильма.
+
+        Raises:
+            ValueError: Незнакомые каталогу тип, порядок, жанр или страна.
+            CatalogLimitError: Квота каталога исчерпана.
+        """
+        if self.kinopoisk is None:
+            return []
+        kind = media_type.strip().upper() or "ALL"
+        if kind not in DISCOVER_TYPES:
+            raise ValueError(f"Неизвестный тип «{media_type}»")
+        sort = order.strip().upper() or "NUM_VOTE"
+        if sort not in DISCOVER_ORDERS:
+            raise ValueError(f"Неизвестный порядок «{order}»")
+        params: dict[str, Any] = {"order": sort, "page": min(max(page, 1), MAX_FILTER_PAGE)}
+        if kind != "ALL":
+            params["type"] = kind
+        if genre.strip():
+            genre_id = self.genre_id(genre)
+            if genre_id is None:
+                raise ValueError(f"Каталог не знает жанра «{genre.strip()}»")
+            params["genres"] = genre_id
+        if country.strip():
+            country_id = self.country_id(country)
+            if country_id is None:
+                raise ValueError(f"Каталог не знает страны «{country.strip()}»")
+            params["countries"] = country_id
+        if year_from:
+            params["yearFrom"] = year_from
+        if year_to:
+            params["yearTo"] = year_to
+        if rating_from is not None:
+            params["ratingFrom"] = rating_from
+        # Ключ — сами параметры запроса: по ним одна выдача отличается от другой
+        cache_key = "discover:" + json.dumps(params, sort_keys=True, ensure_ascii=False)
+        cached = self.shelf_cache.get(cache_key)
+        if cached is None:
+            cached = self.kinopoisk.films(params)
+            self.shelf_cache.put(cache_key, cached)
+        return [catalog_card(item) for item in cached]
+
+    def similar(self, film_id: int, limit: int = DEFAULT_SIMILAR_LIMIT) -> list[dict[str, Any]]:
+        """«Похожие» Кинопоиска — каждый с карточкой фильма.
+
+        У самих «похожих» в элементе нет ни страны, ни жанров, ни оценки, а
+        без страны приложение не может отсеять то, чего не смотрит. Поэтому
+        каждый дополняется карточкой v2.2/films/{id} — той же, что кэширует
+        страница тайтла, так что открытие похожего потом ничего не стоит.
+
+        Цена на холодном кэше — 1 + limit запросов, дальше 0 в течение 30 дней.
+
+        Args:
+            film_id: Тайтл, к которому ищем похожие.
+            limit: Сколько первых похожих отдать, 1…MAX_SIMILAR_LIMIT.
+
+        Returns:
+            Расширенные карточки в порядке каталога. Похожий, чья карточка не
+            пришла, остаётся с `detailed: false` и без страны.
+
+        Raises:
+            CatalogLimitError: Квота исчерпана раньше, чем пришёл список.
+        """
+        if self.kinopoisk is None or film_id <= 0:
+            return []
+        cache_key = f"similars:{film_id}"
+        items = self.cache.get(cache_key)
+        if items is None:
+            items = self.kinopoisk.similars(film_id)
+            self.cache.put(cache_key, items)
+        head = [item for item in items if str(item.get("filmId") or "").isdigit()]
+        head = head[: min(max(limit, 1), MAX_SIMILAR_LIMIT)]
+        details = self._films([int(item["filmId"]) for item in head])
+        return [catalog_card(item, details.get(int(item["filmId"]))) for item in head]
+
+    def briefs(self, film_ids: list[int]) -> list[dict[str, Any]]:
+        """Карточки для ленты: обложка, логотип и «о чём» пачкой.
+
+        Args:
+            film_ids: Идентификаторы Кинопоиска; дальше MAX_BRIEF_IDS не читаются.
+
+        Returns:
+            Расширенные карточки в порядке запроса. Тайтлов, которых каталог
+            не отдал, в ответе нет.
+
+        Raises:
+            CatalogLimitError: Квота исчерпана, и ни одной карточки нет в кэше.
+        """
+        if self.kinopoisk is None:
+            return []
+        wanted = list(dict.fromkeys(film_id for film_id in film_ids if film_id > 0))[:MAX_BRIEF_IDS]
+        details = self._films(wanted)
+        art = self._title_art_batch({film_id: details[film_id] for film_id in wanted if film_id in details})
+        return [
+            catalog_card(details[film_id], details[film_id], art.get(film_id))
+            for film_id in wanted if film_id in details
+        ]
+
+    def _title_art_batch(self, details: dict[int, dict[str, Any]]) -> dict[int, dict[str, str]]:
+        """Картинки TMDB пачкой: кэш сразу, недостающие — параллельно.
+
+        Без TMDB — пусто, и карточки остаются с тем, что дал Кинопоиск.
+        """
+        if self.tmdb is None or not details:
+            return {}
+        found: dict[int, dict[str, str]] = {}
+        missing: list[int] = []
+        for film_id in details:
+            cached = self.cache.get(f"tmdb-art:{film_id}")
+            if cached is not None:
+                found[film_id] = cached
+            else:
+                missing.append(film_id)
+        if missing:
+            with ThreadPoolExecutor(max_workers=min(DETAIL_WORKERS, len(missing))) as pool:
+                futures = {pool.submit(self._title_art, film_id, details[film_id]): film_id for film_id in missing}
+                for future in as_completed(futures):
+                    found[futures[future]] = future.result()
+        return found
+
+    def _title_art(self, film_id: int, details: dict[str, Any]) -> dict[str, str]:
+        """Картинки одного тайтла с кэшем на 30 дней — и пустой ответ тоже:
+        у тайтла без IMDb id или без картинок в TMDB их не появится завтра.
+
+        Отказ сети не кэшируется: на следующей пачке спросим снова.
+        """
+        assert self.tmdb is not None
+        media_type = str(details.get("type") or "").upper()
+        is_series = bool(details.get("serial")) or media_type in {"TV_SERIES", "MINI_SERIES", "TV_SHOW"}
+        try:
+            found = self.tmdb.title_art(str(details.get("imdbId") or "").strip(), is_series)
+            art = {key: self._keep_art(url) for key, url in found.items()}
+        except Exception:
+            LOG.warning("TMDB не отдал картинки %s", film_id, exc_info=True)
+            return {}
+        self.cache.put(f"tmdb-art:{film_id}", art)
+        return art
+
+    def _keep_art(self, url: str) -> str:
+        """Скачать картинку TMDB к себе и вернуть путь, по которому её раздаёт
+        сервер: `/catalog/art/w500/<имя>.png`. Ссылку на image.tmdb.org телефону
+        отдавать нельзя — из России она не открывается.
+        """
+        assert self.tmdb is not None
+        match = re.fullmatch(r"https://image\.tmdb\.org/t/p/(w500|w780)/([A-Za-z0-9_-]{8,64}\.(?:png|jpg))", url)
+        if not match:
+            raise ValueError(f"чужой адрес картинки: {url}")
+        size, name = match[1], match[2]
+        target = self.art_dir / size / name
+        if not target.exists():
+            body = self.tmdb.download(url)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            partial = target.with_suffix(target.suffix + ".part")
+            partial.write_bytes(body)
+            partial.replace(target)
+            self._prune_art()
+        return f"/catalog/art/{size}/{name}"
+
+    def _prune_art(self) -> None:
+        """Сверх ART_FILES_LIMIT — убрать самые давние: их карточки давно
+        вышли из кэша, а вернувшийся тайтл скачает картинку заново."""
+        files = [path for path in self.art_dir.glob("w*/*") if path.suffix in {".png", ".jpg"}]
+        if len(files) <= ART_FILES_LIMIT:
+            return
+        files.sort(key=lambda path: path.stat().st_mtime)
+        for path in files[: len(files) - ART_FILES_LIMIT * 3 // 4]:
+            path.unlink(missing_ok=True)
+
+    def art_file(self, size: str, name: str) -> Path | None:
+        """Файл картинки, которую сервер скачал сам, — или ничего.
+
+        Раздаётся только то, что уже лежит на диске: по чужому имени сервер в
+        TMDB не ходит, и открытым прокси картинок он не становится.
+        """
+        if size not in ART_SIZES or not ART_NAME.fullmatch(name):
+            return None
+        path = self.art_dir / size / name
+        return path if path.is_file() else None
+
+    def _films(self, film_ids: list[int]) -> dict[int, dict[str, Any]]:
+        """Карточки фильмов пачкой: кэш сразу, недостающие — параллельно.
+
+        Квота, кончившаяся посреди пачки, не роняет её целиком: что успели,
+        то и отдаём. CatalogLimitError поднимается, только если не нашлось
+        ни одной карточки — иначе пустой ответ выглядел бы «похожих нет».
+        """
+        found: dict[int, dict[str, Any]] = {}
+        missing: list[int] = []
+        for film_id in dict.fromkeys(film_ids):
+            cached = self.cache.get(f"film:{film_id}")
+            if cached:
+                found[film_id] = cached
+            else:
+                missing.append(film_id)
+        if not missing:
+            return found
+        limit_error: CatalogLimitError | None = None
+        with ThreadPoolExecutor(max_workers=min(DETAIL_WORKERS, len(missing))) as pool:
+            futures = {pool.submit(self._film, film_id): film_id for film_id in missing}
+            for future in as_completed(futures):
+                try:
+                    details = future.result()
+                except CatalogLimitError as exc:
+                    limit_error = exc
+                    continue
+                if details:
+                    found[futures[future]] = details
+        if limit_error is not None and not found:
+            raise limit_error
+        return found
+
+    def quota(self) -> dict[str, Any]:
+        """Остаток суточной квоты каталога — без кэша, иначе цифра врёт."""
+        if self.kinopoisk is None:
+            return {}
+        return self.kinopoisk.quota()
 
     def episodes(self, film_id: int, season: int | None = None) -> list[EpisodeMeta]:
-        """Серии тайтла: названия и описания из Кинопоиска, кадры — из TMDB."""
+        """Серии тайтла: названия и описания из Кинопоиска, кадры — из TMDB.
+
+        У серий невышедшего сезона `released` — False, по тому же правилу и
+        из тех же данных, что у сезонов в `title_card`.
+        """
         seasons = self._seasons(film_id)
+        unreleased = self._unreleased_seasons(film_id, seasons)
         result: list[EpisodeMeta] = []
         for entry in seasons:
             number = entry.get("number")
@@ -591,32 +1988,25 @@ class MetaService:
                         title=str(episode.get("nameRu") or episode.get("nameEn") or "").strip(),
                         overview=str(episode.get("synopsis") or "").strip(),
                         air_date=str(episode.get("releaseDate") or "").strip(),
+                        released=False if number in unreleased else None,
                     )
                 )
         self._attach_stills(film_id, result)
         return result
 
     def _attach_stills(self, film_id: int, episodes: list[EpisodeMeta]) -> None:
+        # Сами кадры без ключа TMDB не отдаёт: /3/tv/{id}/season/{n} требует
+        # api_key. Ключ-фри тут только определение идентификатора сериала.
         if self.tmdb is None or not episodes:
             return
-        query, year = self._tmdb_query(film_id)
-        if not query:
+        tv_id = self._tmdb_series_id(film_id)
+        if not tv_id:
             return
         seasons = {episode.season for episode in episodes}
         for season in seasons:
             cache_key = f"stills:{film_id}:{season}"
             stills = self.cache.get(cache_key)
             if stills is None:
-                tv_id = self.cache.get(f"tmdb:{film_id}")
-                if tv_id is None:
-                    try:
-                        tv_id = self.tmdb.find_series(query, year)
-                    except Exception:
-                        LOG.warning("TMDB не ответил на «%s»", query, exc_info=True)
-                        return
-                    self.cache.put(f"tmdb:{film_id}", tv_id or 0)
-                if not tv_id:
-                    return
                 try:
                     stills = {str(key): value for key, value in self.tmdb.stills(int(tv_id), season).items()}
                 except Exception:

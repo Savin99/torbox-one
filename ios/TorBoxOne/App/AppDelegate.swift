@@ -1,7 +1,6 @@
 import UIKit
 
-/// Единственная задача — отдавать системе актуальную маску ориентаций:
-/// приложение живёт в портрете, плеер разрешает ландшафт.
+/// Каталог работает в портрете. Ориентацией видео управляет приложение Infuse.
 final class AppDelegate: NSObject, UIApplicationDelegate {
     static var orientationMask: UIInterfaceOrientationMask = .portrait
 
