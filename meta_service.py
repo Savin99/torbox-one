@@ -17,13 +17,15 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
 
+import imdb_ratings
+import tmdb_catalog
 import torbox_tg_bot as bot
 
 LOG = logging.getLogger("meta_service")
@@ -67,6 +69,10 @@ UNRELEASED_RECHECK_SECONDS = 24 * 3600
 # Полки живут отдельным кэшем: топы и премьеры меняются за сутки, а карточка
 # фильма — нет. Один TTL на оба не подобрать, поэтому и файла два.
 SHELF_TTL_SECONDS = 12 * 3600
+TMDB_SIMILAR_TTL_SECONDS = 7 * 24 * 3600
+# Пустой валидный ответ `/catalog/search` держим короче, чем непустую выдачу:
+# опечатка не жжёт квоту при правке запроса, но новинка появится в поиске в тот же день.
+SEARCH_EMPTY_TTL_SECONDS = 3600
 SHELF_CACHE_PATH = Path(os.getenv("SHELF_CACHE_PATH", "").strip() or STATE_DIR / "shelf_cache.json")
 
 # Полки Главного — ровно то, что даёт API Кинопоиска. `top` без уточнения
@@ -183,6 +189,9 @@ class TitleMeta:
         return TitleMeta(matched=False)
 
 
+_TITLE_META_FIELD_NAMES = frozenset(item.name for item in fields(TitleMeta))
+
+
 @dataclass
 class PersonMeta:
     """Актёр или режиссёр для карусели «актёрский состав»."""
@@ -278,6 +287,14 @@ class TTLCache:
         with self._lock:
             self._items[key] = (time.time(), value)
             self._save_locked()
+
+    def _pop_memory(self, key: str) -> tuple[float, Any] | None:
+        with self._lock:
+            return self._items.pop(key, None)
+
+    def _restore_memory(self, key: str, entry: tuple[float, Any]) -> None:
+        with self._lock:
+            self._items[key] = entry
 
     def _load(self) -> None:
         if not self._path.exists():
@@ -748,7 +765,9 @@ class KinopoiskMeta:
     def search(self, query: str) -> list[dict[str, Any]]:
         payload = self._get(self.SEARCH_URL, {"keyword": query, "page": 1})
         films = payload.get("films") if isinstance(payload, dict) else None
-        return [item for item in films or [] if isinstance(item, dict)]
+        if not isinstance(films, list):
+            raise RuntimeError("Каталог фильмов вернул неожиданный ответ")
+        return [item for item in films if isinstance(item, dict)]
 
     def film(self, film_id: int) -> dict[str, Any]:
         payload = self._get(self.FILM_URL.format(film_id=film_id))
@@ -1208,6 +1227,114 @@ def _tmdb_dates(record: Any) -> dict[int, str]:
     return {int(number): str(date or "") for number, date in seasons.items() if str(number).isdigit()}
 
 
+def _tmdb_detail_is_airing(detail: Any, media_kind: str, today: datetime.date | None = None) -> bool:
+    """Идёт ли сериал TMDB или у него есть невышедший/недавний сезон."""
+    if media_kind != "tv" or not isinstance(detail, dict):
+        return False
+    status = str(detail.get("status") or "").strip().casefold()
+    if status in {"returning series", "in production", "planned"}:
+        return True
+    if detail.get("next_episode_to_air"):
+        return True
+    day = today or datetime.date.today()
+    recent = day - datetime.timedelta(days=SEASON_RECENT_DAYS)
+    for season_entry in detail.get("seasons") or []:
+        if not isinstance(season_entry, dict):
+            continue
+        number = season_entry.get("season_number")
+        if not isinstance(number, int) or number <= 0:
+            continue
+        air = _release_date(season_entry.get("air_date"))
+        if air is None or air > recent or int(season_entry.get("episode_count") or 0) <= 0:
+            return True
+    return False
+
+
+def _tmdb_detail_fresh(stamp: float, detail: Any, media_kind: str) -> bool:
+    if time.time() - stamp <= SEASONS_AIRING_TTL_SECONDS:
+        return True
+    return not _tmdb_detail_is_airing(detail, media_kind)
+
+
+def _tmdb_card_fresh(stamp: float, card: Any, media_kind: str) -> bool:
+    if time.time() - stamp <= SEASONS_AIRING_TTL_SECONDS:
+        return True
+    if media_kind != "tv" or not isinstance(card, dict):
+        return True
+    seasons = card.get("seasons") or []
+    return not any(isinstance(s, dict) and s.get("released") is False for s in seasons)
+
+
+def _tmdb_episodes_fresh(stamp: float, items: Any, today: datetime.date | None = None) -> bool:
+    if not isinstance(items, list):
+        return False
+    if time.time() - stamp <= SEASONS_AIRING_TTL_SECONDS:
+        return True
+    day = today or datetime.date.today()
+    recent = day - datetime.timedelta(days=SEASON_RECENT_DAYS)
+    for ep in items:
+        if not isinstance(ep, dict):
+            continue
+        if ep.get("released") is False:
+            return False
+        air = _release_date(ep.get("air_date"))
+        if air is None or air > recent:
+            return False
+    return True
+
+
+def _tmdb_score_item(card: dict[str, Any]) -> dict[str, Any]:
+    """Адаптирует карточку TMDB к полям, которые читает `score_candidate`."""
+    return {
+        "catalog_id": card.get("catalog_id"),
+        "nameRu": card.get("name") or "",
+        "nameEn": card.get("original_name") or "",
+        "nameOriginal": card.get("original_name") or "",
+        "year": card.get("year") or "",
+        "type": card.get("media_type") or "",
+        "rating": card.get("rating") or "",
+    }
+
+
+def _title_card_from_tmdb(card: dict[str, Any]) -> TitleCard:
+    """Собирает `TitleCard` из словаря `TmdbCatalog.title_card`, нормализуя `cast`."""
+    raw_meta = card.get("meta") if isinstance(card.get("meta"), dict) else {}
+    if not raw_meta or not raw_meta.get("matched"):
+        return TitleCard(meta=TitleMeta.empty())
+    raw_cast = raw_meta.get("cast") or []
+    cast_items: list[dict[str, str]] = []
+    for person in raw_cast:
+        if isinstance(person, PersonMeta):
+            cast_items.append(asdict(person))
+        elif isinstance(person, dict):
+            cast_items.append(
+                asdict(
+                    PersonMeta(
+                        name=str(person.get("name") or "").strip(),
+                        role=str(person.get("role") or "").strip(),
+                        photo_url=str(person.get("photo_url") or "").strip(),
+                        profession=str(person.get("profession") or "").strip(),
+                    )
+                )
+            )
+    meta_kwargs = {k: v for k, v in raw_meta.items() if k in _TITLE_META_FIELD_NAMES}
+    meta_kwargs["cast"] = cast_items
+    seasons = [
+        SeasonBrief(
+            season=int(entry["season"]),
+            episodes=int(entry.get("episodes") or 0),
+            released=entry.get("released"),
+        )
+        for entry in card.get("seasons") or []
+        if isinstance(entry, dict) and entry.get("season")
+    ]
+    return TitleCard(
+        meta=TitleMeta(**meta_kwargs),
+        imdb_id=str(card.get("imdb_id") or "").strip(),
+        seasons=seasons,
+    )
+
+
 class MetaService:
     """Фасад: имя раздачи → карточка и серии, всё с кэшем."""
 
@@ -1218,20 +1345,50 @@ class MetaService:
         cache: TTLCache | None = None,
         shelf_cache: TTLCache | None = None,
         art_dir: Path | None = None,
+        tmdb_catalog: Any | None = None,
+        imdb_ratings: Any | None = None,
+        primary_backend: str = "",
     ) -> None:
         self.kinopoisk = kinopoisk
         self.tmdb = tmdb
+        self.tmdb_catalog = tmdb_catalog
+        self.imdb_ratings = imdb_ratings
+        self.primary_backend = primary_backend.strip().lower()
         self.art_dir = art_dir or ART_DIR
         self.cache = cache or TTLCache()
         self.shelf_cache = shelf_cache or TTLCache(SHELF_CACHE_PATH, SHELF_TTL_SECONDS)
         self._locks_guard = threading.Lock()
         self._seasons_locks: dict[int, threading.Lock] = {}
+        self._quota_lock = threading.Lock()
+        self._tmdb_calls_total = 0
+        self._tmdb_calls_today = 0
+        self._tmdb_calls_day = datetime.date.today()
+
+    @property
+    def use_tmdb(self) -> bool:
+        return self.primary_backend == "tmdb" and self.tmdb_catalog is not None
 
     @property
     def available(self) -> bool:
-        return self.kinopoisk is not None
+        return self.kinopoisk is not None or self.tmdb_catalog is not None
+
+    def _count_tmdb_call(self, count: int = 1) -> None:
+        today = datetime.date.today()
+        with self._quota_lock:
+            if today != self._tmdb_calls_day:
+                self._tmdb_calls_day = today
+                self._tmdb_calls_today = 0
+            self._tmdb_calls_total += count
+            self._tmdb_calls_today += count
+
+    def _save_tmdb_imdb(self, catalog_id: int, imdb_id: str) -> None:
+        clean = imdb_id.strip() if isinstance(imdb_id, str) else ""
+        if catalog_id > 0 and clean and self.cache.get(f"tmdb:imdb:{catalog_id}") != clean:
+            self.cache.put(f"tmdb:imdb:{catalog_id}", clean)
 
     def match(self, name: str) -> TitleMeta:
+        if self.use_tmdb:
+            return self._match_tmdb(name)
         if self.kinopoisk is None:
             return TitleMeta.empty()
         cache_key = f"match-tmdb-v1:{name.strip().casefold()}"
@@ -1256,6 +1413,57 @@ class MetaService:
         self.remember_title(film_id, meta.original_title or meta.title, meta.year)
         self.cache.put(cache_key, asdict(meta))
         return meta
+
+    def _match_tmdb(self, name: str) -> TitleMeta:
+        assert self.tmdb_catalog is not None
+        cache_key = f"tmdb:match:{name.strip().casefold()}"
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return TitleMeta(**cached)
+
+        parsed = parse_release_name(name)
+        best = self._search_best_tmdb(parsed, parsed.queries[:2], strict=False)
+        if best is None:
+            best = self._search_best_tmdb(parsed, _short_variants(parsed.queries), strict=True)
+
+        if best is None:
+            meta = TitleMeta.empty()
+            self.cache.put(cache_key, asdict(meta))
+            return meta
+
+        best_id = int(best[1].get("catalog_id") or 0)
+        card = self.title_card(best_id)
+        meta = card.meta
+        if meta.matched:
+            meta.season_hint = parsed.season
+        self.cache.put(cache_key, asdict(meta))
+        return meta
+
+    def _search_best_tmdb(
+        self, parsed: ParsedName, queries: list[str], strict: bool
+    ) -> tuple[float, dict[str, Any]] | None:
+        if self.tmdb_catalog is None:
+            return None
+        best: tuple[float, dict[str, Any]] | None = None
+        for query in queries:
+            try:
+                cards = self.tmdb_catalog.search(query)
+                self._count_tmdb_call()
+            except Exception:
+                LOG.warning("TMDB не ответил на «%s»", query, exc_info=True)
+                continue
+            for card in cards[:10]:
+                item = _tmdb_score_item(card)
+                score = score_candidate(item, parsed, query)
+                if score < 3.5:
+                    continue
+                if strict and not _year_matches(item, parsed):
+                    continue
+                if best is None or score > best[0]:
+                    best = (score, card)
+            if best and best[0] >= 6:
+                break
+        return best
 
     def _search_best(
         self, parsed: ParsedName, queries: list[str], strict: bool
@@ -1436,11 +1644,64 @@ class MetaService:
         with self._locks_guard:
             return self._seasons_locks.setdefault(film_id, threading.Lock())
 
+    def _title_card_tmdb(self, film_id: int, media_kind: str) -> TitleCard:
+        if self.tmdb_catalog is None:
+            return TitleCard(meta=TitleMeta.empty())
+        if getattr(self.tmdb_catalog, "cache", None) is self.cache:
+            detail_key = f"tmdb:detail:{film_id}"
+            entry = self.cache.entry(detail_key)
+            if entry is not None and _tmdb_detail_fresh(entry[0], entry[1], media_kind):
+                raw_card = self.tmdb_catalog.title_card(film_id)
+            else:
+                with self._seasons_lock(film_id):
+                    entry = self.cache.entry(detail_key)
+                    if entry is not None and _tmdb_detail_fresh(entry[0], entry[1], media_kind):
+                        raw_card = self.tmdb_catalog.title_card(film_id)
+                    else:
+                        saved = self.cache._pop_memory(detail_key) if entry is not None else None
+                        try:
+                            raw_card = self.tmdb_catalog.title_card(film_id)
+                            self._count_tmdb_call()
+                        except Exception:
+                            if saved is None:
+                                raise
+                            LOG.warning("Не получилось перечитать карточку TMDB %s, отдаю прежнюю", film_id, exc_info=True)
+                            self.cache._restore_memory(detail_key, saved)
+                            raw_card = self.tmdb_catalog.title_card(film_id)
+        else:
+            card_key = f"tmdb:card:{film_id}"
+            entry = self.cache.entry(card_key)
+            if entry is not None and _tmdb_card_fresh(entry[0], entry[1], media_kind):
+                raw_card = entry[1]
+            else:
+                with self._seasons_lock(film_id):
+                    entry = self.cache.entry(card_key)
+                    if entry is not None and _tmdb_card_fresh(entry[0], entry[1], media_kind):
+                        raw_card = entry[1]
+                    else:
+                        try:
+                            raw_card = self.tmdb_catalog.title_card(film_id)
+                            self._count_tmdb_call()
+                        except Exception:
+                            if entry is None:
+                                raise
+                            LOG.warning("Не получилось перечитать карточку TMDB %s, отдаю прежнюю", film_id, exc_info=True)
+                            raw_card = entry[1]
+                        else:
+                            meta_dict = raw_card.get("meta") if isinstance(raw_card, dict) else None
+                            if isinstance(meta_dict, dict) and meta_dict.get("matched"):
+                                storable = {k: v for k, v in raw_card.items() if k != "raw"}
+                                self.cache.put(card_key, storable)
+        result = _title_card_from_tmdb(raw_card if isinstance(raw_card, dict) else {})
+        if result.imdb_id:
+            self._save_tmdb_imdb(film_id, result.imdb_id)
+        return result
+
     def title_card(self, film_id: int) -> TitleCard:
         """Карточка тайтла по идентификатору каталога.
 
         Args:
-            film_id: Идентификатор Кинопоиска.
+            film_id: Идентификатор TMDB (100M+/200M+) или Кинопоиска (<100M).
 
         Returns:
             TitleMeta (внутри уже есть tmdb_id и tmdb_media_type), imdb_id и
@@ -1450,6 +1711,9 @@ class MetaService:
         Raises:
             CatalogLimitError: Квота каталога исчерпана.
         """
+        decoded = tmdb_catalog.decode_id(film_id)
+        if decoded is not None:
+            return self._title_card_tmdb(film_id, decoded[0])
         if self.kinopoisk is None:
             return TitleCard(meta=TitleMeta.empty())
         details = self._film(film_id)
@@ -1627,6 +1891,17 @@ class MetaService:
             ValueError: Полки с таким ключом у каталога нет.
             CatalogLimitError: Квота каталога исчерпана.
         """
+        if self.use_tmdb:
+            assert self.tmdb_catalog is not None
+            safe_page = min(max(int(page), 1), tmdb_catalog.MAX_SHELF_PAGE)
+            clean_kind = kind.strip().strip("/").casefold()
+            cache_key = f"tmdb:shelf:{clean_kind}:{safe_page}"
+            cached = self.shelf_cache.get(cache_key)
+            if cached is None:
+                cached = self.tmdb_catalog.shelf(kind, safe_page)
+                self._count_tmdb_call()
+                self.shelf_cache.put(cache_key, cached)
+            return [tmdb_catalog.to_catalog_title(card) for card in cached]
         if self.kinopoisk is None:
             return []
         cache_key = f"shelf:{kind.casefold()}:{page}"
@@ -1637,6 +1912,44 @@ class MetaService:
         # Тот же маппер, что у бота: карточка полки и карточка каталога
         # обязаны быть одной формы, иначе приложение разбирает их дважды
         return bot.KinopoiskCatalog._titles_from_items(cached)
+
+    def search(self, query: str) -> list[bot.CatalogTitle]:
+        """Поиск тайтлов в каталоге с кэшем в `shelf_cache`.
+
+        Непустая выдача держится 12 часов (`SHELF_TTL_SECONDS`), пустая
+        (валидный ответ 200 без совпадений) — час (`SEARCH_EMPTY_TTL_SECONDS`).
+        Ошибки сети, кривой ответ и лимиты (`CatalogLimitError`) не кэшируются.
+        """
+        clean = " ".join(query.strip().split())
+        if not clean:
+            return []
+        if self.use_tmdb:
+            assert self.tmdb_catalog is not None
+            cache_key = f"tmdb:search:{clean.casefold()}"
+            entry = self.shelf_cache.entry(cache_key)
+            if entry is not None:
+                stamp, cached = entry
+                if isinstance(cached, list) and (
+                    cached or time.time() - stamp <= SEARCH_EMPTY_TTL_SECONDS
+                ):
+                    return [tmdb_catalog.to_catalog_title(card) for card in cached]
+            cards = self.tmdb_catalog.search(clean)
+            self._count_tmdb_call()
+            self.shelf_cache.put(cache_key, cards)
+            return [tmdb_catalog.to_catalog_title(card) for card in cards]
+        if self.kinopoisk is None:
+            return []
+        cache_key = f"search:{clean.casefold()}"
+        entry = self.shelf_cache.entry(cache_key)
+        if entry is not None:
+            stamp, cached = entry
+            if isinstance(cached, list) and (
+                cached or time.time() - stamp <= SEARCH_EMPTY_TTL_SECONDS
+            ):
+                return bot.KinopoiskCatalog._titles_from_items(cached)
+        items = self.kinopoisk.search(clean)
+        self.shelf_cache.put(cache_key, items)
+        return bot.KinopoiskCatalog._titles_from_items(items)
 
     def _load_shelf(self, kind: str, page: int) -> list[dict[str, Any]]:
         assert self.kinopoisk is not None
@@ -1755,6 +2068,41 @@ class MetaService:
             ValueError: Незнакомые каталогу тип, порядок, жанр или страна.
             CatalogLimitError: Квота каталога исчерпана.
         """
+        if self.use_tmdb:
+            assert self.tmdb_catalog is not None
+            kind = media_type.strip().upper() or "ALL"
+            if kind not in DISCOVER_TYPES:
+                raise ValueError(f"Неизвестный тип «{media_type}»")
+            sort = order.strip().upper() or "NUM_VOTE"
+            if sort not in DISCOVER_ORDERS:
+                raise ValueError(f"Неизвестный порядок «{order}»")
+            safe_page = min(max(int(page), 1), tmdb_catalog.MAX_DISCOVER_PAGE)
+            cache_params = {
+                "media_type": kind,
+                "genre": genre.strip().casefold(),
+                "country": country.strip().casefold(),
+                "year_from": year_from,
+                "year_to": year_to,
+                "rating_from": rating_from,
+                "order": sort,
+                "page": safe_page,
+            }
+            cache_key = "tmdb:discover:" + json.dumps(cache_params, sort_keys=True, ensure_ascii=False)
+            cached = self.shelf_cache.get(cache_key)
+            if cached is None:
+                cached = self.tmdb_catalog.discover(
+                    media_type=kind,
+                    genre=genre,
+                    country=country,
+                    year_from=year_from,
+                    year_to=year_to,
+                    rating_from=rating_from,
+                    order=sort,
+                    page=safe_page,
+                )
+                self._count_tmdb_call()
+                self.shelf_cache.put(cache_key, cached)
+            return [dict(card) for card in cached]
         if self.kinopoisk is None:
             return []
         kind = media_type.strip().upper() or "ALL"
@@ -1790,28 +2138,75 @@ class MetaService:
             self.shelf_cache.put(cache_key, cached)
         return [catalog_card(item) for item in cached]
 
+    def _resolve_cached_kp_to_tmdb(self, film_id: int) -> tuple[str, int] | None:
+        """Резолвит старый KP ID в `(kind, tmdb_id)` только из уже закэшированных данных (0 квоты KP)."""
+        if self.tmdb_catalog is None:
+            return None
+        cached_map = self.cache.get(f"tmdb:kp2tmdb:{film_id}")
+        if (
+            isinstance(cached_map, list)
+            and len(cached_map) == 2
+            and cached_map[0] in ("movie", "tv")
+            and isinstance(cached_map[1], int)
+            and cached_map[1] > 0
+        ):
+            return (cached_map[0], cached_map[1])
+
+        cached_film = self.cache.get(f"film:{film_id}")
+        if isinstance(cached_film, dict):
+            imdb_id = str(cached_film.get("imdbId") or "").strip()
+            media_type = str(cached_film.get("type") or "").upper()
+            is_series = bool(cached_film.get("serial")) or media_type in {"TV_SERIES", "MINI_SERIES", "TV_SHOW"}
+            if imdb_id:
+                try:
+                    resolved = self.tmdb_catalog.find_by_imdb(imdb_id, prefer_kind="tv" if is_series else "movie")
+                    self._count_tmdb_call()
+                except Exception:
+                    LOG.warning("TMDB find_by_imdb не удался для %s (%s)", film_id, imdb_id, exc_info=True)
+                    resolved = None
+                if resolved is not None:
+                    self.cache.put(f"tmdb:kp2tmdb:{film_id}", [resolved[0], resolved[1]])
+                    return resolved
+
+        for key in (f"tmdb:{film_id}", f"tmdb-imdb:{film_id}"):
+            cached_tv = self.cache.get(key)
+            if isinstance(cached_tv, int) and cached_tv > 0:
+                return ("tv", cached_tv)
+        return None
+
     def similar(self, film_id: int, limit: int = DEFAULT_SIMILAR_LIMIT) -> list[dict[str, Any]]:
-        """«Похожие» Кинопоиска — каждый с карточкой фильма.
+        """«Похожие» тайтлы: TMDB для 100M+/200M+ (и кэшированных KP ID), иначе Кинопоиск."""
+        if film_id <= 0:
+            return []
+        safe_limit = min(max(int(limit), 1), MAX_SIMILAR_LIMIT)
 
-        У самих «похожих» в элементе нет ни страны, ни жанров, ни оценки, а
-        без страны приложение не может отсеять то, чего не смотрит. Поэтому
-        каждый дополняется карточкой v2.2/films/{id} — той же, что кэширует
-        страница тайтла, так что открытие похожего потом ничего не стоит.
+        decoded = tmdb_catalog.decode_id(film_id)
+        if decoded is not None:
+            if self.tmdb_catalog is None:
+                return []
+            cache_key = f"tmdb:similar:{film_id}:{safe_limit}"
+            entry = self.cache.entry(cache_key)
+            if entry is not None and time.time() - entry[0] <= TMDB_SIMILAR_TTL_SECONDS and isinstance(entry[1], list):
+                return [dict(card) for card in entry[1]]
+            cards = self.tmdb_catalog.similar(film_id, safe_limit)
+            self._count_tmdb_call()
+            self.cache.put(cache_key, cards)
+            return [dict(card) for card in cards]
 
-        Цена на холодном кэше — 1 + limit запросов, дальше 0 в течение 30 дней.
+        if self.use_tmdb:
+            cache_key = f"tmdb:similar:kp:{film_id}:{safe_limit}"
+            entry = self.cache.entry(cache_key)
+            if entry is not None and time.time() - entry[0] <= TMDB_SIMILAR_TTL_SECONDS and isinstance(entry[1], list):
+                return [dict(card) for card in entry[1]]
+            resolved = self._resolve_cached_kp_to_tmdb(film_id)
+            if resolved is not None:
+                assert self.tmdb_catalog is not None
+                cards = self.tmdb_catalog.similar_by_tmdb(resolved[0], resolved[1], safe_limit)
+                self._count_tmdb_call()
+                self.cache.put(cache_key, cards)
+                return [dict(card) for card in cards]
 
-        Args:
-            film_id: Тайтл, к которому ищем похожие.
-            limit: Сколько первых похожих отдать, 1…MAX_SIMILAR_LIMIT.
-
-        Returns:
-            Расширенные карточки в порядке каталога. Похожий, чья карточка не
-            пришла, остаётся с `detailed: false` и без страны.
-
-        Raises:
-            CatalogLimitError: Квота исчерпана раньше, чем пришёл список.
-        """
-        if self.kinopoisk is None or film_id <= 0:
+        if self.kinopoisk is None:
             return []
         cache_key = f"similars:{film_id}"
         items = self.cache.get(cache_key)
@@ -1819,15 +2214,15 @@ class MetaService:
             items = self.kinopoisk.similars(film_id)
             self.cache.put(cache_key, items)
         head = [item for item in items if str(item.get("filmId") or "").isdigit()]
-        head = head[: min(max(limit, 1), MAX_SIMILAR_LIMIT)]
+        head = head[:safe_limit]
         details = self._films([int(item["filmId"]) for item in head])
         return [catalog_card(item, details.get(int(item["filmId"]))) for item in head]
 
     def briefs(self, film_ids: list[int]) -> list[dict[str, Any]]:
-        """Карточки для ленты: обложка, логотип и «о чём» пачкой.
+        """Карточки для ленты: обложка, логотип и «о чём» пачкой (TMDB + legacy KP).
 
         Args:
-            film_ids: Идентификаторы Кинопоиска; дальше MAX_BRIEF_IDS не читаются.
+            film_ids: Идентификаторы каталога; дальше MAX_BRIEF_IDS не читаются.
 
         Returns:
             Расширенные карточки в порядке запроса. Тайтлов, которых каталог
@@ -1836,15 +2231,46 @@ class MetaService:
         Raises:
             CatalogLimitError: Квота исчерпана, и ни одной карточки нет в кэше.
         """
-        if self.kinopoisk is None:
-            return []
         wanted = list(dict.fromkeys(film_id for film_id in film_ids if film_id > 0))[:MAX_BRIEF_IDS]
-        details = self._films(wanted)
-        art = self._title_art_batch({film_id: details[film_id] for film_id in wanted if film_id in details})
-        return [
-            catalog_card(details[film_id], details[film_id], art.get(film_id))
-            for film_id in wanted if film_id in details
-        ]
+        if not wanted:
+            return []
+        tmdb_ids = [fid for fid in wanted if tmdb_catalog.decode_id(fid) is not None]
+        kp_ids = [fid for fid in wanted if tmdb_catalog.decode_id(fid) is None]
+
+        by_id: dict[int, dict[str, Any]] = {}
+
+        if tmdb_ids and self.tmdb_catalog is not None:
+            missing_before = sum(1 for cid in tmdb_ids if not self.cache.get(f"tmdb:detail:{cid}"))
+            tmdb_cards = self.tmdb_catalog.briefs(tmdb_ids)
+            if missing_before:
+                self._count_tmdb_call(missing_before)
+            known_imdb_map = getattr(self.tmdb_catalog, "_known_imdb_ids", None)
+            for card in tmdb_cards:
+                cid = int(card.get("catalog_id") or 0)
+                if cid > 0:
+                    by_id[cid] = dict(card)
+                    imdb_val = ""
+                    if isinstance(known_imdb_map, dict):
+                        imdb_val = str(known_imdb_map.get(cid) or "")
+                    if not imdb_val and isinstance(card.get("imdb_id"), str):
+                        imdb_val = card["imdb_id"]
+                    if imdb_val:
+                        self._save_tmdb_imdb(cid, imdb_val)
+
+        if kp_ids and self.kinopoisk is not None:
+            try:
+                details = self._films(kp_ids)
+            except CatalogLimitError:
+                if not by_id:
+                    raise
+                details = {}
+            if details:
+                art = self._title_art_batch({fid: details[fid] for fid in kp_ids if fid in details})
+                for fid in kp_ids:
+                    if fid in details:
+                        by_id[fid] = catalog_card(details[fid], details[fid], art.get(fid))
+
+        return [by_id[fid] for fid in wanted if fid in by_id]
 
     def _title_art_batch(self, details: dict[int, dict[str, Any]]) -> dict[int, dict[str, str]]:
         """Картинки TMDB пачкой: кэш сразу, недостающие — параллельно.
@@ -1961,16 +2387,69 @@ class MetaService:
 
     def quota(self) -> dict[str, Any]:
         """Остаток суточной квоты каталога — без кэша, иначе цифра врёт."""
+        if self.use_tmdb:
+            today = datetime.date.today()
+            with self._quota_lock:
+                if today != self._tmdb_calls_day:
+                    self._tmdb_calls_day = today
+                    self._tmdb_calls_today = 0
+                total_used = self._tmdb_calls_total
+                daily_used = self._tmdb_calls_today
+            return {
+                "totalQuota": {"value": -1, "used": total_used},
+                "dailyQuota": {"value": 100000, "used": daily_used},
+                "accountType": "TMDB",
+            }
         if self.kinopoisk is None:
             return {}
         return self.kinopoisk.quota()
 
+    def _episodes_tmdb(self, film_id: int, season: int | None = None) -> list[EpisodeMeta]:
+        if self.tmdb_catalog is None:
+            return []
+        season_key = str(season) if season is not None else "all"
+        cache_key = f"tmdb:episodes:{film_id}:{season_key}"
+        entry = self.cache.entry(cache_key)
+        if entry is not None and _tmdb_episodes_fresh(entry[0], entry[1]):
+            items = entry[1]
+        else:
+            with self._seasons_lock(film_id):
+                entry = self.cache.entry(cache_key)
+                if entry is not None and _tmdb_episodes_fresh(entry[0], entry[1]):
+                    items = entry[1]
+                else:
+                    try:
+                        items = self.tmdb_catalog.episodes(film_id, season)
+                        self._count_tmdb_call()
+                    except Exception:
+                        if entry is None:
+                            raise
+                        LOG.warning("Не получилось перечитать серии TMDB %s, отдаю прежние", film_id, exc_info=True)
+                        items = entry[1]
+                    else:
+                        self.cache.put(cache_key, items)
+        return [
+            EpisodeMeta(
+                season=int(ep["season"]),
+                episode=int(ep["episode"]),
+                title=str(ep.get("title") or "").strip(),
+                overview=str(ep.get("overview") or "").strip(),
+                air_date=str(ep.get("air_date") or "").strip(),
+                still_url=str(ep.get("still_url") or "").strip(),
+                released=ep.get("released"),
+            )
+            for ep in items
+            if isinstance(ep, dict) and ep.get("season") and ep.get("episode")
+        ]
+
     def episodes(self, film_id: int, season: int | None = None) -> list[EpisodeMeta]:
-        """Серии тайтла: названия и описания из Кинопоиска, кадры — из TMDB.
+        """Серии тайтла: TMDB для 100M+/200M+, иначе Кинопоиск + кадры TMDB.
 
         У серий невышедшего сезона `released` — False, по тому же правилу и
         из тех же данных, что у сезонов в `title_card`.
         """
+        if tmdb_catalog.decode_id(film_id) is not None:
+            return self._episodes_tmdb(film_id, season)
         seasons = self._seasons(film_id)
         unreleased = self._unreleased_seasons(film_id, seasons)
         result: list[EpisodeMeta] = []
@@ -2071,10 +2550,32 @@ def _https(url: str) -> str:
 
 
 def build_meta_service() -> MetaService:
-    """Собирает сервис из тех же переменных окружения, что и бот."""
+    """Собирает сервис из переменных окружения (TMDB + IMDb SQLite + legacy KP)."""
     kinopoisk_key = os.getenv("KINOPOISK_API_KEY", "").strip()
     tmdb_key = os.getenv("TMDB_API_KEY", "").strip()
+    backend = os.getenv("CATALOG_BACKEND", "").strip().lower() or ("tmdb" if tmdb_key else "kinopoisk")
+    img_base_url = os.getenv("KINO_IMG_BASE_URL", "").strip().rstrip("/")
+    cache = TTLCache()
+    shelf_cache = TTLCache(SHELF_CACHE_PATH, SHELF_TTL_SECONDS)
+    imdb_db_path = Path(os.getenv("IMDB_RATINGS_DB_PATH", "").strip() or STATE_DIR / "imdb_ratings.sqlite")
+    imdb_store: imdb_ratings.ImdbRatingsStore | None = None
+    tmdb_cat: tmdb_catalog.TmdbCatalog | None = None
+    if tmdb_key:
+        imdb_store = imdb_ratings.ImdbRatingsStore(imdb_db_path)
+        imdb_store.start_background_refresh()
+        tmdb_cat = tmdb_catalog.TmdbCatalog(
+            tmdb_key,
+            img_base_url=img_base_url,
+            imdb_lookup=imdb_store.lookup,
+            imdb_id_resolver=lambda cid: str(cache.get(f"tmdb:imdb:{cid}") or ""),
+            cache=cache,
+        )
     return MetaService(
         kinopoisk=KinopoiskMeta(kinopoisk_key) if kinopoisk_key else None,
         tmdb=TMDBStills(tmdb_key) if tmdb_key else None,
+        cache=cache,
+        shelf_cache=shelf_cache,
+        tmdb_catalog=tmdb_cat,
+        imdb_ratings=imdb_store,
+        primary_backend=backend,
     )

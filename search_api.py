@@ -1247,6 +1247,12 @@ def catalog_error(exc: Exception) -> HTTPException:
     """
     if isinstance(exc, meta_service.CatalogLimitError):
         return HTTPException(status_code=429, detail=str(exc))
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status == 402:
+        return HTTPException(status_code=429, detail="Дневная квота Кинопоиска исчерпана")
+    if status == 429:
+        return HTTPException(status_code=429, detail="Кинопоиск просит сбавить темп запросов")
     return HTTPException(status_code=502, detail=f"Каталог недоступен: {exc}")
 
 
@@ -1269,30 +1275,26 @@ def health_auth() -> dict[str, str]:
 
 
 @app.get("/catalog/popular", dependencies=[Depends(require_token)])
-def catalog_popular() -> list[dict[str, Any]]:
-    if CATALOG is None:
-        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+def catalog_popular(http_request: Request = None) -> list[dict[str, Any]]:  # type: ignore[assignment]
+    if not META.available:
+        raise HTTPException(status_code=503, detail="Каталог не настроен")
     try:
-        return [catalog_payload(title) for title in CATALOG.popular()]
+        return [absolute_art(catalog_payload(title), http_request) for title in META.shelf("popular", 1)]
     except Exception as exc:
-        raise HTTPException(
-            status_code=502, detail=f"Каталог недоступен: {exc}"
-        ) from exc
+        raise catalog_error(exc) from exc
 
 
 @app.get("/catalog/search", dependencies=[Depends(require_token)])
-def catalog_search(q: str) -> list[dict[str, Any]]:
+def catalog_search(q: str, http_request: Request = None) -> list[dict[str, Any]]:  # type: ignore[assignment]
     query = q.strip()
     if not query:
         return []
-    if CATALOG is None:
-        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+    if not META.available:
+        raise HTTPException(status_code=503, detail="Каталог не настроен")
     try:
-        return [catalog_payload(title) for title in CATALOG.search(query)]
+        return [absolute_art(catalog_payload(title), http_request) for title in META.search(query)]
     except Exception as exc:
-        raise HTTPException(
-            status_code=502, detail=f"Каталог недоступен: {exc}"
-        ) from exc
+        raise catalog_error(exc) from exc
 
 
 @app.get("/search", dependencies=[Depends(require_token)])
@@ -1400,7 +1402,7 @@ def release_hashes(request: HashRequest) -> HashResult:
 def catalog_quota() -> dict[str, Any]:
     """Остаток суточной квоты каталога: бесплатный способ узнать её заранее."""
     if not META.available:
-        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+        raise HTTPException(status_code=503, detail="Каталог не настроен")
     try:
         return META.quota()
     except Exception as exc:
@@ -1408,27 +1410,25 @@ def catalog_quota() -> dict[str, Any]:
 
 
 @app.get("/catalog/title/{kp_id}", dependencies=[Depends(require_token)])
-def catalog_title(kp_id: int) -> TitleCardResult:
+def catalog_title(kp_id: int, http_request: Request = None) -> TitleCardResult:  # type: ignore[assignment]
     """Карточка тайтла по идентификатору каталога.
 
     Args:
-        kp_id: Идентификатор Кинопоиска.
+        kp_id: Идентификатор TMDB (100M+/200M+) или Кинопоиска (<100M).
 
     Returns:
         TitleMeta, идентификатор IMDb и состав сезонов. `tmdb_id` и
-        `tmdb_media_type` приходят внутри `meta`: Кинопоиск их не отдаёт,
-        и сервер выясняет их у самого TMDB по IMDb-идентификатору —
-        точным редиректом, без ключа API. У невышедшего сезона —
+        `tmdb_media_type` приходят внутри `meta`. У невышедшего сезона —
         `released: false`.
     """
     if not META.available:
-        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+        raise HTTPException(status_code=503, detail="Каталог не настроен")
     try:
         card = META.title_card(kp_id)
     except Exception as exc:
         raise catalog_error(exc) from exc
     return TitleCardResult(
-        meta=dataclasses.asdict(card.meta),
+        meta=absolute_art(dataclasses.asdict(card.meta), http_request),
         imdb_id=card.imdb_id,
         seasons=[
             SeasonItem(season=item.season, episodes=item.episodes, released=item.released)
@@ -1438,23 +1438,22 @@ def catalog_title(kp_id: int) -> TitleCardResult:
 
 
 @app.get("/catalog/shelf/{kind:path}", dependencies=[Depends(require_token)])
-def catalog_shelf(kind: str, page: int = 1) -> list[dict[str, Any]]:
+def catalog_shelf(kind: str, page: int = 1, http_request: Request = None) -> list[dict[str, Any]]:  # type: ignore[assignment]
     """Полка Главного экрана.
 
     Args:
         kind: `popular`, `top_movies`, `top_series`, `popular_series`,
             `premieres`, `closest_releases`, тематические подборки, а также
-            `genre/<название>` и `year/<год>`. Полный список — в
-            `docs/search-api.md`; всё это подборки самого Кинопоиска.
+            `genre/<название>` и `year/<год>`.
         page: Страница выдачи, начиная с 1.
 
     Returns:
         Карточки в той же форме, что и `/catalog/popular`.
     """
     if not META.available:
-        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+        raise HTTPException(status_code=503, detail="Каталог не настроен")
     try:
-        return [catalog_payload(title) for title in META.shelf(kind, page)]
+        return [absolute_art(catalog_payload(title), http_request) for title in META.shelf(kind, page)]
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -1471,6 +1470,7 @@ def catalog_discover(
     rating_from: float | None = None,
     order: str = "NUM_VOTE",
     page: int = 1,
+    http_request: Request = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """Подбор по фильтру каталога для ленты «Что смотреть».
 
@@ -1480,7 +1480,7 @@ def catalog_discover(
         country: Страна по-русски, как в карточке.
         year_from: Нижняя граница года.
         year_to: Верхняя граница года.
-        rating_from: Порог оценки Кинопоиска.
+        rating_from: Порог оценки.
         order: `NUM_VOTE` (по умолчанию), `RATING` или `YEAR`.
         page: Страница выдачи, начиная с 1.
 
@@ -1489,9 +1489,9 @@ def catalog_discover(
         фильма здесь нет (`detailed: false`) — их просят через `/catalog/briefs`.
     """
     if not META.available:
-        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+        raise HTTPException(status_code=503, detail="Каталог не настроен")
     try:
-        return META.discover(
+        cards = META.discover(
             media_type=media_type,
             genre=genre,
             country=country,
@@ -1505,37 +1505,42 @@ def catalog_discover(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise catalog_error(exc) from exc
+    return [absolute_art(card, http_request) for card in cards]
 
 
 @app.get("/catalog/similar/{kp_id}", dependencies=[Depends(require_token)])
-def catalog_similar(kp_id: int, limit: int = meta_service.DEFAULT_SIMILAR_LIMIT) -> list[dict[str, Any]]:
-    """«Похожие» Кинопоиска, каждый с карточкой фильма: страна, жанры, оценки, обложка.
+def catalog_similar(
+    kp_id: int,
+    limit: int = meta_service.DEFAULT_SIMILAR_LIMIT,
+    http_request: Request = None,  # type: ignore[assignment]
+) -> list[dict[str, Any]]:
+    """«Похожие» тайтлы, каждый с карточкой фильма: страна, жанры, оценки, обложка.
 
     Args:
         kp_id: Тайтл, к которому ищем похожие.
-        limit: Сколько первых похожих отдать; каждый стоит запроса карточки
-            на холодном кэше.
+        limit: Сколько первых похожих отдать.
 
     Returns:
         Расширенные карточки в порядке каталога.
     """
     if not META.available:
-        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+        raise HTTPException(status_code=503, detail="Каталог не настроен")
     try:
-        return META.similar(kp_id, limit)
+        cards = META.similar(kp_id, limit)
     except Exception as exc:
         raise catalog_error(exc) from exc
+    return [absolute_art(card, http_request) for card in cards]
 
 
 @app.post("/catalog/briefs", dependencies=[Depends(require_token)])
 def catalog_briefs(request: BriefRequest, http_request: Request) -> list[dict[str, Any]]:
     """Обложка, логотип и «о чём» для карточек ленты — пачкой.
 
-    С версии 1.4 — ещё и картинки TMDB: логотип-название, если у Кинопоиска
-    его нет, и `art_url` — постер без надписей для слайда hero приложения.
+    С версии 1.4 — ещё и картинки TMDB: логотип-название и `art_url` — постер
+    без надписей для слайда hero приложения.
 
     Args:
-        request: Идентификаторы Кинопоиска; читаются первые
+        request: Идентификаторы каталога; читаются первые
             `meta_service.MAX_BRIEF_IDS`, лишние просто не попадают в ответ.
 
     Returns:
@@ -1543,7 +1548,7 @@ def catalog_briefs(request: BriefRequest, http_request: Request) -> list[dict[st
         которых каталог не отдал, в ответе нет.
     """
     if not META.available:
-        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+        raise HTTPException(status_code=503, detail="Каталог не настроен")
     try:
         cards = META.briefs(request.ids)
     except Exception as exc:
@@ -1551,18 +1556,47 @@ def catalog_briefs(request: BriefRequest, http_request: Request) -> list[dict[st
     return [absolute_art(card, http_request) for card in cards]
 
 
-def absolute_art(card: dict[str, Any], request: Request) -> dict[str, Any]:
-    """Пути картинок, которые сервер раздаёт сам, — полным адресом.
+RELATIVE_IMAGE_PREFIXES = ("/kino/img/", "/catalog/art/")
+IMAGE_URL_FIELDS = ("poster_url", "backdrop_url", "logo_url", "art_url", "still_url", "photo_url")
 
-    Адрес берётся из самого запроса: за nginx это `https://<хост>/` — nginx
-    передаёт `Host` и `X-Forwarded-Proto`, а uvicorn верит им с 127.0.0.1.
+
+def img_base_url(request: Request | None = None) -> str:
+    configured = os.getenv("KINO_IMG_BASE_URL", "").strip().rstrip("/")
+    if configured:
+        return configured
+    if request is not None:
+        return str(request.base_url).rstrip("/")
+    return ""
+
+
+def _absolutize_image_url(value: Any, base: str) -> Any:
+    if base and isinstance(value, str) and value.startswith(RELATIVE_IMAGE_PREFIXES):
+        return base + value
+    return value
+
+
+def absolute_art(card: dict[str, Any], request: Request | None = None) -> dict[str, Any]:
+    """Пути картинок (`/kino/img/...` и `/catalog/art/...`) — полным адресом.
+
+    Приоритет: `KINO_IMG_BASE_URL` из env, иначе `request.base_url` (за nginx
+    это `https://<хост>`). Исходный словарь не мутируется, чтобы не портить кэш.
     """
-    base = str(request.base_url).rstrip("/")
-    for key in ("logo_url", "art_url"):
-        value = card.get(key)
-        if isinstance(value, str) and value.startswith("/catalog/art/"):
-            card[key] = base + value
-    return card
+    base = img_base_url(request)
+    if not base:
+        return dict(card)
+    updated = dict(card)
+    for key in IMAGE_URL_FIELDS:
+        if key in updated:
+            updated[key] = _absolutize_image_url(updated[key], base)
+    cast = updated.get("cast")
+    if isinstance(cast, list):
+        updated["cast"] = [
+            {**person, "photo_url": _absolutize_image_url(person.get("photo_url"), base)}
+            if isinstance(person, dict) and "photo_url" in person
+            else person
+            for person in cast
+        ]
+    return updated
 
 
 @app.get("/catalog/art/{size}/{name}")
@@ -1581,21 +1615,25 @@ def catalog_art(size: str, name: str) -> FileResponse:
 
 
 @app.get("/catalog/{kp_id}/episodes", dependencies=[Depends(require_token)])
-def catalog_episodes(kp_id: int, season: int | None = None) -> list[dict[str, Any]]:
+def catalog_episodes(
+    kp_id: int,
+    season: int | None = None,
+    http_request: Request = None,  # type: ignore[assignment]
+) -> list[dict[str, Any]]:
     """Серии тайтла. То же, что `/meta/{film_id}/episodes`; старый путь остаётся."""
-    return meta_episodes(kp_id, season)
+    return meta_episodes(kp_id, season, http_request)
 
 
 @app.get("/meta/match", dependencies=[Depends(require_token)])
-def meta_match(name: str) -> dict[str, Any]:
+def meta_match(name: str, http_request: Request = None) -> dict[str, Any]:  # type: ignore[assignment]
     """Карточка тайтла по имени раздачи: постер, обложка, описание, состав."""
     if not META.available:
-        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+        raise HTTPException(status_code=503, detail="Каталог не настроен")
     query = name.strip()
     if len(query) < 2:
         raise HTTPException(status_code=400, detail="Слишком короткое имя")
     try:
-        return dataclasses.asdict(META.match(query))
+        return absolute_art(dataclasses.asdict(META.match(query)), http_request)
     except Exception as exc:
         raise HTTPException(
             status_code=502, detail=f"Каталог метаданных недоступен: {exc}"
@@ -1603,15 +1641,19 @@ def meta_match(name: str) -> dict[str, Any]:
 
 
 @app.get("/meta/{film_id}/episodes", dependencies=[Depends(require_token)])
-def meta_episodes(film_id: int, season: int | None = None) -> list[dict[str, Any]]:
+def meta_episodes(
+    film_id: int,
+    season: int | None = None,
+    http_request: Request = None,  # type: ignore[assignment]
+) -> list[dict[str, Any]]:
     """Серии тайтла: русские названия, описания и кадры (если настроен TMDB).
 
     У серий невышедшего сезона — `released: false`; у остальных поля нет.
     """
     if not META.available:
-        raise HTTPException(status_code=503, detail="KINOPOISK_API_KEY не настроен")
+        raise HTTPException(status_code=503, detail="Каталог не настроен")
     try:
-        return [episode_payload(item) for item in META.episodes(film_id, season)]
+        return [absolute_art(episode_payload(item), http_request) for item in META.episodes(film_id, season)]
     except Exception as exc:
         raise HTTPException(
             status_code=502, detail=f"Каталог метаданных недоступен: {exc}"

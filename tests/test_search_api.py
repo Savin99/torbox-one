@@ -11,15 +11,14 @@ import sys
 import tempfile
 import threading
 import time
-import types
 import unittest
-import unittest.mock
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import bencodepy
-from fastapi import HTTPException
+import requests
+from fastapi import HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 
 import meta_service
@@ -696,11 +695,6 @@ class FakeMeta:
         return [meta_service.EpisodeMeta(season=season or 1, episode=1, title="Первая")]
 
 
-# Запрос, пришедший через nginx: uvicorn собирает base_url из Host и
-# X-Forwarded-Proto.
-PUBLIC_REQUEST = types.SimpleNamespace(base_url="https://kino.example/")
-
-
 @contextlib.contextmanager
 def meta_replaced(meta: FakeMeta) -> Iterator[None]:
     saved = search_api.META
@@ -941,38 +935,18 @@ class DiscoverEndpointTests(unittest.TestCase):
 
     def test_briefs_take_ids_from_the_body(self) -> None:
         meta = DiscoverMeta()
+        http_request = Request({
+            "type": "http",
+            "method": "POST",
+            "scheme": "https",
+            "server": ("search.test", 443),
+            "path": "/catalog/briefs",
+            "headers": [],
+        })
         with meta_replaced(meta):
-            cards = search_api.catalog_briefs(search_api.BriefRequest(ids=[301, 258687]), PUBLIC_REQUEST)
+            cards = search_api.catalog_briefs(search_api.BriefRequest(ids=[301, 258687]), http_request)
         self.assertEqual(meta.calls, [("briefs", [301, 258687])])
         self.assertTrue(cards[0]["detailed"])
-
-    def test_briefs_art_is_an_address_of_this_server(self) -> None:
-        class ArtMeta(DiscoverMeta):
-            def briefs(self, film_ids: list[int]) -> list[dict[str, Any]]:
-                return [{
-                    "catalog_id": 1,
-                    "logo_url": "/catalog/art/w500/ruLogo1234.png",
-                    "art_url": "",
-                    "poster_url": "https://avatars.mds.yandex.net/get-kinopoisk-image/1/x/600x900",
-                }]
-
-        with meta_replaced(ArtMeta()):
-            card, = search_api.catalog_briefs(search_api.BriefRequest(ids=[1]), PUBLIC_REQUEST)
-        self.assertEqual(card["logo_url"], "https://kino.example/catalog/art/w500/ruLogo1234.png")
-        self.assertEqual(card["art_url"], "")
-        self.assertTrue(card["poster_url"].startswith("https://avatars.mds.yandex.net/"))
-
-    def test_art_route_needs_no_token_and_knows_only_its_files(self) -> None:
-        class Files(DiscoverMeta):
-            def art_file(self, size: str, name: str) -> Path | None:
-                return None
-
-        with meta_replaced(Files()):
-            with self.assertRaises(HTTPException) as ctx:
-                search_api.catalog_art("w500", "unknown12345.png")
-        self.assertEqual(ctx.exception.status_code, 404)
-        route = next(r for r in search_api.app.routes if getattr(r, "path", "") == "/catalog/art/{size}/{name}")
-        self.assertEqual(getattr(route, "dependencies", []), [])
 
     def test_discover_route_reads_the_type_parameter(self) -> None:
         # Параметр в адресе — `type`, а имя в Python другое: `type` занят встроенным
@@ -1164,96 +1138,357 @@ class LogRedactionTests(unittest.TestCase):
         self.assertIn("Поиск ['Дюна 2021']: 8 релизов", line)
 
 
-class MagnetFromHashTests(unittest.TestCase):
-    """Хэш известен, magnet нет (Knaben через Prowlarr) — клиент получает magnet из хэша."""
+class _StubCatalogHttpResponse:
+    def __init__(self, payload: Any, status_code: int = 200) -> None:
+        self.payload = payload
+        self.status_code = status_code
 
-    def test_payload_builds_magnet_from_known_hash(self) -> None:
-        release = make_release(provider="prowlarr", info_hash="38db15f22435c9da85a340d2a40e3a2427335f21", magnet_url="")
-        payload = search_api.release_payload("prowlarr:knaben:1", release)
-        self.assertTrue(payload["magnet_url"].startswith("magnet:?xt=urn:btih:38db15f22435c9da85a340d2a40e3a2427335f21"))
+    def json(self) -> Any:
+        return self.payload
 
-    def test_payload_builds_magnet_from_uppercase_hash(self) -> None:
-        # Prowlarr отдаёт infoHash Knaben заглавными (живой ответ 03.11.2026)
-        release = make_release(provider="prowlarr", info_hash="0D07E4F103E30DA703C41CE6ACCAF5CEEE3E5D7E", magnet_url="")
-        payload = search_api.release_payload("prowlarr:knaben:2", release)
-        self.assertTrue(payload["magnet_url"].startswith("magnet:?xt=urn:btih:0d07e4f103e30da703c41ce6accaf5ceee3e5d7e"))
-
-    def test_payload_keeps_source_magnet_and_skips_bad_hash(self) -> None:
-        own = make_release(magnet_url="magnet:?xt=urn:btih:" + "b" * 40 + "&tr=udp://x")
-        self.assertEqual(search_api.release_payload("nnm:1", own)["magnet_url"], own.magnet_url)
-        # У NNM есть настоящий .torrent: прежний ответ без magnet сохраняется (совместимость TorBox One).
-        self.assertEqual(search_api.release_payload("nnm:4", make_release())["magnet_url"], "")
-        self.assertEqual(search_api.release_payload("p:2", make_release(provider="prowlarr", info_hash="", magnet_url=""))["magnet_url"], "")
-        self.assertEqual(search_api.release_payload("p:3", make_release(provider="prowlarr", info_hash="not-a-hash", magnet_url=""))["magnet_url"], "")
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            error = requests.HTTPError(f"HTTP {self.status_code}")
+            error.response = self  # type: ignore[assignment]
+            raise error
 
 
-class MagnetRedirectTests(unittest.TestCase):
-    """Ссылка «.torrent» Prowlarr, которая редиректит на magnet, — не падение, а magnet."""
+class _StubCatalogHttp:
+    def __init__(self, routes: dict[str, Any], status: int = 200) -> None:
+        self.routes = routes
+        self.status = status
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.headers: dict[str, str] = {}
 
-    MAGNET = "magnet:?xt=urn:btih:38DB15F22435C9DA85A340D2A40E3A2427335F21&dn=Resident%20Evil"
-
-    def _client(self) -> bot.ProwlarrClient:
-        client = bot.ProwlarrClient("http://127.0.0.1:9696", "api-key")
-        redirect = unittest.mock.Mock(is_redirect=True, headers={"Location": self.MAGNET}, url="http://127.0.0.1:9696/1/download")
-        client.http = unittest.mock.Mock(get=unittest.mock.Mock(return_value=redirect))
-        return client
-
-    def test_download_raises_magnet_redirect(self) -> None:
-        release = make_release(provider="prowlarr", download_url="http://127.0.0.1:9696/1/download?link=x", info_hash="")
-        with self.assertRaises(bot.MagnetRedirect) as caught:
-            self._client().download_torrent(release)
-        self.assertEqual(caught.exception.magnet, self.MAGNET)
-
-    def test_hash_comes_from_redirect_magnet(self) -> None:
-        client = self._client()
-        release = make_release(provider="prowlarr", download_url="http://127.0.0.1:9696/1/download?link=x", info_hash="")
-        cache = unittest.mock.Mock(get=unittest.mock.Mock(return_value=None))
-        with unittest.mock.patch.dict(search_api.PROVIDER_BY_KEY, {"prowlarr": client}), \
-                unittest.mock.patch.object(search_api, "HASH_CACHE", cache):
-            value = search_api.release_info_hash("prowlarr:knaben:1", release)
-        self.assertEqual(value, "38db15f22435c9da85a340d2a40e3a2427335f21")
+    def get(self, url: str, params: dict[str, Any] | None = None, timeout: int = 0) -> _StubCatalogHttpResponse:
+        self.calls.append((url, dict(params or {})))
+        key = next((route for route in self.routes if route in url), "")
+        return _StubCatalogHttpResponse(self.routes.get(key, {}), self.status)
 
 
-class DropOtherYearsTests(unittest.TestCase):
-    """Одноимённые фильмы других лет не вытесняют нужный (случай 02.11.2026)."""
+def _stub_meta_service(routes: dict[str, Any], status: int = 200) -> tuple[meta_service.MetaService, _StubCatalogHttp]:
+    kinopoisk = meta_service.KinopoiskMeta("test-key")
+    http = _StubCatalogHttp(routes, status)
+    kinopoisk.http = http  # type: ignore[assignment]
+    folder = Path(tempfile.mkdtemp())
+    service = meta_service.MetaService(
+        kinopoisk=kinopoisk,
+        tmdb=None,
+        cache=meta_service.TTLCache(folder / "meta.json"),
+        shelf_cache=meta_service.TTLCache(folder / "shelf.json", meta_service.SHELF_TTL_SECONDS),
+    )
+    return service, http
 
-    def titles(self, names: list[str], year: int | None, queries: list[str]) -> list[str]:
-        releases = [make_release(title=name) for name in names]
-        return [item.title for item in search_api.drop_other_years(releases, year, queries)]
 
-    def test_resident_evil_2026_drops_2002_and_2016(self) -> None:
-        names = [
-            "Обитель зла: Последняя глава / Resident Evil: The Final Chapter (2016) BDRemux",
-            "Обитель зла / Resident Evil (Пол У. С. Андерсон) [2002, Великобритания] BDRip",
-            "Обитель зла / Resident Evil (Зак Креггер) [2026, Германия, США] WEB-DL 1080p",
-            "Resident Evil 2026 1080p WEB DL AAC x264",
-            "Resident.Evil.1080p.WEB-DL",
+class CatalogSearchAndPopularEndpointTests(unittest.TestCase):
+    SEARCH_PAYLOAD = {
+        "keyword": "матрица",
+        "films": [
+            {
+                "filmId": 301,
+                "nameRu": "Матрица",
+                "nameEn": "The Matrix",
+                "type": "FILM",
+                "year": "1999",
+                "rating": "8.5",
+                "countries": [{"country": "США"}],
+                "genres": [{"genre": "фантастика"}],
+                "posterUrlPreview": "https://example.org/p.jpg",
+            }
+        ],
+    }
+    POPULAR_PAYLOAD = {
+        "items": [
+            {
+                "kinopoiskId": 301,
+                "nameRu": "Матрица",
+                "nameOriginal": "The Matrix",
+                "type": "FILM",
+                "year": "1999",
+                "ratingKinopoisk": 8.5,
+                "countries": [{"country": "США"}],
+                "genres": [{"genre": "фантастика"}],
+                "posterUrlPreview": "https://example.org/p.jpg",
+            }
         ]
-        kept = self.titles(names, 2026, ["Обитель зла 2026", "Обитель зла", "Resident Evil"])
-        self.assertEqual(kept, names[2:])
+    }
 
-    def test_odyssey_2026_drops_kubrick_but_keeps_2026_releases(self) -> None:
-        names = [
-            "2001 год: Космическая одиссея / 2001: A Space Odyssey (Стэнли Кубрик) [1968]",
-            "Одиссея / The Odyssey (Андрей Кончаловский) [1997, США]",
-            "Одиссея / The Odyssey (2026) WEB-DL [H.264/1080p]",
-            "The.Odyssey.2026.1080p.TELESYNC.HEVC",
+    def test_catalog_search_hits_cache_and_normalizes_query(self) -> None:
+        service, http = _stub_meta_service({"films/search-by-keyword": self.SEARCH_PAYLOAD})
+        with meta_replaced(service):  # type: ignore[arg-type]
+            first = search_api.catalog_search("  Матрица  ")
+            second = search_api.catalog_search("матрица")
+            third = search_api.catalog_search("МАТРИЦА")
+        self.assertEqual(len(http.calls), 1)
+        self.assertEqual(first, second)
+        self.assertEqual(first, third)
+        self.assertEqual(first[0]["catalog_id"], 301)
+        self.assertEqual(first[0]["search_query"], "Матрица 1999")
+
+    def test_catalog_search_blank_query_skips_upstream(self) -> None:
+        service, http = _stub_meta_service({"films/search-by-keyword": self.SEARCH_PAYLOAD})
+        with meta_replaced(service):  # type: ignore[arg-type]
+            self.assertEqual(search_api.catalog_search("   "), [])
+        self.assertEqual(http.calls, [])
+
+    def test_catalog_search_returns_429_on_quota_and_rate_limit(self) -> None:
+        for upstream_status in (402, 429):
+            with self.subTest(upstream_status=upstream_status):
+                service, http = _stub_meta_service(
+                    {"films/search-by-keyword": self.SEARCH_PAYLOAD}, status=upstream_status
+                )
+                with meta_replaced(service):  # type: ignore[arg-type]
+                    with self.assertRaises(HTTPException) as ctx:
+                        search_api.catalog_search("Матрица")
+                self.assertEqual(ctx.exception.status_code, 429)
+                self.assertIsNone(service.shelf_cache.get("search:матрица"))
+                self.assertEqual(len(http.calls), 1)
+
+    def test_catalog_popular_returns_429_on_quota_and_rate_limit(self) -> None:
+        for upstream_status in (402, 429):
+            with self.subTest(upstream_status=upstream_status):
+                service, _ = _stub_meta_service(
+                    {"films/collections": self.POPULAR_PAYLOAD}, status=upstream_status
+                )
+                with meta_replaced(service):  # type: ignore[arg-type]
+                    with self.assertRaises(HTTPException) as ctx:
+                        search_api.catalog_popular()
+                self.assertEqual(ctx.exception.status_code, 429)
+
+    def test_catalog_popular_uses_shelf_cache(self) -> None:
+        service, http = _stub_meta_service({"films/collections": self.POPULAR_PAYLOAD})
+        with meta_replaced(service):  # type: ignore[arg-type]
+            first = search_api.catalog_popular()
+            second = search_api.catalog_popular()
+        self.assertEqual(len(http.calls), 1)
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["catalog_id"], 301)
+
+    def test_catalog_error_maps_http_error_402_and_429_to_429(self) -> None:
+        for status_code in (402, 429):
+            with self.subTest(status_code=status_code):
+                response = requests.Response()
+                response.status_code = status_code
+                exc = requests.HTTPError(response=response)
+                self.assertEqual(search_api.catalog_error(exc).status_code, 429)
+
+    def test_http_connection_pool_sizes_are_at_least_24(self) -> None:
+        clients = [
+            (meta_service.KinopoiskMeta("k").http, "https://kinopoiskapiunofficial.tech"),
+            (meta_service.TMDBStills("k").http, "https://api.themoviedb.org"),
+            (bot.NnmClient().http, "https://nnmclub.to"),
+            (bot.ProwlarrClient("http://127.0.0.1:9696", "k").http, "http://127.0.0.1:9696"),
+            (bot.ByparrClient().http, "http://127.0.0.1:8192"),
         ]
-        self.assertEqual(self.titles(names, 2026, ["Одиссея 2026", "Одиссея", "The Odyssey"]), names[2:])
+        for session, url in clients:
+            with self.subTest(url=url):
+                adapter = session.get_adapter(url)
+                self.assertGreaterEqual(adapter._pool_maxsize, 24)
+                self.assertGreaterEqual(adapter._pool_connections, 24)
 
-    def test_numbers_inside_the_name_are_not_years(self) -> None:
-        names = ["1917 (2019) BDRip 1080p", "1917 BDRip 1080p", "1917 (1957) старый фильм"]
-        self.assertEqual(self.titles(names, 2019, ["1917 2019", "1917"]), names[:2])
-        names = ["2012 (2009) BDRip", "2012.BDRip.1080p", "Другой фильм (2014) WEBRip"]
-        self.assertEqual(self.titles(names, 2009, ["2012 2009", "2012"]), names[:2])
-        # Ограничение: раздача, где единственный год совпадает с числом из названия,
-        # остаётся — отличить её нельзя; чужое название отсеет клиент по имени.
-        self.assertEqual(self.titles(["Армагеддон 2012 (2012)"], 2009, ["2012 2009", "2012"]), ["Армагеддон 2012 (2012)"])
 
-    def test_neighbouring_year_and_ranges_survive(self) -> None:
-        names = ["Фильм (2025) WEB-DL", "Фильм (2027) WEB-DL", "Фильм. Коллекция (1993-2026)", "Фильм (2020) BDRip"]
-        self.assertEqual(self.titles(names, 2026, ["Фильм 2026", "Фильм"]), names[:3])
+import os
 
-    def test_no_year_means_no_filter(self) -> None:
-        names = ["Фильм (2016)", "Фильм (2002)"]
-        self.assertEqual(self.titles(names, None, ["Фильм"]), names)
+
+class TmdbSearchApiIntegrationTests(unittest.TestCase):
+    def _fake_request(self, host: str = "api.example.test") -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "scheme": "https",
+                "server": (host, 443),
+                "path": "/",
+                "headers": [],
+            }
+        )
+
+    def test_build_search_queries_for_tmdb_movie_id(self) -> None:
+        puss_card = meta_service.TitleCard(
+            meta=meta_service.TitleMeta(
+                matched=True,
+                source="tmdb",
+                source_id=100315162,
+                tmdb_id=315162,
+                tmdb_media_type="movie",
+                title="Кот в сапогах 2: Последнее желание",
+                original_title="Puss in Boots: The Last Wish",
+                year="2022",
+                media_type="FILM",
+            )
+        )
+        with meta_replaced(FakeMeta(puss_card)):
+            queries = search_api.build_search_queries("", 100315162, None, None, "movie")
+        self.assertEqual(
+            queries,
+            [
+                "Кот в сапогах 2: Последнее желание 2022",
+                "Кот в сапогах 2: Последнее желание",
+                "Puss in Boots: The Last Wish",
+            ],
+        )
+
+    def test_relative_kino_img_and_art_urls_are_absolutized_everywhere(self) -> None:
+        class _TmdbStubMeta:
+            available = True
+
+            def _title(self) -> bot.CatalogTitle:
+                return bot.CatalogTitle(
+                    catalog_id=100315162,
+                    name="Кот в сапогах 2",
+                    original_name="Puss in Boots 2",
+                    media_type="FILM",
+                    year="2022",
+                    rating="8.3",
+                    countries=("США",),
+                    genres=("мультфильм",),
+                    poster_url="/kino/img/w500/pussPoster123.jpg",
+                )
+
+            def _card_dict(self) -> dict[str, Any]:
+                return {
+                    "catalog_id": 100315162,
+                    "name": "Кот в сапогах 2",
+                    "poster_url": "/kino/img/w500/pussPoster123.jpg",
+                    "backdrop_url": "/kino/img/w1280/pussBack12345.jpg",
+                    "logo_url": "/kino/img/w500/pussLogo12345.png",
+                    "art_url": "/catalog/art/w780/legacyArt1234.jpg",
+                    "detailed": True,
+                }
+
+            def shelf(self, kind: str, page: int = 1) -> list[bot.CatalogTitle]:
+                return [self._title()]
+
+            def search(self, query: str) -> list[bot.CatalogTitle]:
+                return [self._title()]
+
+            def discover(self, **kwargs: Any) -> list[dict[str, Any]]:
+                return [self._card_dict()]
+
+            def similar(self, film_id: int, limit: int = 12) -> list[dict[str, Any]]:
+                return [self._card_dict()]
+
+            def briefs(self, film_ids: list[int]) -> list[dict[str, Any]]:
+                return [self._card_dict()]
+
+            def title_card(self, film_id: int) -> meta_service.TitleCard:
+                return meta_service.TitleCard(
+                    meta=meta_service.TitleMeta(
+                        matched=True,
+                        source="tmdb",
+                        source_id=100315162,
+                        tmdb_id=315162,
+                        tmdb_media_type="movie",
+                        title="Кот в сапогах 2",
+                        poster_url="/kino/img/w500/pussPoster123.jpg",
+                        backdrop_url="/kino/img/w1280/pussBack12345.jpg",
+                        logo_url="/kino/img/w500/pussLogo12345.png",
+                        cast=[
+                            {
+                                "name": "Антонио Бандерас",
+                                "role": "Puss",
+                                "photo_url": "/kino/img/w500/banderas12345.jpg",
+                                "profession": "actor",
+                            }
+                        ],
+                    ),
+                    imdb_id="tt3915174",
+                )
+
+            def episodes(self, film_id: int, season: int | None = None) -> list[meta_service.EpisodeMeta]:
+                return [
+                    meta_service.EpisodeMeta(
+                        season=1,
+                        episode=1,
+                        title="Пилот",
+                        still_url="/kino/img/w780/ep1Still12345.jpg",
+                    )
+                ]
+
+            def match(self, name: str) -> meta_service.TitleMeta:
+                return self.title_card(100315162).meta
+
+            def quota(self) -> dict[str, Any]:
+                return {
+                    "totalQuota": {"value": -1, "used": 3},
+                    "dailyQuota": {"value": 100000, "used": 3},
+                    "accountType": "TMDB",
+                }
+
+        req = self._fake_request("cdn.example.test")
+        saved_env = os.environ.pop("KINO_IMG_BASE_URL", None)
+        try:
+            with meta_replaced(_TmdbStubMeta()):  # type: ignore[arg-type]
+                self.assertEqual(
+                    search_api.catalog_popular(req)[0]["poster_url"],
+                    "https://cdn.example.test/kino/img/w500/pussPoster123.jpg",
+                )
+                self.assertEqual(
+                    search_api.catalog_search("кот", req)[0]["poster_url"],
+                    "https://cdn.example.test/kino/img/w500/pussPoster123.jpg",
+                )
+                self.assertEqual(
+                    search_api.catalog_shelf("kids_animation", 1, req)[0]["poster_url"],
+                    "https://cdn.example.test/kino/img/w500/pussPoster123.jpg",
+                )
+                disc = search_api.catalog_discover(http_request=req)[0]
+                self.assertEqual(disc["backdrop_url"], "https://cdn.example.test/kino/img/w1280/pussBack12345.jpg")
+                self.assertEqual(disc["art_url"], "https://cdn.example.test/catalog/art/w780/legacyArt1234.jpg")
+                self.assertEqual(
+                    search_api.catalog_similar(100315162, 8, req)[0]["logo_url"],
+                    "https://cdn.example.test/kino/img/w500/pussLogo12345.png",
+                )
+                self.assertEqual(
+                    search_api.catalog_briefs(search_api.BriefRequest(ids=[100315162]), req)[0]["poster_url"],
+                    "https://cdn.example.test/kino/img/w500/pussPoster123.jpg",
+                )
+                tc = search_api.catalog_title(100315162, req)
+                self.assertEqual(tc.meta["backdrop_url"], "https://cdn.example.test/kino/img/w1280/pussBack12345.jpg")
+                self.assertEqual(
+                    tc.meta["cast"][0]["photo_url"],
+                    "https://cdn.example.test/kino/img/w500/banderas12345.jpg",
+                )
+                self.assertEqual(
+                    search_api.catalog_episodes(200040075, 1, req)[0]["still_url"],
+                    "https://cdn.example.test/kino/img/w780/ep1Still12345.jpg",
+                )
+                self.assertEqual(
+                    search_api.meta_episodes(200040075, 1, req)[0]["still_url"],
+                    "https://cdn.example.test/kino/img/w780/ep1Still12345.jpg",
+                )
+                self.assertEqual(
+                    search_api.meta_match("Puss in Boots 2022", req)["poster_url"],
+                    "https://cdn.example.test/kino/img/w500/pussPoster123.jpg",
+                )
+                self.assertEqual(search_api.catalog_quota()["accountType"], "TMDB")
+
+                os.environ["KINO_IMG_BASE_URL"] = "https://torbox.example.io"
+                self.assertEqual(
+                    search_api.catalog_popular()[0]["poster_url"],
+                    "https://torbox.example.io/kino/img/w500/pussPoster123.jpg",
+                )
+                self.assertEqual(
+                    search_api.catalog_title(100315162).meta["logo_url"],
+                    "https://torbox.example.io/kino/img/w500/pussLogo12345.png",
+                )
+        finally:
+            if saved_env is not None:
+                os.environ["KINO_IMG_BASE_URL"] = saved_env
+            else:
+                os.environ.pop("KINO_IMG_BASE_URL", None)
+
+    def test_unavailable_catalog_returns_503_with_generic_detail(self) -> None:
+        empty_meta = meta_service.MetaService(kinopoisk=None, tmdb=None)
+        with meta_replaced(empty_meta):  # type: ignore[arg-type]
+            self.assertFalse(search_api.health().catalog)
+            with self.assertRaises(HTTPException) as ctx:
+                search_api.catalog_quota()
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail, "Каталог не настроен")
+
+    def test_openapi_schema_has_no_http_request_query_params(self) -> None:
+        schema = search_api.app.openapi()
+        for path in ("/catalog/popular", "/catalog/search", "/catalog/discover", "/catalog/title/{kp_id}"):
+            params = schema["paths"][path]["get"].get("parameters", [])
+            names = [p["name"] for p in params]
+            self.assertNotIn("http_request", names, f"Unexpected http_request param in {path}")

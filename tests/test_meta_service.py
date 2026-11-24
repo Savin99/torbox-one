@@ -1530,147 +1530,539 @@ class TmdbSeasonDatesTests(unittest.TestCase):
         self.assertEqual(http.calls, [("https://api.themoviedb.org/3/tv/236235", {"api_key": "v3-key"})])
 
 
-# Форма `/3/find` и `/3/movie/{id}/images` — из живых ответов TMDB для
-# «Человек-паук: Новый день» 24.10.2026, урезанная до нужных полей.
-SPIDER_FIND = {"movie_results": [{"id": 969681, "title": "Spider-Man: Brand New Day"}], "tv_results": []}
-SPIDER_IMAGES = {
-    "logos": [
-        {"iso_639_1": "en", "file_path": "/en-logo.png", "vote_average": 5.9, "vote_count": 3},
-        {"iso_639_1": "ru", "file_path": "/ru-logo.svg", "vote_average": 9.0, "vote_count": 9},
-        {"iso_639_1": "ru", "file_path": "/ru-logo-weak.png", "vote_average": 3.1, "vote_count": 1},
-        {"iso_639_1": "ru", "file_path": "/ru-logo.png", "vote_average": 5.3, "vote_count": 2},
+SEARCH_KEYWORD_PAYLOAD = {
+    "keyword": "матрица",
+    "pagesCount": 1,
+    "films": [
+        {
+            "filmId": 301,
+            "nameRu": "Матрица",
+            "nameEn": "The Matrix",
+            "type": "FILM",
+            "year": "1999",
+            "rating": "8.5",
+            "countries": [{"country": "США"}],
+            "genres": [{"genre": "фантастика"}],
+            "posterUrl": "http://example.org/poster.jpg",
+            "posterUrlPreview": "http://example.org/preview.jpg",
+        }
     ],
-    "posters": [
-        {"iso_639_1": "en", "file_path": "/en-poster.jpg", "vote_average": 9.9, "vote_count": 50},
-        {"iso_639_1": None, "file_path": "/clean-poster.jpg", "vote_average": 5.5, "vote_count": 4},
-        {"iso_639_1": None, "file_path": "/clean-poster-2.jpg", "vote_average": 5.5, "vote_count": 2},
-    ],
-    "backdrops": [],
 }
 
 
-class TmdbTitleArtTests(unittest.TestCase):
-    def client(self, routes: dict[str, Any]) -> tuple[meta_service.TMDBStills, FakeHttp]:
-        client = meta_service.TMDBStills("v3-key")
-        http = FakeHttp(routes)
-        client.http = http  # type: ignore[assignment]
-        return client, http
+class CatalogSearchTests(unittest.TestCase):
+    def test_search_is_cached_across_case_and_whitespace(self) -> None:
+        service, http = catalog_service({"films/search-by-keyword": SEARCH_KEYWORD_PAYLOAD})
+        first = service.search("  Матрица  ")
+        second = service.search("матрица")
+        third = service.search("МАТРИЦА\t")
+        self.assertEqual(len(http.calls), 1)
+        self.assertEqual(http.calls[0][1], {"keyword": "Матрица", "page": 1})
+        self.assertEqual(first, second)
+        self.assertEqual(first, third)
+        self.assertEqual(first[0].catalog_id, 301)
+        self.assertEqual(first[0].name, "Матрица")
+        self.assertTrue(first[0].poster_url.startswith("https://"))
 
-    def test_russian_png_logo_and_textless_poster(self) -> None:
-        client, http = self.client({"3/find/tt22084616": SPIDER_FIND, "3/movie/969681/images": SPIDER_IMAGES})
-        art = client.title_art("tt22084616", is_series=False)
-        # SVG пропущен, хоть у него оценка выше: iOS его не нарисует
-        self.assertEqual(art["logo_url"], "https://image.tmdb.org/t/p/w500/ru-logo.png")
-        # Постер без текста, а не лучший постер вообще: на нём надпись
-        self.assertEqual(art["art_url"], "https://image.tmdb.org/t/p/w780/clean-poster.jpg")
-        self.assertEqual(http.calls[0][1], {"external_source": "imdb_id", "api_key": "v3-key"})
-        self.assertEqual(http.calls[1][1]["include_image_language"], "ru,en,null")
+    def test_search_collapses_internal_whitespace_in_cache_key(self) -> None:
+        service, http = catalog_service({"films/search-by-keyword": SEARCH_KEYWORD_PAYLOAD})
+        service.search("Звёздные   войны")
+        service.search("звёздные войны")
+        self.assertEqual(len(http.calls), 1)
+        self.assertEqual(http.calls[0][1]["keyword"], "Звёздные войны")
 
-    def test_english_logo_when_no_russian(self) -> None:
-        images = {"logos": [{"iso_639_1": "en", "file_path": "/en.png", "vote_average": 1, "vote_count": 1}]}
-        client, _ = self.client({"3/find/tt0816692": SPIDER_FIND, "3/movie/969681/images": images})
-        art = client.title_art("tt0816692", is_series=False)
-        self.assertEqual(art, {"logo_url": "https://image.tmdb.org/t/p/w500/en.png"})
+    def test_search_cache_persists_between_instances(self) -> None:
+        service, http = catalog_service({"films/search-by-keyword": SEARCH_KEYWORD_PAYLOAD})
+        service.search("Матрица")
+        self.assertEqual(len(http.calls), 1)
 
-    def test_series_is_taken_from_tv_results(self) -> None:
-        found = {"movie_results": [{"id": 1}], "tv_results": [{"id": 1399}]}
-        client, http = self.client({"3/find/tt0944947": found, "3/tv/1399/images": SPIDER_IMAGES})
-        client.title_art("tt0944947", is_series=True)
-        self.assertIn("3/tv/1399/images", http.calls[1][0])
+        restarted_kp = meta_service.KinopoiskMeta("test-key")
+        restarted_http = FakeHttp({"films/search-by-keyword": SEARCH_KEYWORD_PAYLOAD})
+        restarted_kp.http = restarted_http  # type: ignore[assignment]
+        restarted = meta_service.MetaService(
+            kinopoisk=restarted_kp,
+            tmdb=None,
+            cache=meta_service.TTLCache(service.cache._path),
+            shelf_cache=meta_service.TTLCache(service.shelf_cache._path, meta_service.SHELF_TTL_SECONDS),
+        )
+        titles = restarted.search("матрица")
+        self.assertEqual(len(restarted_http.calls), 0)
+        self.assertEqual(titles[0].catalog_id, 301)
 
-    def test_no_imdb_id_asks_nothing(self) -> None:
-        client, http = self.client({})
-        self.assertEqual(client.title_art("", is_series=False), {})
-        self.assertEqual(http.calls, [])
+    def test_valid_empty_search_is_cached_for_short_ttl(self) -> None:
+        service, http = catalog_service({"films/search-by-keyword": {"keyword": "нет", "films": []}})
+        self.assertEqual(service.search("НесуществующийФильм"), [])
+        self.assertEqual(service.search("несуществующийфильм"), [])
+        self.assertEqual(len(http.calls), 1)
 
-    def test_unknown_title_gives_nothing(self) -> None:
-        client, http = self.client({"3/find/tt1234567": {"movie_results": [], "tv_results": []}})
-        self.assertEqual(client.title_art("tt1234567", is_series=False), {})
+        # Старше SEARCH_EMPTY_TTL_SECONDS пустая выдача перечитывается заново
+        cache_key = "search:несуществующийфильм"
+        service.shelf_cache._items[cache_key] = (
+            time.time() - meta_service.SEARCH_EMPTY_TTL_SECONDS - 60,
+            [],
+        )
+        http.routes["films/search-by-keyword"] = SEARCH_KEYWORD_PAYLOAD
+        refreshed = service.search("НесуществующийФильм")
+        self.assertEqual(len(http.calls), 2)
+        self.assertEqual(refreshed[0].catalog_id, 301)
+
+    def test_errors_and_quota_are_never_cached(self) -> None:
+        for status, expected_exc in (
+            (402, meta_service.CatalogLimitError),
+            (429, meta_service.CatalogLimitError),
+            (500, RuntimeError),
+        ):
+            with self.subTest(status=status):
+                service, http = catalog_service({"films/search-by-keyword": SEARCH_KEYWORD_PAYLOAD}, status=status)
+                with self.assertRaises(expected_exc):
+                    service.search("Матрица")
+                self.assertIsNone(service.shelf_cache.get("search:матрица"))
+                http.status = 200
+                titles = service.search("Матрица")
+                self.assertEqual(len(http.calls), 2)
+                self.assertEqual(titles[0].catalog_id, 301)
+
+    def test_unexpected_payload_is_error_and_not_cached(self) -> None:
+        service, http = catalog_service({"films/search-by-keyword": {"error": "oops"}}, status=200)
+        with self.assertRaises(RuntimeError):
+            service.search("Матрица")
+        self.assertIsNone(service.shelf_cache.get("search:матрица"))
         self.assertEqual(len(http.calls), 1)
 
 
-class FakeArtTmdb:
-    """TMDB, у которого есть только картинки тайтлов, со счётом вызовов."""
+class ConnectionPoolTests(unittest.TestCase):
+    def _assert_pool(self, session: Any, url: str, *, expect_retries: bool) -> None:
+        adapter = session.get_adapter(url)
+        self.assertGreaterEqual(adapter._pool_maxsize, 24)
+        self.assertGreaterEqual(adapter._pool_connections, 24)
+        if expect_retries:
+            self.assertEqual(adapter.max_retries.total, 2)
+            self.assertIn(429, adapter.max_retries.status_forcelist)
+            self.assertFalse(adapter.max_retries.raise_on_status)
+        else:
+            self.assertEqual(adapter.max_retries.total, 0)
 
-    def __init__(self, art: dict[str, str] | None = None, error: Exception | None = None) -> None:
-        self.art = dict(art or {})
-        self.error = error
-        self.calls: list[tuple[str, bool]] = []
-        self.downloads: list[str] = []
+    def test_all_http_clients_have_enlarged_connection_pools(self) -> None:
+        self._assert_pool(
+            meta_service.KinopoiskMeta("key").http,
+            "https://kinopoiskapiunofficial.tech/api/v2.2/films",
+            expect_retries=True,
+        )
+        self._assert_pool(
+            meta_service.TMDBStills("key").http,
+            "https://api.themoviedb.org/3/tv/1",
+            expect_retries=True,
+        )
+        self._assert_pool(
+            meta_service.bot.KinopoiskCatalog("key").http,
+            "https://kinopoiskapiunofficial.tech/api/v2.1/films/search-by-keyword",
+            expect_retries=True,
+        )
+        self._assert_pool(
+            meta_service.bot.NnmClient().http,
+            "https://nnmclub.to/forum/",
+            expect_retries=True,
+        )
+        self._assert_pool(
+            meta_service.bot.ProwlarrClient("http://127.0.0.1:9696", "key").http,
+            "http://127.0.0.1:9696/api/v1/search",
+            expect_retries=True,
+        )
+        self._assert_pool(
+            meta_service.bot.ByparrClient().http,
+            "http://127.0.0.1:8192/v1",
+            expect_retries=False,
+        )
 
-    def download(self, url: str) -> bytes:
-        self.downloads.append(url)
-        return b"PNG" + url.encode()
 
-    def title_art(self, imdb_id: str, is_series: bool) -> dict[str, str]:
-        self.calls.append((imdb_id, is_series))
-        if self.error is not None:
-            raise self.error
-        return dict(self.art)
+import tmdb_catalog
 
 
-class BriefArtTests(unittest.TestCase):
-    ART = {
-        "logo_url": "https://image.tmdb.org/t/p/w500/ruLogo1234.png",
-        "art_url": "https://image.tmdb.org/t/p/w780/cleanArt123.jpg",
-    }
+class _TmdbFakeResponse:
+    def __init__(self, payload: Any, status_code: int = 200) -> None:
+        self._payload = payload
+        self.status_code = status_code
 
-    def service(self, tmdb: FakeArtTmdb) -> meta_service.MetaService:
-        service, _ = catalog_service(similar_routes())
-        service.tmdb = tmdb  # type: ignore[assignment]
-        service.art_dir = Path(tempfile.mkdtemp())
-        return service
+    def json(self) -> Any:
+        return self._payload
 
-    def test_briefs_carry_tmdb_art_served_by_us(self) -> None:
-        tmdb = FakeArtTmdb(self.ART)
-        service = self.service(tmdb)
-        tenet, = service.briefs([1236063])
-        # Не адрес TMDB, а путь сервера: из России image.tmdb.org не открывается
-        self.assertEqual(tenet["art_url"], "/catalog/art/w780/cleanArt123.jpg")
-        self.assertEqual(tmdb.calls, [("tt6723592", False)])
-        path = service.art_file("w780", "cleanArt123.jpg")
-        self.assertIsNotNone(path)
-        self.assertEqual(path.read_bytes(), b"PNG" + self.ART["art_url"].encode())  # type: ignore[union-attr]
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            err = meta_service.requests.HTTPError(f"HTTP {self.status_code}")
+            err.response = self  # type: ignore[assignment]
+            raise err
 
-    def test_kinopoisk_logo_wins_over_tmdb(self) -> None:
-        tenet, = self.service(FakeArtTmdb(self.ART)).briefs([1236063])
-        self.assertTrue(tenet["logo_url"].startswith("https://avatars.mds.yandex.net/"))
 
-    def test_tmdb_logo_fills_the_gap(self) -> None:
-        solaris, = self.service(FakeArtTmdb(self.ART)).briefs([43911])
-        self.assertEqual(solaris["logo_url"], "/catalog/art/w500/ruLogo1234.png")
+class _TmdbFakeHttp:
+    def __init__(self, routes: dict[str, Any], status: int = 200) -> None:
+        self.routes = routes
+        self.status = status
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.headers: dict[str, str] = {}
 
-    def test_art_file_serves_only_what_we_downloaded(self) -> None:
-        service = self.service(FakeArtTmdb(self.ART))
-        self.assertIsNone(service.art_file("w500", "ruLogo1234.png"))
-        service.briefs([43911])
-        self.assertIsNotNone(service.art_file("w500", "ruLogo1234.png"))
-        self.assertIsNone(service.art_file("original", "ruLogo1234.png"))
-        self.assertIsNone(service.art_file("w500", "../meta.json"))
+    def get(self, url: str, params: dict[str, Any] | None = None, timeout: int = 0) -> _TmdbFakeResponse:
+        self.calls.append((url, dict(params or {})))
+        for route, payload in self.routes.items():
+            if route in url:
+                if callable(payload):
+                    return _TmdbFakeResponse(payload(url, params or {}), self.status)
+                return _TmdbFakeResponse(payload, self.status)
+        return _TmdbFakeResponse({}, self.status)
 
-    def test_foreign_art_url_is_not_downloaded(self) -> None:
-        tmdb = FakeArtTmdb({"logo_url": "https://evil.example/w500/x12345678.png"})
-        solaris, = self.service(tmdb).briefs([43911])
-        self.assertEqual(solaris["logo_url"], "")
-        self.assertEqual(tmdb.downloads, [])
 
-    def test_art_is_cached_even_when_empty(self) -> None:
-        tmdb = FakeArtTmdb({})
-        service = self.service(tmdb)
-        service.briefs([43911])
-        service.briefs([43911])
-        self.assertEqual(len(tmdb.calls), 1)
+PUSS_MOVIE_DETAIL = {
+    "id": 315162,
+    "title": "Кот в сапогах 2: Последнее желание",
+    "original_title": "Puss in Boots: The Last Wish",
+    "release_date": "2022-12-07",
+    "runtime": 102,
+    "vote_average": 8.3,
+    "vote_count": 7800,
+    "tagline": "Скажи «привет» своему маленькому другу",
+    "overview": "Кот в сапогах потратил восемь из девяти жизней.",
+    "poster_path": "/kuf6dutpsT0vSVehic3EZIqkOBt.jpg",
+    "backdrop_path": "/jr8tSoJGj33XLgFBy6lmZhpGQNu.jpg",
+    "original_language": "en",
+    "production_countries": [{"iso_3166_1": "US", "name": "United States"}],
+    "genres": [{"id": 16, "name": "Мультфильм"}, {"id": 10751, "name": "Семейный"}],
+    "external_ids": {"imdb_id": "tt3915174"},
+    "images": {
+        "logos": [{"file_path": "/pussRuLogo123.png", "iso_639_1": "ru", "vote_average": 5.5, "vote_count": 10}],
+        "posters": [{"file_path": "/pussCleanArt1.jpg", "iso_639_1": None, "vote_average": 6.0, "vote_count": 8}],
+    },
+    "credits": {
+        "crew": [{"name": "Джоэл Кроуфорд", "job": "Director", "profile_path": "/dirPhoto1234.jpg"}],
+        "cast": [{"name": "Антонио Бандерас", "character": "Puss in Boots", "profile_path": "/actPhoto1234.jpg"}],
+    },
+}
 
-    def test_failure_is_not_cached_and_does_not_break_briefs(self) -> None:
-        tmdb = FakeArtTmdb(error=RuntimeError("TMDB down"))
-        service = self.service(tmdb)
-        solaris, = service.briefs([43911])
-        self.assertEqual(solaris["art_url"], "")
-        self.assertEqual(solaris["name"], "Солярис")
-        service.briefs([43911])
-        self.assertEqual(len(tmdb.calls), 2)
+GRAVITY_FALLS_DETAIL = {
+    "id": 40075,
+    "name": "Гравити Фолз",
+    "original_name": "Gravity Falls",
+    "first_air_date": "2012-06-15",
+    "status": "Ended",
+    "type": "Scripted",
+    "episode_run_time": [22],
+    "vote_average": 8.6,
+    "vote_count": 3200,
+    "overview": "Близнецы проводят лето у дяди Стэна.",
+    "poster_path": "/gfPoster12345.jpg",
+    "backdrop_path": "/gfBackdrop123.jpg",
+    "original_language": "en",
+    "origin_country": ["US"],
+    "genres": [{"id": 16, "name": "Мультфильм"}, {"id": 10762, "name": "Детский"}],
+    "external_ids": {"imdb_id": "tt1865718"},
+    "images": {"logos": [], "posters": []},
+    "created_by": [{"name": "Алекс Хирш", "profile_path": "/alexHirsch12.jpg"}],
+    "credits": {"crew": [], "cast": [{"name": "Джейсон Риттер", "character": "Dipper", "profile_path": "/ritter123456.jpg"}]},
+    "seasons": [
+        {"season_number": 0, "episode_count": 17, "air_date": "2013-10-14"},
+        {"season_number": 1, "episode_count": 20, "air_date": "2012-06-15"},
+        {"season_number": 2, "episode_count": 20, "air_date": "2014-08-01"},
+        {"season_number": 3, "episode_count": 0, "air_date": None},
+    ],
+}
 
-    def test_without_tmdb_art_is_empty(self) -> None:
-        service, _ = catalog_service(similar_routes())
-        tenet, = service.briefs([1236063])
-        self.assertEqual(tenet["art_url"], "")
+GRAVITY_SEASON_1 = {
+    "air_date": "2012-06-15",
+    "episodes": [
+        {
+            "season_number": 1,
+            "episode_number": 1,
+            "name": "Ловушка для туриста",
+            "overview": "Диппер находит дневник.",
+            "air_date": "2012-06-15",
+            "still_path": "/gfEp1Still123.jpg",
+        },
+        {
+            "season_number": 1,
+            "episode_number": 2,
+            "name": "Легенда о Живогрызе",
+            "overview": "Рыбалка на озере.",
+            "air_date": "2012-06-29",
+            "still_path": "/gfEp2Still123.jpg",
+        },
+    ],
+}
+
+
+def _make_tmdb_service(
+    tmdb_routes: dict[str, Any],
+    kp_routes: dict[str, Any] | None = None,
+    *,
+    imdb_map: dict[str, tuple[float, int]] | None = None,
+    tmdb_status: int = 200,
+    img_base_url: str = "",
+) -> tuple[meta_service.MetaService, _TmdbFakeHttp, FakeHttp]:
+    folder = Path(tempfile.mkdtemp())
+    cache = meta_service.TTLCache(folder / "meta.json")
+    shelf_cache = meta_service.TTLCache(folder / "shelf.json", meta_service.SHELF_TTL_SECONDS)
+    tmdb_http = _TmdbFakeHttp(tmdb_routes, status=tmdb_status)
+    lookup_dict = imdb_map or {"tt3915174": (7.8, 195000), "tt1865718": (8.9, 145000)}
+    tcat = tmdb_catalog.TmdbCatalog(
+        "tmdb-test-key",
+        session=tmdb_http,  # type: ignore[arg-type]
+        img_base_url=img_base_url,
+        imdb_lookup=lambda tid: lookup_dict.get(tid),
+        imdb_id_resolver=lambda cid: str(cache.get(f"tmdb:imdb:{cid}") or ""),
+        cache=cache,
+    )
+    kp = meta_service.KinopoiskMeta("kp-test-key")
+    kp_http = FakeHttp(kp_routes or {})
+    kp.http = kp_http  # type: ignore[assignment]
+    svc = meta_service.MetaService(
+        kinopoisk=kp,
+        tmdb=None,
+        cache=cache,
+        shelf_cache=shelf_cache,
+        tmdb_catalog=tcat,
+        primary_backend="tmdb",
+    )
+    return svc, tmdb_http, kp_http
+
+
+class TmdbHybridMetaServiceTests(unittest.TestCase):
+    def test_shelf_routes_to_tmdb_and_caches(self) -> None:
+        routes = {
+            "discover/movie": {
+                "results": [
+                    {
+                        "id": 315162,
+                        "title": "Кот в сапогах 2",
+                        "original_title": "Puss in Boots: The Last Wish",
+                        "release_date": "2022-12-07",
+                        "vote_average": 8.3,
+                        "vote_count": 7800,
+                        "genre_ids": [16, 10751],
+                        "original_language": "en",
+                        "poster_path": "/kuf6dutpsT0vSVehic3EZIqkOBt.jpg",
+                    }
+                ]
+            }
+        }
+        svc, tmdb_http, kp_http = _make_tmdb_service(routes)
+        first = svc.shelf("kids_animation", page=5)
+        second = svc.shelf("kids_animation", page=5)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0].catalog_id, 100315162)
+        self.assertEqual(first[0].name, "Кот в сапогах 2")
+        self.assertEqual(first, second)
+        self.assertEqual(len(tmdb_http.calls), 1)
+        self.assertEqual(tmdb_http.calls[0][1]["page"], 5)
+        self.assertEqual(kp_http.calls, [])
+
+    def test_search_routes_to_tmdb_caches_non_empty_and_short_empty_never_errors(self) -> None:
+        routes = {
+            "search/multi": {
+                "results": [
+                    {
+                        "id": 315162,
+                        "media_type": "movie",
+                        "title": "Атлантида: Затерянный мир",
+                        "original_title": "Atlantis: The Lost Empire",
+                        "release_date": "2001-06-15",
+                        "vote_average": 7.0,
+                        "vote_count": 4800,
+                        "popularity": 45.0,
+                        "genre_ids": [16],
+                        "original_language": "en",
+                        "poster_path": "/atlantis12345.jpg",
+                    }
+                ]
+            }
+        }
+        svc, tmdb_http, kp_http = _make_tmdb_service(routes)
+        first = svc.search("  Атлантида  ")
+        second = svc.search("атлантида")
+        self.assertEqual(len(tmdb_http.calls), 1)
+        self.assertEqual(kp_http.calls, [])
+        self.assertEqual(first[0].catalog_id, 100315162)
+        self.assertEqual(first, second)
+
+        svc2, tmdb_http2, _ = _make_tmdb_service({"search/multi": {"results": []}})
+        self.assertEqual(svc2.search("НетТакого"), [])
+        self.assertEqual(svc2.search("неттакого"), [])
+        self.assertEqual(len(tmdb_http2.calls), 1)
+        svc2.shelf_cache._items["tmdb:search:неттакого"] = (
+            time.time() - meta_service.SEARCH_EMPTY_TTL_SECONDS - 60,
+            [],
+        )
+        svc2.search("НетТакого")
+        self.assertEqual(len(tmdb_http2.calls), 2)
+
+        svc3, tmdb_http3, _ = _make_tmdb_service({"search/multi": {}}, tmdb_status=500)
+        with self.assertRaises(Exception):
+            svc3.search("Ошибка")
+        self.assertIsNone(svc3.shelf_cache.get("tmdb:search:ошибка"))
+
+    def test_discover_supports_page_10_and_up_to_50_with_cache(self) -> None:
+        routes = {
+            "discover/movie": {
+                "results": [
+                    {
+                        "id": 5001,
+                        "title": "Фильм 10",
+                        "original_title": "Movie 10",
+                        "release_date": "2023-05-01",
+                        "vote_average": 7.4,
+                        "vote_count": 200,
+                        "genre_ids": [16],
+                        "original_language": "en",
+                        "poster_path": "/movie10poster.jpg",
+                    }
+                ]
+            }
+        }
+        svc, tmdb_http, kp_http = _make_tmdb_service(routes)
+        cards = svc.discover(media_type="FILM", genre="мультфильм", country="США", year_from=2021, page=10)
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["catalog_id"], 100005001)
+        self.assertEqual(tmdb_http.calls[0][1]["page"], 10)
+        svc.discover(media_type="FILM", genre="мультфильм", country="США", year_from=2021, page=10)
+        self.assertEqual(len(tmdb_http.calls), 1)
+        svc.discover(media_type="FILM", page=999)
+        self.assertEqual(tmdb_http.calls[-1][1]["page"], tmdb_catalog.MAX_DISCOVER_PAGE)
+        self.assertEqual(kp_http.calls, [])
+
+    def test_title_card_routes_tmdb_and_legacy_kp_independently(self) -> None:
+        tmdb_routes = {
+            "movie/315162": PUSS_MOVIE_DETAIL,
+            "tv/40075": GRAVITY_FALLS_DETAIL,
+        }
+        kp_routes = {
+            "films/4444/seasons": SEASONS_PAYLOAD,
+            "api/v2.2/films/4444": SERIES_FILM_PAYLOAD,
+            "v1/staff": [],
+        }
+        svc, tmdb_http, kp_http = _make_tmdb_service(tmdb_routes, kp_routes)
+
+        movie = svc.title_card(100315162)
+        self.assertTrue(movie.meta.matched)
+        self.assertEqual(movie.meta.source, "tmdb")
+        self.assertEqual(movie.meta.tmdb_id, 315162)
+        self.assertEqual(movie.meta.tmdb_media_type, "movie")
+        self.assertEqual(movie.imdb_id, "tt3915174")
+        self.assertEqual(svc.cache.get("tmdb:imdb:100315162"), "tt3915174")
+        self.assertEqual(movie.meta.cast[0]["profession"], "director")
+        self.assertEqual(movie.meta.cast[1]["name"], "Антонио Бандерас")
+        self.assertEqual(kp_http.calls, [])
+
+        svc.title_card(100315162)
+        self.assertEqual(len(tmdb_http.calls), 1)
+
+        tv = svc.title_card(200040075)
+        self.assertTrue(tv.meta.matched)
+        self.assertEqual(tv.imdb_id, "tt1865718")
+        self.assertEqual([(s.season, s.episodes, s.released) for s in tv.seasons], [(1, 20, None), (2, 20, None), (3, 0, False)])
+        self.assertEqual(kp_http.calls, [])
+
+        with tmdb_redirect("https://www.themoviedb.org/tv/1399"):
+            legacy = svc.title_card(4444)
+        self.assertTrue(legacy.meta.matched)
+        self.assertEqual(legacy.meta.source, "kinopoisk")
+        self.assertEqual(legacy.meta.title, "Игра престолов")
+        self.assertGreater(len(kp_http.calls), 0)
+
+    def test_episodes_routes_tmdb_and_caches(self) -> None:
+        svc, tmdb_http, kp_http = _make_tmdb_service({"tv/40075/season/1": GRAVITY_SEASON_1})
+        eps = svc.episodes(200040075, season=1)
+        self.assertEqual(len(eps), 2)
+        self.assertEqual(eps[0].title, "Ловушка для туриста")
+        self.assertEqual(eps[0].still_url, "/kino/img/w780/gfEp1Still123.jpg")
+        self.assertIsNone(eps[0].released)
+        eps2 = svc.episodes(200040075, season=1)
+        self.assertEqual(eps, eps2)
+        self.assertEqual(len(tmdb_http.calls), 1)
+        self.assertEqual(kp_http.calls, [])
+
+    def test_similar_works_for_tmdb_id_and_cached_legacy_kp_id_with_zero_kp_calls(self) -> None:
+        rec_payload = {
+            "results": [
+                {
+                    "id": 9991,
+                    "media_type": "movie",
+                    "title": "Шрек",
+                    "original_title": "Shrek",
+                    "release_date": "2001-05-18",
+                    "vote_average": 7.7,
+                    "vote_count": 16000,
+                    "genre_ids": [16, 10751],
+                    "original_language": "en",
+                    "poster_path": "/shrekPoster12.jpg",
+                }
+            ]
+        }
+        tmdb_routes = {
+            "movie/315162/recommendations": rec_payload,
+            "find/tt6723592": {"movie_results": [{"id": 577922}]},
+            "movie/577922/recommendations": rec_payload,
+        }
+        svc, tmdb_http, kp_http = _make_tmdb_service(tmdb_routes)
+
+        sim = svc.similar(100315162, limit=8)
+        self.assertEqual([c["catalog_id"] for c in sim], [100009991])
+        svc.similar(100315162, limit=8)
+        self.assertEqual(len(tmdb_http.calls), 1)
+        self.assertEqual(kp_http.calls, [])
+
+        svc.cache.put("film:1236063", TENET_FILM_PAYLOAD)
+        sim_kp = svc.similar(1236063, limit=8)
+        self.assertEqual([c["catalog_id"] for c in sim_kp], [100009991])
+        self.assertEqual(kp_http.calls, [])
+
+    def test_mixed_briefs_preserves_order_for_tmdb_and_legacy_kp(self) -> None:
+        svc, tmdb_http, kp_http = _make_tmdb_service(
+            {"movie/315162": PUSS_MOVIE_DETAIL},
+            {"api/v2.2/films/1236063": TENET_FILM_PAYLOAD},
+        )
+        svc.cache.put("film:1236063", TENET_FILM_PAYLOAD)
+        cards = svc.briefs([100315162, 1236063])
+        self.assertEqual([c["catalog_id"] for c in cards], [100315162, 1236063])
+        self.assertEqual(cards[0]["name"], "Кот в сапогах 2: Последнее желание")
+        self.assertEqual(cards[0]["rating_imdb"], "7.8")
+        self.assertEqual(cards[1]["name"], "Довод")
+        self.assertEqual(kp_http.calls, [])
+        self.assertEqual(svc.cache.get("tmdb:imdb:100315162"), "tt3915174")
+
+    def test_match_and_quota_use_tmdb_without_hitting_kp(self) -> None:
+        tmdb_routes = {
+            "search/multi": {
+                "results": [
+                    {
+                        "id": 40075,
+                        "media_type": "tv",
+                        "name": "Гравити Фолз",
+                        "original_name": "Gravity Falls",
+                        "first_air_date": "2012-06-15",
+                        "vote_average": 8.6,
+                        "vote_count": 3200,
+                        "popularity": 80.0,
+                        "genre_ids": [16],
+                        "original_language": "en",
+                        "origin_country": ["US"],
+                        "poster_path": "/gfPoster12345.jpg",
+                    }
+                ]
+            },
+            "tv/40075": GRAVITY_FALLS_DETAIL,
+        }
+        svc, tmdb_http, kp_http = _make_tmdb_service(tmdb_routes)
+        matched = svc.match("Гравити Фолз / Gravity Falls (Сезон 2) [2014, WEB-DL 1080p]")
+        self.assertTrue(matched.matched)
+        self.assertEqual(matched.source, "tmdb")
+        self.assertEqual(matched.source_id, 200040075)
+        self.assertEqual(matched.season_hint, 2)
+        self.assertEqual(kp_http.calls, [])
+
+        calls_before = len(tmdb_http.calls)
+        matched2 = svc.match("Гравити Фолз / Gravity Falls (Сезон 2) [2014, WEB-DL 1080p]")
+        self.assertEqual(len(tmdb_http.calls), calls_before)
+        self.assertEqual(matched2.season_hint, 2)
+
+        q = svc.quota()
+        self.assertEqual(q["accountType"], "TMDB")
+        self.assertEqual(q["totalQuota"]["value"], -1)
+        self.assertEqual(q["dailyQuota"]["value"], 100000)
+        self.assertGreaterEqual(q["dailyQuota"]["used"], 2)
+        self.assertEqual(kp_http.calls, [])

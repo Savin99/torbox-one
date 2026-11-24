@@ -78,7 +78,15 @@ LOG = logging.getLogger("torbox_tg_bot")
 STOP = Event()
 
 
-def configure_read_retries(session: requests.Session) -> None:
+HTTP_POOL_SIZE = 32
+
+
+def configure_read_retries(
+    session: requests.Session,
+    *,
+    pool_connections: int = HTTP_POOL_SIZE,
+    pool_maxsize: int = HTTP_POOL_SIZE,
+) -> None:
     """Retry transient read failures without replaying mutations."""
     retry = Retry(
         total=2,
@@ -91,7 +99,11 @@ def configure_read_retries(session: requests.Session) -> None:
         respect_retry_after_header=True,
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=pool_connections,
+        pool_maxsize=pool_maxsize,
+    )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
 
@@ -1273,7 +1285,13 @@ class ByparrClient:
         self, base_url: str = BYPARR_DEFAULT_URL, http: Any = None, clock: Callable[[], float] = time.time
     ) -> None:
         self.base_url = (base_url or BYPARR_DEFAULT_URL).rstrip("/")
-        self.http = http if http is not None else requests.Session()
+        if http is not None:
+            self.http = http
+        else:
+            self.http = requests.Session()
+            adapter = HTTPAdapter(pool_connections=HTTP_POOL_SIZE, pool_maxsize=HTTP_POOL_SIZE)
+            self.http.mount("https://", adapter)
+            self.http.mount("http://", adapter)
         self._clock = clock
         # Домен куки -> (кука для Byparr, когда истекает по `clock`)
         self._clearance: dict[str, tuple[dict[str, str], float]] = {}
